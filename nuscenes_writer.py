@@ -28,7 +28,9 @@ import numpy as np
 from scipy.spatial.transform import Rotation, Slerp
 
 from common import (
-    NUSCENES_CAMS,
+    MOTION_TYPE_TO_ATTRIBUTE,
+    OBJECT_TYPE_TO_CATEGORY,
+    VISIBILITY_LEVELS,
     opencv_ext_to_nuscenes_pose,
     quat_wxyz_to_R,
 )
@@ -69,32 +71,51 @@ def nearest_ts(query: np.ndarray, target: np.ndarray) -> tuple[np.ndarray, np.nd
 
 
 def sync_keyframes(data: SensorData, channels: list[str], sync_ns: int,
-                   keyframe_stride: int) -> list[dict]:
-    """Pick every Kth lidar ts as keyframe anchor. Match nearest cam ts per
-    channel; drop keyframes that miss any channel within tolerance.
+                   keyframe_stride: int,
+                   required: list[str] | None = None) -> list[dict]:
+    """Pick every Kth lidar ts as a keyframe anchor and match cameras to it.
 
-    Returns list of dicts: {"lidar_ts": int, "cam_ts": {channel: int}}.
+    `required` channels must all land within `sync_ns` or the keyframe is
+    dropped. Channels outside `required` are best-effort: they are attached when
+    they happen to be in tolerance and simply omitted when they are not, so they
+    can never veto a keyframe. That is how CAM_TRAFFIC is carried — it is a
+    seventh, non-standard channel with placeholder calibration, and letting it
+    gate the six real cameras would throw away good samples for nothing.
+
+    Returns [{"lidar_ts": int, "cam_ts": {channel: ts}}], where cam_ts is
+    guaranteed to hold every required channel and may hold the optional ones.
     """
-    anchors = data.lidar_ts[::keyframe_stride]
-    print(f"  candidate keyframes: {len(anchors)} (every {keyframe_stride}th of {len(data.lidar_ts)} lidar)")
+    required = list(channels) if required is None else [c for c in required if c in channels]
+    optional = [c for c in channels if c not in required]
 
-    cam_match: dict[str, tuple[np.ndarray, np.ndarray]] = {}
-    for ch in channels:
-        cam_match[ch] = nearest_ts(anchors, data.cam_ts[ch])
+    anchors = data.lidar_ts[::keyframe_stride]
+    print(f"  candidate keyframes: {len(anchors)} "
+          f"(every {keyframe_stride}th of {len(data.lidar_ts)} lidar)")
+    print(f"  gating on {len(required)} channel(s); "
+          f"best-effort: {optional or 'none'}")
+
+    cam_match = {ch: nearest_ts(anchors, data.cam_ts[ch]) for ch in channels}
 
     valid = np.ones(len(anchors), dtype=bool)
-    for ch in channels:
-        _, diff = cam_match[ch]
-        valid &= diff <= sync_ns
+    for ch in required:
+        valid &= cam_match[ch][1] <= sync_ns
     n_drop = int((~valid).sum())
-    print(f"  dropped {n_drop} ({100*n_drop/len(anchors):.2f}%) for sync miss; kept {valid.sum()}")
+    print(f"  dropped {n_drop} ({100 * n_drop / max(len(anchors), 1):.2f}%) "
+          f"for sync miss; kept {int(valid.sum())}")
 
     out: list[dict] = []
     for i in np.where(valid)[0]:
-        out.append({
-            "lidar_ts": int(anchors[i]),
-            "cam_ts": {ch: int(cam_match[ch][0][i]) for ch in channels},
-        })
+        cam_ts = {ch: int(cam_match[ch][0][i]) for ch in required}
+        for ch in optional:
+            matched, diff = cam_match[ch]
+            if diff[i] <= sync_ns:
+                cam_ts[ch] = int(matched[i])
+        out.append({"lidar_ts": int(anchors[i]), "cam_ts": cam_ts})
+
+    for ch in optional:
+        n = sum(1 for kf in out if ch in kf["cam_ts"])
+        print(f"    {ch}: attached to {n}/{len(out)} keyframes "
+              f"({100 * n / max(len(out), 1):.1f}%)")
     return out
 
 
@@ -248,32 +269,34 @@ def build_tables(data: SensorData, scenes: list[list[dict]],
         "location": "korea-test",
     }
 
-    # ---------- placeholder category/attribute/visibility/map (reuse if existing) ----------
+    # ---------- taxonomy (reuse across logs; written once) ----------
+    # These three tables define what a labelling vendor is being asked to
+    # produce. category/attribute come from msg/ObjectType.msg and
+    # msg/MotionType.msg so the perception enum and the label set stay in step;
+    # visibility is NuScenes' standard four bins. sample_annotation and instance
+    # are emitted empty — the vendor fills those.
     if existing and existing.get("category.json"):
-        categories: list = []  # already there, don't duplicate
+        categories: list = []  # already written, don't duplicate
     else:
-        categories = [{
-            "token": new_token(),
-            "name": "vehicle.unknown",
-            "description": "placeholder; annotations to be filled later",
-            "index": 0,
-        }]
+        categories = [
+            {"token": new_token(), "name": name, "description": desc, "index": i}
+            for i, (_type_id, (name, desc))
+            in enumerate(sorted(OBJECT_TYPE_TO_CATEGORY.items()))
+        ]
     if existing and existing.get("attribute.json"):
         attributes: list = []
     else:
-        attributes = [{
-            "token": new_token(),
-            "name": "vehicle.moving",
-            "description": "placeholder",
-        }]
+        attributes = [
+            {"token": new_token(), "name": name, "description": desc}
+            for _mid, (name, desc) in sorted(MOTION_TYPE_TO_ATTRIBUTE.items())
+        ]
     if existing and existing.get("visibility.json"):
         visibilities: list = []
     else:
-        visibilities = [{
-            "token": new_token(),
-            "level": "v80-100",
-            "description": "placeholder",
-        }]
+        visibilities = [
+            {"token": new_token(), "level": level, "description": desc}
+            for level, desc in VISIBILITY_LEVELS
+        ]
     # Map: append a record per log so log_tokens reference is set per bag.
     # devkit's render_sample expects a real PNG at filename; we point all maps
     # at a single shared placeholder created in materialize_files().
@@ -334,7 +357,8 @@ def build_tables(data: SensorData, scenes: list[list[dict]],
 
         # Cameras: keyframe cam ts (from scene_kfs) + sweeps in window
         for ch in channels:
-            kf_cam_ts_set = {kf["cam_ts"][ch] for kf in scene_kfs}
+            kf_cam_ts_set = {kf["cam_ts"][ch] for kf in scene_kfs
+                             if ch in kf["cam_ts"]}
             cam_in_scene_mask = (
                 (data.cam_ts[ch] >= scene_start_ns) & (data.cam_ts[ch] <= scene_end_ns)
             )

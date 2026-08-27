@@ -165,3 +165,52 @@ def collect_header_timestamps(bag_path: Path, typestore, max_seconds: float = 0.
                 # bag arrival time is what the converter uses there too.
                 out.setdefault("LIDAR_TOP", []).append(int(bag_ns))
     return {k: np.array(sorted(v), dtype=np.int64) for k, v in out.items()}
+
+
+# ------------------------------------------------------------ label taxonomy
+# Derived from msg/ObjectType.msg so the perception enum and the labelling
+# taxonomy cannot drift apart. The names follow the NuScenes dotted convention
+# (family.thing) because downstream tooling splits on the first component.
+# The integer key is the `type` field carried in ObjectFusion.
+OBJECT_TYPE_TO_CATEGORY = {
+    0:  ("unknown",                         "Unclassified object."),
+    1:  ("vehicle.car",                     "Passenger car, SUV, van."),
+    2:  ("vehicle.bus",                     "Bus or coach."),
+    3:  ("vehicle.truck",                   "Truck or lorry."),
+    4:  ("vehicle.construction",            "Construction vehicle."),
+    5:  ("vehicle.bicycle",                 "Bicycle, with or without rider."),
+    6:  ("vehicle.tricycle",                "Three-wheeled vehicle."),
+    7:  ("human.pedestrian",                "Pedestrian."),
+    8:  ("movable_object.trafficcone",      "Traffic cone."),
+    9:  ("movable_object.barrow",           "Hand cart or barrow."),
+    10: ("animal",                          "Animal other than a bird."),
+    11: ("movable_object.warning_triangle", "Roadside warning triangle."),
+    12: ("animal.bird",                     "Bird."),
+    13: ("movable_object.water_barrier",    "Water-filled barrier."),
+    14: ("static_object.lamp_post",         "Lamp or utility post."),
+    15: ("static_object.traffic_sign",      "Traffic sign."),
+    16: ("static_object.warning_post",      "Warning post or delineator."),
+    17: ("movable_object.traffic_barrel",   "Traffic barrel."),
+    18: ("vehicle.articulated_head",        "Tractor unit of an articulated vehicle."),
+    19: ("vehicle.articulated_body",        "Trailer of an articulated vehicle."),
+    20: ("vision_obstacle",                 "Obstacle detected by vision only."),
+    50: ("static_object.unknown",           "Unclassified static object."),
+}
+
+# Derived from msg/MotionType.msg.
+MOTION_TYPE_TO_ATTRIBUTE = {
+    0: ("motion.unknown",       "Motion state could not be determined."),
+    1: ("motion.stationary",    "Never observed to move."),
+    2: ("motion.stopped",       "Temporarily stopped but able to move."),
+    3: ("motion.moving_slowly", "Moving at or below 5 km/h."),
+    4: ("motion.moving",        "Moving above 5 km/h."),
+}
+
+# NuScenes' four standard visibility bins (fraction of the object visible across
+# all camera channels). Kept verbatim so devkit filters written for NuScenes work.
+VISIBILITY_LEVELS = [
+    ("v0-40",   "Between 0 and 40% visible."),
+    ("v40-60",  "Between 40 and 60% visible."),
+    ("v60-80",  "Between 60 and 80% visible."),
+    ("v80-100", "Between 80 and 100% visible."),
+]

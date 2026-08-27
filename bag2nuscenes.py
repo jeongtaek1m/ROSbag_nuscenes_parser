@@ -372,9 +372,13 @@ def main() -> None:
         if args.include_traffic_cam and "CAM_TRAFFIC" in data.cam_ts:
             channels.append("CAM_TRAFFIC")
 
-        print(f"\n[2/5] Sync ({args.sync_ms} ms, all {len(channels)} cameras must pass)...")
+        # Only the six standard channels gate a keyframe. CAM_TRAFFIC rides
+        # along when it is in tolerance; it has placeholder calibration and must
+        # not be able to throw away otherwise-good samples.
+        required = [c for c in channels if c in NUSCENES_CAMS]
+        print(f"\n[2/5] Sync ({args.sync_ms} ms)...")
         keyframes = sync_keyframes(data, channels, int(args.sync_ms * 1e6),
-                                   args.keyframe_stride)
+                                   args.keyframe_stride, required=required)
 
         print(f"\n[3/5] Scene partitioning ({args.scene_dur}s windows)...")
         scenes = partition_scenes(keyframes, args.scene_dur)

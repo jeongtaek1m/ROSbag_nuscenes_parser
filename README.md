@@ -169,17 +169,53 @@ It is not a fixed driver property — measure it per bag with
 offset with genuine capture latency and cannot be separated without
 motion-based estimation.
 
-**6. Annotations are not emitted.** `/post_fusion_object` is parsed but
-`sample_annotation.json` and `instance.json` are written empty — labelling is done
+**6. Annotations are not emitted — by design.** `/post_fusion_object` is parsed
+but `sample_annotation.json` and `instance.json` are written empty — labelling is done
 externally. `category`/`attribute`/`visibility` hold one placeholder record
 each; **replace them with the real taxonomy** before handing the dataset to a
 labelling vendor.
 
 **7. `CAM_TRAFFIC` has no calibration.** It gets an identity extrinsic and a
-fabricated `K`. Standard 6-camera pipelines ignore it; do not use it for
-geometry. Pass `--no-include-traffic-cam` to leave it out.
+fabricated `K`, so it must not be used for geometry. It is also **best-effort**:
+only the six standard cameras gate a keyframe, so `CAM_TRAFFIC` is attached when
+it is in sync tolerance and omitted otherwise — some samples carry six camera
+channels and some seven. Pass `--no-include-traffic-cam` to leave it out
+entirely.
+
+## Sensor configuration
+
+| | |
+|---|---|
+| LiDAR | **1** channel, `LIDAR_TOP`, 10 Hz. `.pcd.bin`, 5 × float32 (`x, y, z, intensity, ring`). |
+| Cameras | **7** channels, 30 Hz source. Six standard NuScenes channels + `CAM_TRAFFIC`. |
+| Samples | 2 Hz keyframes, anchored on a LiDAR sweep. |
+
+The six standard channels gate keyframes and carry real calibration.
+`CAM_TRAFFIC` does neither — see limitation 7.
+
+## Annotations
+
+The dataset ships **schema-complete and value-empty**: everything an annotation
+references is populated, and only the two annotation tables are left blank for an
+external labelling vendor.
+
+| Table | State |
+|---|---|
+| `category.json` | **22 classes**, derived from `msg/ObjectType.msg` |
+| `attribute.json` | **5 motion states**, derived from `msg/MotionType.msg` |
+| `visibility.json` | NuScenes' standard four bins |
+| `sample_annotation.json` | `[]` — vendor fills |
+| `instance.json` | `[]` — vendor fills |
+
+Deriving the taxonomy from the `.msg` enums keeps the perception class list and
+the labelling class list from drifting apart.
+
+[`docs/labeling_handoff.md`](docs/labeling_handoff.md) is the document to send to
+the vendor: required fields and types for both tables, frame conventions, the
+`CAM_TRAFFIC` caveats, the fisheye warning, and the devkit acceptance test.
 
 ## Docs
 
-- [`docs/pipeline_overview.md`](docs/pipeline_overview.md) — design rationale, timings, why three stages
+- [`docs/labeling_handoff.md`](docs/labeling_handoff.md) — what the labelling vendor must return
+- [`docs/pipeline_overview.md`](docs/pipeline_overview.md) — design rationale, why a single stage
 - [`docs/sync_reference.md`](docs/sync_reference.md) — how our sync tolerance compares to public datasets

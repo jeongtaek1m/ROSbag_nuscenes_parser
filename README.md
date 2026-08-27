@@ -36,6 +36,13 @@ decoded in-process). Only the packet path is slow — roughly 40 minutes for a
 Running it again on another bag **appends**: scene numbering continues, sensor
 and category tokens are reused, and re-importing the same bag is refused.
 
+Frames are only used inside the **coverage window**: the interval in which the
+LiDAR, the six standard cameras and odom are all present, shrunk by `--sync-ms`
+at both ends. Sensors start at different times — up to 1.4 s apart on the
+2026-08-19 bags — and a keyframe outside that window would have no image or no
+pose to attach. The per-stream offsets and the cut are printed and recorded in
+`<log>.import.json`; `scripts/screen_bags.py` shows them before converting.
+
 Useful flags: `--sync-ms`, `--keyframe-stride`, `--scene-dur`,
 `--no-include-traffic-cam`, `--no-validate`, `--keep-staging`.
 
@@ -47,8 +54,12 @@ Not every bag is convertible. Run this before spending an hour on a conversion:
 python scripts/screen_bags.py /path/to/bags/ --nominal-hz 30
 ```
 
-It reports per-camera delivery rate and flags bags that lost frames at record
-time (see *Camera frame loss* below).
+It measures each bag with the converter's own rules and prints what a conversion
+would do with it: per-stream delivery and gaps (cameras, LiDAR, odom), the
+*coverage window* and how much would be cut at head and tail, odom gaps, the INS
+solution status over time, and keyframe acceptance per sync tolerance (this is
+how `--sync-ms` gets chosen). Each bag gets a PASS / MARGINAL / DROP verdict with
+the reasons listed. See *Camera frame loss* and *INS status* below.
 
 ## Layout
 
@@ -126,10 +137,9 @@ do not expect NaN.
 
 | Script | Purpose |
 |---|---|
-| `scripts/screen_bags.py` | Per-camera delivery rate; which bags are worth converting |
+| `scripts/screen_bags.py` | Per-bag verdict: delivery and gaps per stream, coverage window, odom gaps, INS status, keyframe acceptance vs `--sync-ms` |
 | `scripts/clock_diagnosis.py` | Per-sensor clock offset/skew vs the bag clock, anchored to GPS |
 | `scripts/qa_report.py` | Dataset QA: sync survival, ego anomalies, per-scene stats (`--bag` adds raw-timestamp sections) |
-| `scripts/sync_stats.py` | Acceptance rate vs sync tolerance, straight from a bag — use it to pick `--sync-ms` |
 | `scripts/lidar2cam_projection.py` | Project LiDAR onto each camera — calibration check |
 | `scripts/extract_cam_viz.py` | 7-camera contact sheet — topic mapping check |
 | `scripts/viz_lidar_frame.py` | Single-frame BEV / side view |
@@ -177,7 +187,7 @@ they come from the bag receive clock (the sensor's own clock is not disciplined
 — PTP is not wired up yet). The points in a frame were acquired over the
 preceding ~100 ms, so the cloud is on average ~50 ms older than the camera
 matched to it. The 0° frame split also puts the sweep seam inside `CAM_FRONT`'s
-field of view. The decoder computes per-point timestamps but `_write_lidar_frame`
+field of view. The decoder computes per-point timestamps but `lidar_points_to_pcdbin`
 discards them, which is what a proper fix would need. `lidar_time_base` in
 `<log>.import.json` records which clock a given import used.
 
@@ -190,9 +200,8 @@ motion-based estimation.
 
 **6. Annotations are not emitted — by design.** `sample_annotation.json` and
 `instance.json` are written empty — labelling is done
-externally. `category`/`attribute`/`visibility` hold one placeholder record
-each; **replace them with the real taxonomy** before handing the dataset to a
-labelling vendor.
+externally. `category`/`attribute`/`visibility` carry the taxonomy the vendor
+labels against (see *Annotations* below).
 
 **7. `CAM_TRAFFIC` has no calibration.** It gets an identity extrinsic and a
 fabricated `K`, so it must not be used for geometry. It is also **best-effort**:
@@ -200,6 +209,22 @@ only the six standard cameras gate a keyframe, so `CAM_TRAFFIC` is attached when
 it is in sync tolerance and omitted otherwise — some samples carry six camera
 channels and some seven. Pass `--no-include-traffic-cam` to leave it out
 entirely.
+
+**8. `ego_pose` is in absolute UTM.** Ego poses come from `/novatel/oem7/odom`,
+which the Novatel driver derives from the INS solution (INSPVA) in UTM zone 52N,
+so translations are of order (3.0e5, 4.1e6) m. The JSON and the devkit are
+float64 and lose nothing, but float32 has a 0.25 m grid at that magnitude (0.5 m
+north of latitude ~37.9°): any consumer that casts poses to float32 — most
+training loaders, some annotation tools — quantizes ego positions and, worse,
+any box positions produced in that frame. Keep float64 end to end, or subtract a
+dataset-wide origin before casting and store the origin alongside. The converter
+deliberately leaves the frame absolute so that logs recorded on different days
+stay in one coordinate system.
+
+**9. INS status is not checked by the converter.** The driver keeps publishing
+odom while the INS is still aligning or has lost GNSS, and those poses look
+normal. `scripts/screen_bags.py` reports the INSPVA status runs and odom gaps —
+screen before converting.
 
 ## Sensor configuration
 
@@ -222,7 +247,7 @@ external labelling vendor.
 |---|---|
 | `category.json` | **22 classes**, from `msg/ObjectType.msg` |
 | `attribute.json` | **5 motion states**, from `msg/MotionType.msg` |
-| `visibility.json` | NuScenes' standard four bins |
+| `visibility.json` | NuScenes' standard four bins, with nuScenes' literal tokens `"1"`–`"4"` (tools filter on them) |
 | `sample_annotation.json` | `[]` — vendor fills |
 | `instance.json` | `[]` — vendor fills |
 

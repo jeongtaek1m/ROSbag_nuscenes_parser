@@ -70,7 +70,7 @@ Already written into the dataset; do not invent new names.
 - **`attribute.json`** — 5 motion states, derived from `msg/MotionType.msg`
   (`motion.unknown`, `motion.stationary`, `motion.stopped`,
   `motion.moving_slowly`, `motion.moving`).
-- **`visibility.json`** — NuScenes' standard four bins: `v0-40`, `v40-60`,
+- **`visibility.json`** — tokens are the literal strings `"1"`, `"2"`, `"3"`, `"4"` exactly as in nuScenes (downstream tools filter on them; do not invent others). NuScenes' standard four bins: `v0-40`, `v40-60`,
   `v60-80`, `v80-100`, measured as the fraction of the object visible across all
   camera channels.
 
@@ -96,7 +96,7 @@ Two JSON files, matching the NuScenes schema exactly.
 | `sample_token` | str | FK into `sample.json` |
 | `instance_token` | str | FK into `instance.json` |
 | `attribute_tokens` | list[str] | FKs into `attribute.json` (may be empty) |
-| `visibility_token` | str | FK into `visibility.json` |
+| `visibility_token` | str | one of `"1"`, `"2"`, `"3"`, `"4"` (FK into `visibility.json`) |
 | `translation` | [x, y, z] | box centre in the **global** frame, metres |
 | `size` | [w, l, h] | width, length, height in metres |
 | `rotation` | [w, x, y, z] | box orientation quaternion in the **global** frame |
@@ -107,6 +107,10 @@ Two JSON files, matching the NuScenes schema exactly.
 
 ### Constraints that must hold
 
+- The global frame is **UTM zone 52N in metres** — coordinates are of order
+  (3.0e5, 4.1e6). Keep them in float64: float32 quantizes to a 0.25 m grid at
+  that magnitude, which would corrupt box centres. If your tooling is float32,
+  subtract a fixed origin on import and add it back on export.
 - `translation`/`rotation` are in the **global** frame, not the ego or LiDAR
   frame. Convert with the `ego_pose` referenced by that sample's `LIDAR_TOP`
   `sample_data`, then the `calibrated_sensor` for `LIDAR_TOP`.

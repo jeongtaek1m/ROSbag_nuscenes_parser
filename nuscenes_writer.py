@@ -10,9 +10,10 @@ Conventions:
     (P_sensor = R @ P_ego + t); NuScenes wants the sensor pose in the ego frame,
     so it is inverted when writing calibrated_sensor.json.
   - sample_annotation/instance are emitted empty on purpose: labels are produced
-    externally. category/attribute/visibility hold one placeholder record each
-    so foreign keys stay valid; replace them with the real taxonomy before
-    handing the dataset to a labelling vendor.
+    externally. category/attribute carry the label taxonomy (from the perception
+    stack's enums, see common.py) and visibility the four nuScenes bins with
+    nuScenes' literal tokens "1".."4", so a vendor fills the two empty tables
+    against a complete, standard-looking schema.
   - Images are not undistorted anywhere in this pipeline; NuScenes has no
     distortion field. See "Known limitations" in README.md.
 """
@@ -20,7 +21,7 @@ from __future__ import annotations
 
 import json
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -52,6 +53,10 @@ class SensorData:
     cam_size: dict[str, tuple[int, int]]  # channel -> (height, width)
     bag_start_ns: int
     bag_end_ns: int
+    # Built lazily by interp_pose and reused. Slerp's constructor preprocesses
+    # every odom sample (O(N)); build_tables interpolates once per
+    # (scene, channel), so rebuilding it per call cost scenes x channels x N.
+    _slerp: Slerp | None = field(default=None, repr=False, compare=False)
 
 
 
@@ -70,10 +75,69 @@ def nearest_ts(query: np.ndarray, target: np.ndarray) -> tuple[np.ndarray, np.nd
     return matched, diff
 
 
+def required_streams(data: SensorData, required: list[str]) -> dict[str, np.ndarray]:
+    """The streams a keyframe cannot do without: LiDAR, the gating cameras, odom."""
+    out: dict[str, np.ndarray] = {"LIDAR_TOP": data.lidar_ts}
+    out.update({ch: data.cam_ts[ch] for ch in required})
+    out["ODOM"] = data.odom_ts
+    return out
+
+
+def coverage_window(streams: dict[str, np.ndarray], sync_ns: int) -> dict:
+    """The interval in which every stream in `streams` has data, shrunk by sync_ns.
+
+    Sensors start and stop at different times (up to ~1.4 s apart on the
+    2026-08-19 bags). A keyframe outside this interval would have no image or
+    no pose to attach; the margin exists because a camera frame matched to a
+    keyframe may sit up to sync_ns away from it and still needs a pose.
+    `streams` is name -> sorted timestamps (ns). The result is JSON-friendly.
+    """
+    present = {k: v for k, v in streams.items() if len(v)}
+    if not present:
+        raise ValueError("coverage_window: no timestamps in any stream")
+    firsts = {k: int(v[0]) for k, v in present.items()}
+    lasts = {k: int(v[-1]) for k, v in present.items()}
+    earliest, latest = min(firsts.values()), max(lasts.values())
+    last_start = max(firsts, key=firsts.__getitem__)
+    first_end = min(lasts, key=lasts.__getitem__)
+    start = firsts[last_start] + int(sync_ns)
+    end = lasts[first_end] - int(sync_ns)
+    return {
+        "start_ns": start, "end_ns": end, "sync_ns": int(sync_ns),
+        "earliest_ns": earliest, "latest_ns": latest,
+        "last_start": last_start, "first_end": first_end,
+        "head_cut_s": (start - earliest) / 1e9,
+        "tail_cut_s": (latest - end) / 1e9,
+        "streams": {k: {"first_ns": firsts[k], "last_ns": lasts[k],
+                        "start_offset_s": (firsts[k] - earliest) / 1e9,
+                        "end_offset_s": (lasts[k] - latest) / 1e9}
+                    for k in present},
+    }
+
+
+def format_coverage(window: dict) -> list[str]:
+    """Human-readable lines for a coverage_window() result."""
+    lines = [f"{'stream':16} {'starts':>9} {'ends':>9}"]
+    for k, w in window["streams"].items():
+        lines.append(f"{k:16} {w['start_offset_s']:+8.3f}s {w['end_offset_s']:+8.3f}s")
+    lines.append(
+        f"coverage window: head cut {window['head_cut_s']:.3f}s "
+        f"({window['last_start']} starts last), tail cut {window['tail_cut_s']:.3f}s "
+        f"({window['first_end']} ends first), margin {window['sync_ns'] / 1e6:.0f} ms")
+    return lines
+
+
 def sync_keyframes(data: SensorData, channels: list[str], sync_ns: int,
                    keyframe_stride: int,
-                   required: list[str] | None = None) -> list[dict]:
+                   required: list[str] | None = None,
+                   window: dict | None = None) -> list[dict]:
     """Pick every Kth lidar ts as a keyframe anchor and match cameras to it.
+
+    Candidates are restricted to the coverage window (see coverage_window): the
+    span in which LiDAR, every required camera and odom are all present. Since
+    scenes and sweeps only ever lie between keyframes, that is what guarantees
+    every frame in the dataset has both an image and a pose. `window` may be
+    passed in when the caller has already computed it.
 
     `required` channels must all land within `sync_ns` or the keyframe is
     dropped. Channels outside `required` are best-effort: they are attached when
@@ -88,9 +152,14 @@ def sync_keyframes(data: SensorData, channels: list[str], sync_ns: int,
     required = list(channels) if required is None else [c for c in required if c in channels]
     optional = [c for c in channels if c not in required]
 
-    anchors = data.lidar_ts[::keyframe_stride]
+    if window is None:
+        window = coverage_window(required_streams(data, required), sync_ns)
+    all_anchors = data.lidar_ts[::keyframe_stride]
+    in_window = (all_anchors >= window["start_ns"]) & (all_anchors <= window["end_ns"])
+    anchors = all_anchors[in_window]
     print(f"  candidate keyframes: {len(anchors)} "
-          f"(every {keyframe_stride}th of {len(data.lidar_ts)} lidar)")
+          f"(every {keyframe_stride}th of {len(data.lidar_ts)} lidar; "
+          f"{int((~in_window).sum())} outside the coverage window)")
     print(f"  gating on {len(required)} channel(s); "
           f"best-effort: {optional or 'none'}")
 
@@ -156,8 +225,16 @@ def interp_pose(query_ns: np.ndarray, data: SensorData) -> tuple[np.ndarray, np.
     """Interpolate ego pose at each query ns. Returns (translations, quaternions[wxyz])."""
     odom_ts = data.odom_ts
     odom_t = data.odom_t
-    # Clip query to odom range to avoid SLERP errors at the edges
-    q = np.clip(query_ns, odom_ts[0], odom_ts[-1])
+    # Every frame must lie inside odom coverage; coverage_window guarantees it
+    # for anything sync_keyframes lets through. Clipping here instead would
+    # silently freeze the pose at the first/last odom sample.
+    outside = (query_ns < odom_ts[0]) | (query_ns > odom_ts[-1])
+    if outside.any():
+        raise ValueError(
+            f"{int(outside.sum())} frame timestamp(s) outside odom coverage "
+            f"[{int(odom_ts[0])}, {int(odom_ts[-1])}] ns — keyframes were not "
+            "restricted to the coverage window")
+    q = query_ns
 
     # Linear interp translation
     tx = np.interp(q, odom_ts, odom_t[:, 0])
@@ -165,9 +242,11 @@ def interp_pose(query_ns: np.ndarray, data: SensorData) -> tuple[np.ndarray, np.
     tz = np.interp(q, odom_ts, odom_t[:, 2])
     trans = np.stack([tx, ty, tz], axis=-1)
 
-    # SLERP rotation
-    slerp = Slerp(odom_ts.astype(np.float64), data.odom_R)
-    rots = slerp(q.astype(np.float64))
+    # SLERP rotation. The interpolator is cached on `data`: constructing it
+    # walks every odom sample, which dwarfs the interpolation itself.
+    if data._slerp is None:
+        data._slerp = Slerp(odom_ts.astype(np.float64), data.odom_R)
+    rots = data._slerp(q.astype(np.float64))
     quats_xyzw = rots.as_quat()
     quats_wxyz = np.stack(
         [quats_xyzw[:, 3], quats_xyzw[:, 0], quats_xyzw[:, 1], quats_xyzw[:, 2]],
@@ -176,16 +255,18 @@ def interp_pose(query_ns: np.ndarray, data: SensorData) -> tuple[np.ndarray, np.
     return trans, quats_wxyz
 
 
-def assign_to_nearest_sample(target_ts: np.ndarray, sample_ts: np.ndarray) -> np.ndarray:
-    """For each target ts, return index into sample_ts (nearest)."""
+def assign_to_following_sample(target_ts: np.ndarray, sample_ts: np.ndarray) -> np.ndarray:
+    """For each target ts, the index of the first sample at or after it.
+
+    nuScenes' rule for sweeps: a sample owns the sweeps recorded since the
+    previous sample, up to its own instant. In the official data every sweep
+    (camera, lidar, radar) points at the keyframe that follows it, even when
+    the one before is closer. Targets past the last sample map to the last one.
+    """
     if len(sample_ts) == 0:
         return np.full_like(target_ts, -1, dtype=np.int64)
-    idx = np.searchsorted(sample_ts, target_ts)
-    idx_l = np.clip(idx - 1, 0, len(sample_ts) - 1)
-    idx_r = np.clip(idx, 0, len(sample_ts) - 1)
-    d_l = np.abs(sample_ts[idx_l] - target_ts)
-    d_r = np.abs(sample_ts[idx_r] - target_ts)
-    return np.where(d_l <= d_r, idx_l, idx_r)
+    idx = np.searchsorted(sample_ts, target_ts, side="left")
+    return np.clip(idx, 0, len(sample_ts) - 1)
 
 
 def build_tables(data: SensorData, scenes: list[list[dict]],
@@ -293,9 +374,14 @@ def build_tables(data: SensorData, scenes: list[list[dict]],
     if existing and existing.get("visibility.json"):
         visibilities: list = []
     else:
+        # nuScenes gives these four rows the literal tokens "1".."4" (the one
+        # table that does not use uuids), and downstream tools filter on those
+        # strings — e.g. mmdetection3d keeps a box only if its visibility_token
+        # is in {"1","2","3","4"}. Random tokens here would silently drop every
+        # vendor-produced annotation from such tools.
         visibilities = [
-            {"token": new_token(), "level": level, "description": desc}
-            for level, desc in VISIBILITY_LEVELS
+            {"token": str(i + 1), "level": level, "description": desc}
+            for i, (level, desc) in enumerate(VISIBILITY_LEVELS)
         ]
     # Map: append a record per log so log_tokens reference is set per bag.
     # devkit's render_sample expects a real PNG at filename; we point all maps
@@ -372,15 +458,21 @@ def build_tables(data: SensorData, scenes: list[list[dict]],
                 ch_frames.append((int(t), is_kf, new_token()))
             channel_frames[ch] = ch_frames
 
-        # Map keyframe lidar_ts -> sample_token for sample_data linkage
-        kf_lidar_to_sample = {int(t): tok for t, tok in zip(scene_kf_ts, scene_kf_tokens)}
+        # A keyframe frame belongs to the sample it was synchronized into: the
+        # lidar frame by its own timestamp, a camera frame by the match
+        # sync_keyframes made — it may sit a few ms after the lidar instant, so
+        # it must not be re-assigned by time. Sweeps attach to the following
+        # keyframe, as in nuScenes (see assign_to_following_sample). Anchors are
+        # this scene's keyframes only, so every sample_data stays in its scene.
+        kf_frame_to_sample: dict[tuple[str, int], str] = {}
+        for kf, tok in zip(scene_kfs, scene_kf_tokens):
+            kf_frame_to_sample[("LIDAR_TOP", int(kf["lidar_ts"]))] = tok
+            for ch, t in kf["cam_ts"].items():
+                kf_frame_to_sample[(ch, int(t))] = tok
 
-        # Build channel-keyed nearest-sample mapping for sweeps using the sorted
-        # scene_kf_ts as anchors (so all sample_data in this scene attach to a
-        # sample within this scene).
         for ch_name, frames in channel_frames.items():
             frame_ts_arr = np.array([f[0] for f in frames], dtype=np.int64)
-            nearest_kf = assign_to_nearest_sample(frame_ts_arr, scene_kf_ts)
+            following_kf = assign_to_following_sample(frame_ts_arr, scene_kf_ts)
 
             # interp ego pose for every frame ts in this channel (one ego_pose per sample_data)
             trans, quats = interp_pose(frame_ts_arr, data)
@@ -395,12 +487,10 @@ def build_tables(data: SensorData, scenes: list[list[dict]],
                     "timestamp": int(ts_ns) // 1000,
                 })
 
-                # Determine sample_token: keyframes use their own; sweeps use nearest keyframe lidar_ts -> sample_token
-                if is_kf and ch_name == "LIDAR_TOP":
-                    sample_token = kf_lidar_to_sample[ts_ns]
+                if is_kf:
+                    sample_token = kf_frame_to_sample[(ch_name, int(ts_ns))]
                 else:
-                    nearest_kf_ts = int(scene_kf_ts[nearest_kf[i]])
-                    sample_token = kf_lidar_to_sample[nearest_kf_ts]
+                    sample_token = scene_kf_tokens[following_kf[i]]
 
                 # filename: samples/<channel>/<token>.<ext> or sweeps/<channel>/<token>.<ext>
                 bucket = "samples" if is_kf else "sweeps"

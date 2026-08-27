@@ -74,6 +74,16 @@ ego 프레임에서의 센서 pose. `common.opencv_ext_to_nuscenes_pose`가 변�
 채널 수를 받으므로 표준 6채널 파이프라인은 자동으로 무시한다. 다만 캘리브가
 placeholder이므로 기하 용도로 쓰면 안 된다. `--no-include-traffic-cam`으로 제외.
 
+### Coverage window
+
+센서마다 녹화 시작·종료 시점이 다르다(2026-08-19 bag에서 최대 1.4초). 라이다,
+표준 카메라 6개, odom이 **모두** 살아 있는 교집합 구간을 `--sync-ms`만큼 안쪽으로
+줄인 것이 coverage window이고, keyframe 후보는 그 안에서만 고른다. scene과 sweep은
+keyframe 사이에만 놓이므로 모든 프레임에 이미지와 pose가 있음이 구조적으로
+보장되고, `interp_pose`는 odom 범위 밖 쿼리를 clip하는 대신 에러로 취급한다.
+스트림별 오프셋과 잘린 길이는 로그와 `<log>.import.json`에 남는다. 중간에 끊기는
+경우(odom gap, INS 상태 불량)는 변환기가 아니라 `scripts/screen_bags.py`가 잡는다.
+
 ### 자동 검증
 
 실행 마지막에 `NuScenes(version, dataroot)`로 직접 로드한다. 13개 테이블,

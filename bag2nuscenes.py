@@ -22,6 +22,9 @@ import argparse
 import json
 import shutil
 import sys
+import threading
+from collections import deque
+from concurrent.futures import Future, ThreadPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -44,10 +47,13 @@ from common import (
 from nuscenes_writer import (
     SensorData,
     build_tables,
+    coverage_window,
+    format_coverage,
     new_token,
     load_existing_tables,
     merge_tables,
     partition_scenes,
+    required_streams,
     sync_keyframes,
     validate_with_devkit,
     write_tables,
@@ -77,51 +83,146 @@ class _Stamp:
         return self._s
 
 
-def pointcloud2_to_xyzir(msg) -> np.ndarray:
-    """PointCloud2 -> (N, 5) float32 of x, y, z, intensity, ring.
+_PCD_COLUMNS = ("x", "y", "z", "intensity", "ring")
+_PC2_DTYPES: dict[tuple, np.dtype] = {}
 
-    Field offsets are honoured rather than assumed, because the padding between
-    fields differs between Robosense models.
+
+def _pointcloud2_dtype(msg) -> np.dtype:
+    """Structured dtype that views a PointCloud2 buffer in place.
+
+    Field offsets and point_step are honoured rather than assumed, because the
+    padding between fields differs between Robosense models. Cached per field
+    layout, which is constant for a topic.
     """
-    point_step = int(msg.point_step)
-    data = bytes(msg.data)
-    n_pts = len(data) // point_step
-    parts: list = []
-    cursor = 0
-    for f in sorted(msg.fields, key=lambda f: f.offset):
-        if f.offset > cursor:
-            parts.append((f"_pad{cursor}", f"V{f.offset - cursor}"))
-        np_type = _PF_DTYPE[f.datatype]
-        parts.append((f.name, np_type))
-        cursor = f.offset + np.dtype(np_type).itemsize
-    if cursor < point_step:
-        parts.append(("_pad_end", f"V{point_step - cursor}"))
-    arr = np.frombuffer(data, dtype=np.dtype(parts), count=n_pts)
-    out = np.empty((n_pts, 5), dtype=np.float32)
-    for i, name in enumerate(["x", "y", "z", "intensity", "ring"]):
-        out[:, i] = arr[name].astype(np.float32, copy=False)
-    return out
+    key = (tuple((f.name, int(f.offset), int(f.datatype), int(f.count))
+                 for f in msg.fields),
+           int(msg.point_step), bool(msg.is_bigendian))
+    dt = _PC2_DTYPES.get(key)
+    if dt is None:
+        formats = []
+        for f in msg.fields:
+            t = np.dtype(_PF_DTYPE[f.datatype])
+            if msg.is_bigendian:
+                t = t.newbyteorder(">")
+            formats.append(t if int(f.count) == 1 else (t, int(f.count)))
+        dt = np.dtype({"names": [f.name for f in msg.fields],
+                       "formats": formats,
+                       "offsets": [int(f.offset) for f in msg.fields],
+                       "itemsize": int(msg.point_step)})
+        _PC2_DTYPES[key] = dt
+    return dt
 
 
-def _write_lidar_frame(points, frame_ts_ns: int, staging: Path) -> int:
-    """Write one sweep as NuScenes .pcd.bin (5 x float32 per point).
+def pointcloud2_to_pcdbin(msg) -> np.ndarray:
+    """PointCloud2 -> (M, 5) float32 of x, y, z, intensity, ring, NaN dropped.
 
     Robosense publishes an organized cloud, so no-return directions arrive as
     NaN placeholders — around 42% of a 128x1800 sweep. NuScenes point clouds are
-    unorganized and devkit consumers do not expect NaN, so they are dropped
-    here. Returns the number of points kept.
+    unorganized and devkit consumers do not expect NaN, so they are dropped.
+
+    The buffer is viewed in place through a structured dtype and only the
+    surviving points are copied, once per column. Doing it the obvious way —
+    copy every column out, then mask — moved each cloud through memory several
+    times and spent most of its time in a row-wise all() reduction.
+    """
+    dt = _pointcloud2_dtype(msg)
+    missing = [c for c in _PCD_COLUMNS if c not in dt.names]
+    if missing:
+        raise SystemExit(f"PointCloud2 lacks field(s) {missing}; "
+                         f"has {list(dt.names)}")
+    arr = np.frombuffer(msg.data, dtype=dt, count=len(msg.data) // dt.itemsize)
+    # ring is an integer field and always finite, so these four checks are
+    # exactly the former all-five-columns test.
+    keep = np.isfinite(arr["x"])
+    for name in ("y", "z", "intensity"):
+        keep &= np.isfinite(arr[name])
+    out = np.empty((int(keep.sum()), 5), dtype=np.float32)
+    if len(out):
+        for k, name in enumerate(_PCD_COLUMNS):
+            out[:, k] = arr[name][keep]
+    return out
+
+
+def lidar_points_to_pcdbin(points) -> np.ndarray:
+    """Generic (N, >=5) points -> (M, 5) float32 with non-finite rows dropped.
+
+    Used for the packet decoder, which returns a list of tuples with a 6th
+    column of per-point timestamps; .pcd.bin is 5 floats per point, so that
+    column is discarded here.
     """
     arr = np.asarray(points, dtype=np.float32)
     if arr.ndim != 2 or arr.shape[1] < 5:
-        return 0
-    # The packet decoder emits a 6th column of per-point timestamps; .pcd.bin is
-    # 5 floats per point, so it is dropped here.
+        return np.empty((0, 5), dtype=np.float32)
     arr = arr[:, :5]
-    arr = arr[np.isfinite(arr).all(axis=1)]
+    return np.ascontiguousarray(arr[np.isfinite(arr).all(axis=1)])
+
+
+def _write_lidar_frame(arr: np.ndarray, frame_ts_ns: int, staging: Path,
+                       writer: _StagingWriter) -> int:
+    """Queue one sweep for writing as NuScenes .pcd.bin (5 x float32 per point).
+
+    Returns the number of points; 0 means the frame was empty and skipped.
+    """
     if not len(arr):
         return 0
-    (staging / "lidar" / f"{frame_ts_ns}.pcd.bin").write_bytes(arr.tobytes())
+    writer.submit(staging / "lidar" / f"{frame_ts_ns}.pcd.bin",
+                  np.ascontiguousarray(arr, dtype=np.float32))
     return len(arr)
+
+
+class _StagingWriter:
+    """Write staged payloads on a small thread pool.
+
+    File I/O releases the GIL, so open/write/close overlap with the main
+    thread's deserialization and point-cloud filtering instead of serializing
+    with them. At most `depth` buffers are in flight, which bounds memory (a
+    sweep is ~4 MB, a JPEG ~0.5 MB). Completed writes are reaped on every
+    submit and the first failure is re-raised on the main thread, so a full
+    disk surfaces within a few dozen messages rather than at the end.
+    """
+
+    def __init__(self, workers: int = 4, depth: int = 64):
+        self._pool = ThreadPoolExecutor(max_workers=workers,
+                                        thread_name_prefix="staging")
+        self._slots = threading.BoundedSemaphore(depth)
+        self._pending: deque[Future] = deque()
+
+    def submit(self, path: Path, buf) -> None:
+        """Queue `buf` (bytes or a C-contiguous array) to be written to `path`."""
+        self._reap(block=False)
+        self._slots.acquire()
+        try:
+            self._pending.append(self._pool.submit(self._write, path, buf))
+        except BaseException:
+            self._slots.release()
+            raise
+
+    def _write(self, path: Path, buf) -> None:
+        try:
+            path.write_bytes(buf)
+        finally:
+            self._slots.release()
+
+    def _reap(self, block: bool) -> None:
+        while self._pending and (block or self._pending[0].done()):
+            self._pending.popleft().result()  # re-raises a failed write
+
+    def close(self) -> None:
+        """Wait for every queued write; raises if any of them failed."""
+        try:
+            self._reap(block=True)
+        finally:
+            self._pool.shutdown(wait=True)
+
+    def __enter__(self) -> _StagingWriter:
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        if exc_type is None:
+            self.close()
+        else:
+            # Don't mask the original error with a write failure; just drain.
+            self._pool.shutdown(wait=True)
 
 
 def read_bag(bag_path: Path, staging: Path, calib_dir: Path,
@@ -129,7 +230,8 @@ def read_bag(bag_path: Path, staging: Path, calib_dir: Path,
     """Single pass over the bag: stage sensor payloads, collect timestamps.
 
     Camera JPEGs and LiDAR frames land in `staging` named by timestamp; odom is
-    small enough to hold in memory until the tables are built.
+    small enough to hold in memory until the tables are built. Payload writes
+    go through a small thread pool so file I/O overlaps with parsing.
     """
     for ch in TOPIC_TO_CAM_CHANNEL.values():
         (staging / "cameras" / ch).mkdir(parents=True, exist_ok=True)
@@ -145,7 +247,8 @@ def read_bag(bag_path: Path, staging: Path, calib_dir: Path,
     n_msop_skipped = 0
     lidar_topics_seen: set[str] = set()
 
-    with AnyReader([bag_path], default_typestore=typestore) as reader:
+    with _StagingWriter() as writer, \
+         AnyReader([bag_path], default_typestore=typestore) as reader:
         wanted_topics = (set(TOPIC_TO_CAM_CHANNEL)
                          | {ODOM_TOPIC, LIDAR_POINTS_TOPIC, LIDAR_PACKETS_TOPIC})
         conns = [c for c in reader.connections if c.topic in wanted_topics]
@@ -166,13 +269,15 @@ def read_bag(bag_path: Path, staging: Path, calib_dir: Path,
             if topic in TOPIC_TO_CAM_CHANNEL:
                 ch = TOPIC_TO_CAM_CHANNEL[topic]
                 ts_ns = stamp_to_ns(msg.header.stamp)
-                (staging / "cameras" / ch / f"{ts_ns}.jpg").write_bytes(bytes(msg.data))
+                writer.submit(staging / "cameras" / ch / f"{ts_ns}.jpg",
+                              bytes(msg.data))
                 cam_ts[ch].append(ts_ns)
 
             elif topic == LIDAR_POINTS_TOPIC:
                 lidar_topics_seen.add(topic)
                 ts_ns = stamp_to_ns(msg.header.stamp)
-                if _write_lidar_frame(pointcloud2_to_xyzir(msg), ts_ns, staging):
+                if _write_lidar_frame(pointcloud2_to_pcdbin(msg), ts_ns,
+                                      staging, writer):
                     lidar_ts.append(ts_ns)
 
             elif topic == LIDAR_PACKETS_TOPIC:
@@ -191,7 +296,8 @@ def read_bag(bag_path: Path, staging: Path, calib_dir: Path,
                     pkt, _Stamp(bag_ns / 1e9), bool(msg.is_frame_begin)
                 ):
                     ts_ns = int(frame_ts * 1e9)
-                    if _write_lidar_frame(points, ts_ns, staging):
+                    if _write_lidar_frame(lidar_points_to_pcdbin(points), ts_ns,
+                                          staging, writer):
                         lidar_ts.append(ts_ns)
 
             elif topic == ODOM_TOPIC:
@@ -203,7 +309,8 @@ def read_bag(bag_path: Path, staging: Path, calib_dir: Path,
         if LIDAR_PACKETS_TOPIC in lidar_topics_seen:
             for points, frame_ts in decoder.flush():
                 ts_ns = int(frame_ts * 1e9)
-                if _write_lidar_frame(points, ts_ns, staging):
+                if _write_lidar_frame(lidar_points_to_pcdbin(points), ts_ns,
+                                          staging, writer):
                     lidar_ts.append(ts_ns)
 
         bag_start_ns, bag_end_ns = int(reader.start_time), int(reader.end_time)
@@ -225,12 +332,16 @@ def read_bag(bag_path: Path, staging: Path, calib_dir: Path,
             cam_size[ch] = (img.shape[0], img.shape[1])
 
     odom = np.array(sorted(odom_rows), dtype=np.float64)
+    odom_ts = odom[:, 0].astype(np.int64)
+    # Ego poses are interpolated between odom samples, so a gap in odom is
+    # invisible in the output; report it here and let screen_bags.py judge it.
+    odom_max_gap_ms = float(np.diff(odom_ts).max() / 1e6) if len(odom_ts) > 1 else 0.0
     data = SensorData(
         calib=load_calib(calib_dir),
         cam_ts={ch: np.array(sorted(v), dtype=np.int64)
                 for ch, v in cam_ts.items() if v},
         lidar_ts=np.array(sorted(lidar_ts), dtype=np.int64),
-        odom_ts=odom[:, 0].astype(np.int64),
+        odom_ts=odom_ts,
         odom_t=odom[:, 1:4],
         odom_R=Rotation.from_quat(odom[:, [5, 6, 7, 4]]),  # wxyz -> xyzw
         cam_size=cam_size,
@@ -249,6 +360,7 @@ def read_bag(bag_path: Path, staging: Path, calib_dir: Path,
         "n_camera_frames": sum(len(v) for v in cam_ts.values()),
         "n_lidar_frames": len(lidar_ts),
         "n_odom_samples": len(odom_rows),
+        "odom_max_gap_ms": odom_max_gap_ms,
     }
     return data, stats
 
@@ -345,7 +457,10 @@ def main() -> None:
               f"over {len(data.cam_ts)} channels")
         print(f"  lidar:   {len(data.lidar_ts)} frames "
               f"({stats['lidar_time_base']})")
-        print(f"  odom:    {len(data.odom_ts)} samples")
+        print(f"  odom:    {len(data.odom_ts)} samples, max gap "
+              f"{stats['odom_max_gap_ms']:.0f} ms"
+              + ("   [!] ego pose is interpolated across gaps — run "
+                 "scripts/screen_bags.py" if stats["odom_max_gap_ms"] > 500 else ""))
 
         channels = [c for c in NUSCENES_CAMS if c in data.cam_ts]
         missing = sorted(set(NUSCENES_CAMS) - set(channels))
@@ -358,9 +473,17 @@ def main() -> None:
         # along when it is in tolerance; it has placeholder calibration and must
         # not be able to throw away otherwise-good samples.
         required = [c for c in channels if c in NUSCENES_CAMS]
+        sync_ns = int(args.sync_ms * 1e6)
         print(f"\n[2/5] Sync ({args.sync_ms} ms)...")
-        keyframes = sync_keyframes(data, channels, int(args.sync_ms * 1e6),
-                                   args.keyframe_stride, required=required)
+        window = coverage_window(required_streams(data, required), sync_ns)
+        for line in format_coverage(window):
+            print("  " + line)
+        stats["coverage_window"] = window
+        if window["end_ns"] <= window["start_ns"]:
+            raise SystemExit("required streams (lidar, standard cameras, odom) "
+                             "do not overlap in time — nothing to convert")
+        keyframes = sync_keyframes(data, channels, sync_ns, args.keyframe_stride,
+                                   required=required, window=window)
 
         print(f"\n[3/5] Scene partitioning ({args.scene_dur}s windows)...")
         scenes = partition_scenes(keyframes, args.scene_dur)

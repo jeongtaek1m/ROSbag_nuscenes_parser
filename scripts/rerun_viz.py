@@ -55,9 +55,9 @@ def intensity_colors(intensity: np.ndarray) -> np.ndarray:
     return lut[(norm * 255).astype(np.int32)][:, ::-1].astype(np.uint8)  # -> RGB
 
 
-def find_snapshot_calib(calib_dir: Path) -> dict | None:
+def find_snapshot_calib(calib_dir: Path | None) -> dict | None:
     """Load the calibration snapshot, for the distortion NuScenes cannot store."""
-    if not calib_dir.exists():
+    if calib_dir is None or not calib_dir.exists():
         return None
     return load_calib(calib_dir)
 
@@ -220,9 +220,9 @@ def main():
     p.add_argument("--version", default="v1.0-trainval")
     p.add_argument("--scene", default="0",
                    help="Scene index (int) or scene name (e.g. scene-0001).")
-    p.add_argument("--calib", type=Path,
-                   default=Path(__file__).resolve().parent.parent / "calib" / "2025_6_27",
-                   help="Calibration snapshot, for the distortion NuScenes cannot store.")
+    p.add_argument("--calib", type=Path, default=None,
+                   help="Calibration snapshot, for the distortion NuScenes cannot "
+                        "store. Without it, projection ignores distortion.")
     p.add_argument("--max-samples", type=int, default=None,
                    help="Limit number of samples (for quick preview).")
     p.add_argument("--save", type=Path, default=None,

@@ -32,7 +32,6 @@ from scipy.spatial.transform import Rotation
 from tqdm import tqdm
 
 from common import (
-    ANNOTATION_TOPIC,
     LIDAR_PACKETS_TOPIC,
     LIDAR_POINTS_TOPIC,
     NUSCENES_CAMS,
@@ -126,32 +125,29 @@ def _write_lidar_frame(points, frame_ts_ns: int, staging: Path) -> int:
 
 
 def read_bag(bag_path: Path, staging: Path, calib_dir: Path,
-             msg_dir: Path, packet_msg_dir: Path) -> tuple[SensorData, dict]:
+             packet_msg_dir: Path) -> tuple[SensorData, dict]:
     """Single pass over the bag: stage sensor payloads, collect timestamps.
 
-    Camera JPEGs and LiDAR frames land in `staging` named by timestamp; odom and
-    annotations are small enough to hold in memory until the tables are built.
+    Camera JPEGs and LiDAR frames land in `staging` named by timestamp; odom is
+    small enough to hold in memory until the tables are built.
     """
     for ch in TOPIC_TO_CAM_CHANNEL.values():
         (staging / "cameras" / ch).mkdir(parents=True, exist_ok=True)
     (staging / "lidar").mkdir(parents=True, exist_ok=True)
 
-    typestore = make_typestore((msg_dir, "data_processing"),
-                               (packet_msg_dir, "rslidar_msg"))
+    typestore = make_typestore((packet_msg_dir, "rslidar_msg"))
 
     cam_ts: dict[str, list[int]] = {ch: [] for ch in TOPIC_TO_CAM_CHANNEL.values()}
     cam_size: dict[str, tuple[int, int]] = {}
     lidar_ts: list[int] = []
     odom_rows: list[tuple] = []
-    ann_rows: list[tuple] = []
     decoder = RSP128Decoder()
     n_msop_skipped = 0
     lidar_topics_seen: set[str] = set()
 
     with AnyReader([bag_path], default_typestore=typestore) as reader:
         wanted_topics = (set(TOPIC_TO_CAM_CHANNEL)
-                         | {ODOM_TOPIC, ANNOTATION_TOPIC,
-                            LIDAR_POINTS_TOPIC, LIDAR_PACKETS_TOPIC})
+                         | {ODOM_TOPIC, LIDAR_POINTS_TOPIC, LIDAR_PACKETS_TOPIC})
         conns = [c for c in reader.connections if c.topic in wanted_topics]
         if not conns:
             raise SystemExit(f"no pipeline topics in {bag_path}")
@@ -203,18 +199,6 @@ def read_bag(bag_path: Path, staging: Path, calib_dir: Path,
                 odom_rows.append((stamp_to_ns(msg.header.stamp),
                                   p_.x, p_.y, p_.z, q_.w, q_.x, q_.y, q_.z))
 
-            elif topic == ANNOTATION_TOPIC:
-                ts_ns = stamp_to_ns(msg.header.stamp)
-                for o in msg.object_list:
-                    ann_rows.append((
-                        ts_ns, int(o.track_id), int(o.type),
-                        float(o.box_center_base.x), float(o.box_center_base.y),
-                        float(o.box_center_base.z), float(o.box_size.width),
-                        float(o.box_size.length), float(o.box_size.height),
-                        float(o.yaw_base), float(o.velocity_base.x),
-                        float(o.velocity_base.y), float(o.velocity_base.z),
-                        float(o.yaw_rate), int(o.track_state), int(o.track_age),
-                    ))
 
         if LIDAR_PACKETS_TOPIC in lidar_topics_seen:
             for points, frame_ts in decoder.flush():
@@ -265,7 +249,6 @@ def read_bag(bag_path: Path, staging: Path, calib_dir: Path,
         "n_camera_frames": sum(len(v) for v in cam_ts.values()),
         "n_lidar_frames": len(lidar_ts),
         "n_odom_samples": len(odom_rows),
-        "n_annotation_objects": len(ann_rows),
     }
     return data, stats
 
@@ -312,8 +295,9 @@ def main() -> None:
     p.add_argument("bag", type=Path, help="Path to a single .bag file.")
     p.add_argument("--out", type=Path, default=Path("/data/tcar_nuscenes"),
                    help="NuScenes dataroot (default: /data/tcar_nuscenes).")
-    p.add_argument("--calib", type=Path, default=here / "calib" / "2025_6_27",
-                   help="Calibration snapshot directory.")
+    p.add_argument("--calib", type=Path, required=True,
+                   help="Calibration snapshot directory (not shipped with this "
+                        "repo — supply your own; see README 'Calibration').")
     p.add_argument("--version", default="v1.0-trainval",
                    help="NuScenes version subdirectory (default: v1.0-trainval).")
     p.add_argument("--keyframe-stride", type=int, default=5,
@@ -326,7 +310,6 @@ def main() -> None:
     p.add_argument("--include-traffic-cam", action=argparse.BooleanOptionalAction,
                    default=True,
                    help="Include CAM_TRAFFIC as a 7th channel.")
-    p.add_argument("--msg-dir", type=Path, default=here / "msg")
     p.add_argument("--packet-msg-dir", type=Path,
                    default=here / "packet_decoder" / "src" / "rslidar_msg" / "msg")
     p.add_argument("--no-validate", action="store_true",
@@ -335,8 +318,7 @@ def main() -> None:
                    help="Leave the staging directory for debugging.")
     args = p.parse_args()
 
-    for path, label in [(args.bag, "bag"), (args.calib, "calib"),
-                        (args.msg_dir, "msg dir")]:
+    for path, label in [(args.bag, "bag"), (args.calib, "calib")]:
         if not path.exists():
             raise SystemExit(f"{label} not found: {path}")
 
@@ -358,7 +340,7 @@ def main() -> None:
     try:
         print(f"[1/5] Reading {args.bag.name} ...")
         data, stats = read_bag(args.bag, staging, args.calib,
-                               args.msg_dir, args.packet_msg_dir)
+                               args.packet_msg_dir)
         print(f"  cameras: {sum(len(v) for v in data.cam_ts.values())} frames "
               f"over {len(data.cam_ts)} channels")
         print(f"  lidar:   {len(data.lidar_ts)} frames "

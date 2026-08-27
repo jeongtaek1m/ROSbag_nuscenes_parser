@@ -27,10 +27,10 @@ viz_lidar/
 viz_projection/
 clock_diag/
 
-# Calibration snapshots ship only the numbers the pipeline reads (.txt/.npy).
-# The verification renders and archives are large and reproducible.
-calib/**/*.png
-calib/**/*.tar.xz
+# Calibration is deployment data, not code: intrinsics/extrinsics are specific to
+# one vehicle build and the labelling vendor produces their own. Keep a snapshot
+# locally and point --calib at it.
+calib/
 
 # Bags and dataset artifacts
 *.bag
@@ -38,5 +38,15 @@ calib/**/*.tar.xz
 *.bin.zst
 *.parquet
 
-# Notebooks are committed without outputs (nbstripout-style); see CONTRIBUTING
+# Notebooks are committed without outputs (nbstripout-style)
 .ipynb_checkpoints/
+
+# Agent instructions — local only
+CLAUDE.md
+
+# The perception stack's .msg definitions are no longer parsed by this pipeline.
+# Only the two enums the label taxonomy is transcribed from are kept, so drift
+# between msg/ObjectType.msg and common.OBJECT_TYPE_TO_CATEGORY stays checkable.
+msg/*
+!msg/ObjectType.msg
+!msg/MotionType.msg

@@ -40,7 +40,6 @@ ODOM_TOPIC = "/novatel/oem7/odom"
 # Carries GPS week/ms internally, so it is the only absolute time reference in
 # a bag — used by scripts/clock_diagnosis.py to anchor the host clock.
 INSPVA_TOPIC = "/novatel/oem7/inspva"
-ANNOTATION_TOPIC = "/post_fusion_object"
 LIDAR_PACKETS_TOPIC = "/middle/rslidar_packets"
 LIDAR_POINTS_TOPIC = "/middle/rslidar_points"
 
@@ -58,8 +57,8 @@ def make_typestore(*msg_dirs: tuple[Path, str]):
     """Build a ROS1 typestore with custom .msg definitions registered.
 
     Each argument is a (directory, package_name) pair, e.g.
-    (Path("msg"), "data_processing") or (.../rslidar_msg/msg, "rslidar_msg").
-    Missing directories are skipped so callers can pass optional ones.
+    (.../rslidar_msg/msg, "rslidar_msg"). Missing directories are skipped so
+    callers can pass optional ones.
     """
     typestore = get_typestore(Stores.ROS1_NOETIC)
     add_types: dict = {}
@@ -168,10 +167,11 @@ def collect_header_timestamps(bag_path: Path, typestore, max_seconds: float = 0.
 
 
 # ------------------------------------------------------------ label taxonomy
-# Derived from msg/ObjectType.msg so the perception enum and the labelling
-# taxonomy cannot drift apart. The names follow the NuScenes dotted convention
-# (family.thing) because downstream tooling splits on the first component.
-# The integer key is the `type` field carried in ObjectFusion.
+# The class list a labelling vendor works against. Transcribed from the
+# perception stack's ObjectType enum (kept in msg/ObjectType.msg) so the two
+# cannot drift apart; the integer key is that enum's value. Names follow the
+# NuScenes dotted convention (family.thing) because downstream tooling splits on
+# the first component.
 OBJECT_TYPE_TO_CATEGORY = {
     0:  ("unknown",                         "Unclassified object."),
     1:  ("vehicle.car",                     "Passenger car, SUV, van."),
@@ -197,7 +197,7 @@ OBJECT_TYPE_TO_CATEGORY = {
     50: ("static_object.unknown",           "Unclassified static object."),
 }
 
-# Derived from msg/MotionType.msg.
+# Transcribed from the perception stack's MotionType enum (msg/MotionType.msg).
 MOTION_TYPE_TO_ATTRIBUTE = {
     0: ("motion.unknown",       "Motion state could not be determined."),
     1: ("motion.stationary",    "Never observed to move."),

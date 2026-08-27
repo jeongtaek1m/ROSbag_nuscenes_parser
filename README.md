@@ -19,7 +19,7 @@ pip install -e '.[plots]'    # matplotlib/jupyter, for diagnostics and notebooks
 ## Convert
 
 ```bash
-python bag2nuscenes.py /path/to.bag --out /data/tcar_nuscenes --calib calib/2025_8_19
+python bag2nuscenes.py /path/to.bag --out /data/tcar_nuscenes --calib /path/to/calib
 ```
 
 One pass over the bag. Sensor payloads stream into a staging directory inside
@@ -56,9 +56,8 @@ time (see *Camera frame loss* below).
 bag2nuscenes.py     # CLI: read the bag, stage payloads, materialize the dataset
 nuscenes_writer.py  # sync, scene partitioning, ego-pose interpolation, 13 tables
 common.py           # topic map, calibration loading, geometry conventions
-msg/                # custom .msg definitions (ObjectFusionArray etc.)
+msg/                # ObjectType / MotionType enums — the label taxonomy's source
 packet_decoder/     # Robosense RSP128/RSM1/RSBP packet decoders
-calib/<date>/       # intrinsic/extrinsic snapshots
 scripts/            # diagnostics and QA
 notebooks/          # dataset validation (outputs stripped)
 docs/               # design notes, sync reference
@@ -85,11 +84,31 @@ Defined once in `common.py`, verified visually with
 | `/camera_3/compressed` | `CAM_TRAFFIC` (7th channel, non-standard) |
 | `/middle/rslidar_packets` or `/middle/rslidar_points` | `LIDAR_TOP` |
 | `/novatel/oem7/odom` | ego pose |
-| `/post_fusion_object` | annotations (extracted, not yet emitted) |
+
+## Calibration
+
+**Calibration is not shipped with this repository.** Intrinsics and extrinsics
+are specific to one vehicle build, and the labelling vendor produces their own,
+so `--calib` is required and must point at a snapshot you supply.
+
+Expected layout:
+
+```
+<calib_dir>/
+  CAM_FRONT/  CAM_FRONT_LEFT/  CAM_FRONT_RIGHT/
+  CAM_BACK/   CAM_BACK_LEFT/   CAM_BACK_RIGHT/
+      intrinsic.txt    # 3x3 K
+      distortion.txt   # 4 coefficients -> OpenCV fisheye, 5 -> plumb_bob
+      quat_r.txt       # rotation quaternion, w x y z
+      t.txt            # translation
+  LIDAR_TOP/
+      r.txt            # rotation quaternion, w x y z
+      t.txt            # translation
+```
 
 ## Conventions
 
-**Calibration.** The `calib/` files use the OpenCV extrinsic convention
+**Calibration convention.** The files use the OpenCV extrinsic convention
 (`P_sensor = R · P_ego + t`). NuScenes stores the inverse — the sensor's pose
 *in* the ego frame — so `common.opencv_ext_to_nuscenes_pose` inverts it when
 writing `calibrated_sensor.json`. Sanity check: the resulting sensor positions
@@ -169,8 +188,8 @@ It is not a fixed driver property — measure it per bag with
 offset with genuine capture latency and cannot be separated without
 motion-based estimation.
 
-**6. Annotations are not emitted — by design.** `/post_fusion_object` is parsed
-but `sample_annotation.json` and `instance.json` are written empty — labelling is done
+**6. Annotations are not emitted — by design.** `sample_annotation.json` and
+`instance.json` are written empty — labelling is done
 externally. `category`/`attribute`/`visibility` hold one placeholder record
 each; **replace them with the real taxonomy** before handing the dataset to a
 labelling vendor.
@@ -201,8 +220,8 @@ external labelling vendor.
 
 | Table | State |
 |---|---|
-| `category.json` | **22 classes**, derived from `msg/ObjectType.msg` |
-| `attribute.json` | **5 motion states**, derived from `msg/MotionType.msg` |
+| `category.json` | **22 classes**, from `msg/ObjectType.msg` |
+| `attribute.json` | **5 motion states**, from `msg/MotionType.msg` |
 | `visibility.json` | NuScenes' standard four bins |
 | `sample_annotation.json` | `[]` — vendor fills |
 | `instance.json` | `[]` — vendor fills |

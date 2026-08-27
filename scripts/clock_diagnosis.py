@@ -165,15 +165,13 @@ def main() -> None:
     p.add_argument("bag", type=Path)
     p.add_argument("--packet-msg-dir", type=Path,
                    default=here / "packet_decoder" / "src" / "rslidar_msg" / "msg")
-    p.add_argument("--msg-dir", type=Path, default=here / "msg")
     p.add_argument("--max-seconds", type=float, default=180.0,
                    help="Only read the first N seconds of the bag (default 180).")
     p.add_argument("--out", type=Path, default=None,
                    help="If set, write diagnostic plots here.")
     args = p.parse_args()
 
-    typestore = make_typestore((args.packet_msg_dir, "rslidar_msg"),
-                               (args.msg_dir, "data_processing"))
+    typestore = make_typestore((args.packet_msg_dir, "rslidar_msg"))
 
     msop_raw: list[bytes] = []        # first N packet payloads, for offset probe
     msop_bag_s: list[float] = []      # bag receive time per MSOP packet

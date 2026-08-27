@@ -9,6 +9,10 @@ arrays on purpose. Everything they reference — samples, sample_data, ego poses
 sensor calibration, and the label taxonomy — is already populated, so the vendor
 only has to fill in the two annotation tables.
 
+`calibrated_sensor.json` is populated from whatever snapshot the conversion ran
+with. If the vendor is also producing calibration, treat those values as
+provisional and overwrite them.
+
 ## Sensor configuration
 
 | | |
@@ -50,8 +54,11 @@ cloud**, and treat camera images as visual context rather than as a source of
 precise 2D-3D correspondence. If 2D boxes are required, label them directly in
 the image rather than by projecting the 3D box.
 
-The true distortion coefficients and projection model live in the
-`calib/<date>/` snapshot used for the conversion and can be supplied on request.
+The true distortion coefficients and projection model live in the calibration
+snapshot used for the conversion, which is not part of the code repository.
+Request it if you need it — and if you are producing your own calibration,
+`calibrated_sensor.json` in the delivered dataset is provisional and can be
+replaced wholesale.
 
 ## Taxonomy the vendor labels against
 
@@ -124,11 +131,3 @@ nusc.list_categories()
 
 Loading exercises the full foreign-key graph and the `prev`/`next` chains, so a
 clean load is a strong integrity signal.
-
-## Pre-annotation
-
-`/post_fusion_object` from the perception stack carries `track_id`, 3D boxes,
-yaw, velocity and a `type` matching `msg/ObjectType.msg`. It is parsed during
-conversion but not emitted. It can be exported as a pre-annotation seed to cut
-labelling cost — the `track_id` also gives a first draft of the instance chains.
-Ask if you want this turned on.

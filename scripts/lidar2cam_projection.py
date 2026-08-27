@@ -53,8 +53,7 @@ def main():
                    help="NuScenes dataroot, e.g. /data/tcar_nuscenes")
     p.add_argument("--version", default="v1.0-trainval",
                    help="NuScenes version subdirectory (default: v1.0-trainval).")
-    p.add_argument("--calib", type=Path,
-                   default=Path(__file__).resolve().parent.parent / "calib" / "2025_6_27",
+    p.add_argument("--calib", type=Path, required=True,
                    help="Calibration snapshot used for the conversion.")
     p.add_argument("--out", type=Path, default=Path("viz_projection"),
                    help="Output dir (default: viz_projection/).")

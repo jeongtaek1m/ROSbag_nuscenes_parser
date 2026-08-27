@@ -25,13 +25,11 @@ def main():
     p.add_argument("bag", type=Path, help="Path to a .bag file.")
     p.add_argument("--max-seconds", type=float, default=0.0,
                    help="Only inspect the first N seconds (0 = whole bag).")
-    p.add_argument("--msg-dir", type=Path, default=here / "msg")
     p.add_argument("--packet-msg-dir", type=Path,
                    default=here / "packet_decoder" / "src" / "rslidar_msg" / "msg")
     args = p.parse_args()
 
-    typestore = make_typestore((args.msg_dir, "data_processing"),
-                               (args.packet_msg_dir, "rslidar_msg"))
+    typestore = make_typestore((args.packet_msg_dir, "rslidar_msg"))
     ts_by_ch = collect_header_timestamps(args.bag, typestore, args.max_seconds)
     if "LIDAR_TOP" not in ts_by_ch:
         raise SystemExit(f"no lidar topic in {args.bag}")

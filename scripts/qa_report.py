@@ -180,9 +180,8 @@ def main():
     if args.bag:
         # Sections [1] and [2] measure what the bag contained, which is the only
         # place frames that never made it into the dataset can still be counted.
-        typestore = make_typestore((_ROOT / "msg", "data_processing"),
-                                   (_ROOT / "packet_decoder" / "src" / "rslidar_msg"
-                                    / "msg", "rslidar_msg"))
+        typestore = make_typestore((_ROOT / "packet_decoder" / "src"
+                                    / "rslidar_msg" / "msg", "rslidar_msg"))
         ts_by_ch = collect_header_timestamps(args.bag, typestore)
         section(f"[1] Per-channel sync (source bag)  — {args.bag.name}")
         per_channel_sync_drops(ts_by_ch, args.sync_ms)

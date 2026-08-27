@@ -22,7 +22,8 @@ from nuscenes.nuscenes import NuScenes
 from scipy.spatial.transform import Rotation
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from common import collect_header_timestamps, make_typestore  # noqa: E402
+from common import NUSCENES_CAMS, collect_header_timestamps, make_typestore  # noqa: E402
+from nuscenes_writer import nearest_ts  # noqa: E402
 
 _ROOT = Path(__file__).resolve().parent.parent
 
@@ -33,7 +34,12 @@ def section(title: str) -> None:
 
 
 def per_channel_sync_drops(ts_by_ch: dict, sync_ms: float = 25.0) -> None:
-    """ts_by_ch: channel -> sorted header timestamps (ns), from the source bag."""
+    """ts_by_ch: channel -> sorted header timestamps (ns), from the source bag.
+
+    Same matching as the converter (nuscenes_writer.nearest_ts) and the same
+    rule: only the six standard cameras gate a frame; CAM_TRAFFIC is best-effort
+    and is reported but never counted against a frame.
+    """
     cam_channels = sorted(c for c in ts_by_ch if c != "LIDAR_TOP")
     lidar_ts = ts_by_ch.get("LIDAR_TOP")
     if lidar_ts is None or not len(cam_channels):
@@ -45,21 +51,20 @@ def per_channel_sync_drops(ts_by_ch: dict, sync_ms: float = 25.0) -> None:
     print(f"  Tolerance:    {sync_ms} ms")
     print(f"  {'channel':18} {'p50':>7} {'p99':>7} {'>tol':>7}  {'pct in tol':>11}")
     worst = np.zeros_like(lidar_ts)
+    gating = [ch for ch in cam_channels if ch in NUSCENES_CAMS]
     for ch in cam_channels:
-        cam_ts = ts_by_ch[ch]
-        idx = np.searchsorted(cam_ts, lidar_ts)
-        idx_l = np.clip(idx - 1, 0, len(cam_ts) - 1)
-        idx_r = np.clip(idx, 0, len(cam_ts) - 1)
-        d = np.minimum(np.abs(cam_ts[idx_l] - lidar_ts), np.abs(cam_ts[idx_r] - lidar_ts))
-        worst = np.maximum(worst, d)
+        _, d = nearest_ts(lidar_ts, ts_by_ch[ch])
+        if ch in gating:
+            worst = np.maximum(worst, d)
         p50 = np.median(d) / 1e6
         p99 = np.percentile(d, 99) / 1e6
         n_over = int(np.sum(d > sync_ns))
         pct_in = 100 - 100 * n_over / len(d)
-        print(f"  {ch:18} {p50:7.2f} {p99:7.2f} {n_over:7d}  {pct_in:10.2f}%")
+        print(f"  {ch:18} {p50:7.2f} {p99:7.2f} {n_over:7d}  {pct_in:10.2f}%"
+              + ("" if ch in gating else "   (best-effort, not gating)"))
 
     n_drop = int(np.sum(worst > sync_ns))
-    print(f"  Worst-channel ≤ {sync_ms}ms:  {len(lidar_ts) - n_drop}/{len(lidar_ts)} "
+    print(f"  Worst of {len(gating)} standard cams ≤ {sync_ms}ms:  {len(lidar_ts) - n_drop}/{len(lidar_ts)} "
           f"({100*(len(lidar_ts)-n_drop)/len(lidar_ts):.2f}%)")
 
 

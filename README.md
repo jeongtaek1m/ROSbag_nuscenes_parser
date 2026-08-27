@@ -16,28 +16,28 @@ pip install -e '.[verify]'   # nuscenes-devkit, for output validation + QA repor
 pip install -e '.[plots]'    # matplotlib/jupyter, for diagnostics and notebooks
 ```
 
-## Pipeline
-
-Three stages. The split exists so that the expensive parts are cached: LiDAR
-packet decoding runs once per bag, and stage-2 parameters (sync tolerance,
-keyframe rate, scene length) can be re-tuned without re-reading the bag.
-
-| Stage | Script | Input → Output | Rough cost (20-min bag) |
-|---|---|---|---|
-| 1a | `decode_lidar.py` | bag → `intermediate/<bag>/lidar/*.bin.zst` | ~40 min, 22 GB |
-| 1b | `bag2raw.py` | bag → cameras, odom, annotations, calib | ~5 min, 88 GB |
-| 2 | `raw2nuscenes.py` | intermediate → NuScenes dataset | ~10–15 min, 50 GB |
-
-1a and 1b touch different topics and can run concurrently.
+## Convert
 
 ```bash
-python decode_lidar.py  /path/to.bag --out /data/intermediate
-python bag2raw.py       /path/to.bag --out /data/intermediate --calib calib/2025_6_27
-python raw2nuscenes.py  /data/intermediate/<bag_name> --out /data/tcar_nuscenes
+python bag2nuscenes.py /path/to.bag --out /data/tcar_nuscenes --calib calib/2025_8_19
 ```
 
-Stage 2 auto-appends: running it on a second bag continues the scene numbering,
-reuses sensor/category tokens, and refuses to import the same bag twice.
+One pass over the bag. Sensor payloads stream into a staging directory inside
+the output root; once synchronization and scene partitioning have decided which
+frames become samples and sweeps, the staged files are **renamed** into place —
+a metadata operation on the same filesystem. Nothing is written twice and no
+intermediate dump survives the run.
+
+LiDAR is read from whichever topic the bag carries: `/middle/rslidar_points`
+(PointCloud2, read directly) or `/middle/rslidar_packets` (raw MSOP/DIFOP,
+decoded in-process). Only the packet path is slow — roughly 40 minutes for a
+20-minute bag, against a couple of minutes for PointCloud2.
+
+Running it again on another bag **appends**: scene numbering continues, sensor
+and category tokens are reused, and re-importing the same bag is refused.
+
+Useful flags: `--sync-ms`, `--keyframe-stride`, `--scene-dur`,
+`--no-include-traffic-cam`, `--no-validate`, `--keep-staging`.
 
 ### Screen bags first
 
@@ -53,34 +53,21 @@ time (see *Camera frame loss* below).
 ## Layout
 
 ```
-bag2raw.py          decode_lidar.py     raw2nuscenes.py    # the three stages
-common.py                                                  # shared topic map, calib, geometry
-msg/                                                       # custom .msg for ObjectFusionArray etc.
-packet_decoder/                                            # Robosense RSP128/RSM1/RSBP decoders
-calib/<date>/                                              # intrinsic/extrinsic snapshots
-scripts/                                                   # diagnostics and QA
-notebooks/                                                 # dataset validation (outputs stripped)
-docs/                                                      # pipeline overview, sync reference
+bag2nuscenes.py     # CLI: read the bag, stage payloads, materialize the dataset
+nuscenes_writer.py  # sync, scene partitioning, ego-pose interpolation, 13 tables
+common.py           # topic map, calibration loading, geometry conventions
+msg/                # custom .msg definitions (ObjectFusionArray etc.)
+packet_decoder/     # Robosense RSP128/RSM1/RSBP packet decoders
+calib/<date>/       # intrinsic/extrinsic snapshots
+scripts/            # diagnostics and QA
+notebooks/          # dataset validation (outputs stripped)
+docs/               # design notes, sync reference
 ```
 
 `common.py` holds the single source of truth for the topic → channel mapping.
-Do not re-declare it in a script; import it.
-
-## Intermediate format
-
-```
-intermediate/<bag_basename>/
-  cameras/CAM_*/<header_ns>.jpg      # JPEG bytes copied verbatim, no re-encode
-  lidar/<frame_ts_ns>.bin.zst        # 5 x float32 (x,y,z,intensity,ring), zstd
-  odom.parquet                       # ts_ns, tx,ty,tz, qw,qx,qy,qz
-  annotations.parquet                # ts_ns + flattened ObjectFusion fields
-  calib.json                         # snapshot of the calibration used
-  meta.json / meta_lidar.json        # source bag, topic mapping, counts, time base
-```
-
-Every file is inspectable on its own — JPEGs open, parquet reads in pandas or
-DuckDB, lidar frames are a `zstd` decompress and a `reshape(-1, 5)` away. When
-something looks wrong, that tells you whether the fault is in stage 1 or 2.
+Do not re-declare it in a script; import it. `nuscenes_writer.py` deliberately
+knows nothing about rosbags — it takes timestamps and returns tables, so the
+sync and scene logic can be developed and tested without touching a bag.
 
 ## Topic ↔ channel mapping
 
@@ -109,10 +96,12 @@ writing `calibrated_sensor.json`. Sanity check: the resulting sensor positions
 are `LIDAR_TOP (1.56, 0, 1.90)` and `CAM_FRONT (2.04, −0.14, 1.73)` with the
 front camera's optical axis along +x.
 
-**Files.** Camera JPEGs are **hard-linked** from the intermediate dump into
-`samples/`/`sweeps/`, so the dataset costs no extra disk *and* survives deleting
-the intermediate directory. LiDAR is decompressed to real `.pcd.bin` files
-because NuScenes requires raw point clouds.
+**Files.** Staged payloads are renamed into `samples/`/`sweeps/`, so each byte
+is written exactly once. LiDAR sweeps are stored as NuScenes `.pcd.bin`
+(5 × float32 per point). Robosense publishes an organized cloud, so no-return
+directions arrive as NaN — about 42% of a 128 × 1800 sweep — and those points
+are dropped, because NuScenes point clouds are unorganized and devkit consumers
+do not expect NaN.
 
 ## Diagnostics and QA
 
@@ -120,9 +109,8 @@ because NuScenes requires raw point clouds.
 |---|---|
 | `scripts/screen_bags.py` | Per-camera delivery rate; which bags are worth converting |
 | `scripts/clock_diagnosis.py` | Per-sensor clock offset/skew vs the bag clock, anchored to GPS |
-| `scripts/preflight_check.py` | Intermediate integrity before stage 2 |
-| `scripts/qa_report.py` | Dataset QA: sync survival, ego anomalies, per-scene stats |
-| `scripts/sync_stats.py` | Acceptance rate vs sync tolerance |
+| `scripts/qa_report.py` | Dataset QA: sync survival, ego anomalies, per-scene stats (`--bag` adds raw-timestamp sections) |
+| `scripts/sync_stats.py` | Acceptance rate vs sync tolerance, straight from a bag — use it to pick `--sync-ms` |
 | `scripts/lidar2cam_projection.py` | Project LiDAR onto each camera — calibration check |
 | `scripts/extract_cam_viz.py` | 7-camera contact sheet — topic mapping check |
 | `scripts/viz_lidar_frame.py` | Single-frame BEV / side view |
@@ -130,7 +118,7 @@ because NuScenes requires raw point clouds.
 
 All of these write into gitignored output directories.
 
-Stage 2 ends by loading the result with `NuScenes(version, dataroot)`, which
+The run ends by loading the result with `NuScenes(version, dataroot)`, which
 validates the 13 tables, foreign keys, and `prev`/`next` chains.
 
 ## Known limitations
@@ -161,17 +149,18 @@ Record at **10G with reliable QoS**. Dropped frames cannot be recovered later.
 bit-identical trigger timestamp, so inter-camera sync error is exactly zero and
 frame sets can be grouped by exact equality. Older recordings (e.g. the
 2026-03-23 traffic bags) have independent per-camera stamps spread up to ~47 ms.
-`raw2nuscenes.py` currently only implements the latter — per-channel
+`nuscenes_writer.sync_keyframes` currently only implements the latter — per-channel
 nearest-neighbour matching within `--sync-ms`. On new-regime bags this is
 unnecessary work and costs keyframes.
 
-**4. LiDAR frame timestamps are the end of the sweep,** and are taken from the
-bag receive clock when decoding packets (the sensor's own clock is not
-disciplined — PTP is not wired up yet). The points in a frame were acquired over
-the preceding ~100 ms, so the cloud is on average ~50 ms older than the camera
+**4. LiDAR frame timestamps are the end of the sweep,** and on the packet path
+they come from the bag receive clock (the sensor's own clock is not disciplined
+— PTP is not wired up yet). The points in a frame were acquired over the
+preceding ~100 ms, so the cloud is on average ~50 ms older than the camera
 matched to it. The 0° frame split also puts the sweep seam inside `CAM_FRONT`'s
-field of view. The decoder computes per-point timestamps but `decode_lidar.py`
-discards them (`arr[:, :5]`), which is what a proper fix would need.
+field of view. The decoder computes per-point timestamps but `_write_lidar_frame`
+discards them, which is what a proper fix would need. `lidar_time_base` in
+`<log>.import.json` records which clock a given import used.
 
 **5. Camera clock skew varies per recording.** Measured against the bag clock:
 −15 to −26 ppm on one bag, −147 to −180 ppm on another (≈200 ms over 20 min).
@@ -180,9 +169,8 @@ It is not a fixed driver property — measure it per bag with
 offset with genuine capture latency and cannot be separated without
 motion-based estimation.
 
-**6. Annotations are not emitted.** `bag2raw.py` extracts
-`/post_fusion_object` into `annotations.parquet`, but `raw2nuscenes.py` writes
-`sample_annotation.json` and `instance.json` as empty — labelling is done
+**6. Annotations are not emitted.** `/post_fusion_object` is parsed but
+`sample_annotation.json` and `instance.json` are written empty — labelling is done
 externally. `category`/`attribute`/`visibility` hold one placeholder record
 each; **replace them with the real taxonomy** before handing the dataset to a
 labelling vendor.

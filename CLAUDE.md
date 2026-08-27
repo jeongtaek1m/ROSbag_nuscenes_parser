@@ -69,15 +69,17 @@ Strong success criteria let you loop independently. Weak criteria ("make it work
 # Project-specific
 
 ## Goal
-Convert ROS1 rosbag files (Robosense LiDAR + 6 e-CON cameras + Novatel odom + perception fusion output) into NuScenes v1.0-trainval format, in two stages:
+Convert ROS1 rosbag files (Robosense LiDAR + 7 e-CON cameras + Novatel odom + perception fusion output) into NuScenes v1.0-trainval format.
 
-- **Stage 1 (`bag2raw.py`)**: bag → intermediate compressed dump (no synchronization, no scene splitting)
-- **Stage 2 (`raw2nuscenes.py`)**: intermediate → NuScenes (synchronization, scene splitting, JSON metadata). Images are copied as-is; **no undistortion is applied** — see README "Known limitations".
+Single stage: `bag2nuscenes.py` reads the bag once and writes the dataset.
+`nuscenes_writer.py` holds the sync / scene / table logic and imports no rosbag
+code. Images are copied as-is; **no undistortion is applied** — see README
+"Known limitations".
 
 ## Stack
 - Python 3.10+
 - `rosbags` (ROS-free .bag reader)
-- `numpy`, `scipy`, `opencv-python`, `pyarrow`, `zstandard`
+- `numpy`, `scipy`, `opencv-python`
 - `nuscenes-devkit` for output verification
 
 ## Topic ↔ Channel mapping

@@ -266,7 +266,7 @@ def main() -> None:
             print(f"  INTERPRETATION")
             print(f"    The 'residual after fit' is the receive jitter that is "
                   f"currently baked")
-            print(f"    into every per-point timestamp (decode_lidar.py uses "
+            print(f"    into every per-point timestamp (the packet path uses "
                   f"bag receive time).")
             print(f"    Switching intra-frame timing to the embedded stamp "
                   f"removes exactly that.")

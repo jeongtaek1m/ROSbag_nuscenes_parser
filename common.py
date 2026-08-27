@@ -131,3 +131,37 @@ def load_calib(calib_dir: Path) -> dict:
         "translation": np.loadtxt(lidar_d / "t.txt").reshape(-1).tolist(),
     }
     return out
+
+
+# ------------------------------------------------------ timestamp collection
+def collect_header_timestamps(bag_path: Path, typestore, max_seconds: float = 0.0
+                              ) -> dict[str, np.ndarray]:
+    """Per-channel header.stamp arrays (ns) for the cameras and LIDAR_TOP.
+
+    Reads header stamps, not bag arrival times: those are the timestamps the
+    converter synchronizes on. Returns channel -> sorted int64 array.
+    """
+    from rosbags.highlevel import AnyReader  # local: keeps the import optional
+
+    lidar_topics = (LIDAR_POINTS_TOPIC, LIDAR_PACKETS_TOPIC)
+    out: dict[str, list[int]] = {}
+    with AnyReader([bag_path], default_typestore=typestore) as reader:
+        wanted = set(TOPIC_TO_CAM_CHANNEL) | set(lidar_topics)
+        conns = [c for c in reader.connections if c.topic in wanted]
+        if not conns:
+            raise SystemExit(f"no camera or lidar topics in {bag_path}")
+        t_end = (reader.start_time + int(max_seconds * 1e9)) if max_seconds else None
+        for conn, bag_ns, raw in reader.messages(connections=conns):
+            if t_end and bag_ns > t_end:
+                break
+            msg = reader.deserialize(raw, conn.msgtype)
+            if conn.topic in TOPIC_TO_CAM_CHANNEL:
+                ch = TOPIC_TO_CAM_CHANNEL[conn.topic]
+                out.setdefault(ch, []).append(stamp_to_ns(msg.header.stamp))
+            elif conn.topic == LIDAR_POINTS_TOPIC:
+                out.setdefault("LIDAR_TOP", []).append(stamp_to_ns(msg.header.stamp))
+            else:
+                # Packet bags have no per-frame stamp until the sweep is decoded;
+                # bag arrival time is what the converter uses there too.
+                out.setdefault("LIDAR_TOP", []).append(int(bag_ns))
+    return {k: np.array(sorted(v), dtype=np.int64) for k, v in out.items()}

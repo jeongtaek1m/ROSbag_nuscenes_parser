@@ -1,47 +1,30 @@
-#!/usr/bin/env python3
-"""Stage 2: intermediate -> NuScenes v1.0-trainval layout.
+"""Turn synchronized sensor timestamps into the 13 NuScenes JSON tables.
 
-Reads <intermediate>/<bag_name>/ produced by decode_lidar.py + bag2raw.py and
-emits a NuScenes-compatible dataset under <out_root>/.
+Knows nothing about rosbags or about where the sensor files live: the caller
+hands it timestamps plus a calibration dict and gets back the tables and a
+materialization plan of (timestamp_ns, channel, destination_relpath) that it is
+free to satisfy however it likes.
 
-Pipeline:
-  1. Read calib + odom + per-channel cam ts + lidar ts (filesystem glob).
-  2. Pick keyframes at fixed rate (every Kth lidar at 10Hz -> 2Hz default).
-  3. For each keyframe lidar ts, match nearest cam ts per channel within
-     <sync_ms> tolerance. If any channel misses, drop the keyframe.
-  4. Partition surviving keyframes into scenes by fixed time window
-     (default 20s). Drop the trailing incomplete scene.
-  5. Build 13 NuScenes JSON tables.
-  6. Materialize files: hard-link JPEGs into samples/sweeps; decompress lidar
-     .bin.zst -> .pcd.bin (5xfloat32) into samples/sweeps.
-  7. Optional: validate by loading NuScenes(version, dataroot).
-
-Convention notes:
-  - Intermediate calib stores OpenCV-style extrinsics (P_sensor = R @ P_ego + t).
-    NuScenes stores sensor-in-ego pose. We invert when writing
-    calibrated_sensor.json.
-  - Annotations are empty (sample_annotation/instance = []) on purpose: labels
-    are produced externally. category/attribute/visibility hold one placeholder
-    record each so foreign keys stay valid; replace them with the real taxonomy
-    before handing the dataset to a labeling vendor.
-  - Images are NOT undistorted. NuScenes has no distortion field, so consumers
-    treat camera_intrinsic as a pinhole K, but five of the six cameras are
-    fisheye. See "Known limitations" in README.md.
+Conventions:
+  - Calibration arrives in the OpenCV extrinsic convention
+    (P_sensor = R @ P_ego + t); NuScenes wants the sensor pose in the ego frame,
+    so it is inverted when writing calibrated_sensor.json.
+  - sample_annotation/instance are emitted empty on purpose: labels are produced
+    externally. category/attribute/visibility hold one placeholder record each
+    so foreign keys stay valid; replace them with the real taxonomy before
+    handing the dataset to a labelling vendor.
+  - Images are not undistorted anywhere in this pipeline; NuScenes has no
+    distortion field. See "Known limitations" in README.md.
 """
 from __future__ import annotations
 
-import argparse
 import json
-import os
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
-import cv2
 import numpy as np
-import pyarrow.parquet as pq
-import zstandard as zstd
 from scipy.spatial.transform import Rotation, Slerp
 
 from common import (
@@ -56,8 +39,8 @@ def new_token() -> str:
 
 
 @dataclass
-class IntermediateData:
-    root: Path
+class SensorData:
+    """Everything the table builder needs, however the caller obtained it."""
     calib: dict
     cam_ts: dict[str, np.ndarray]   # channel -> sorted ts_ns (int64)
     lidar_ts: np.ndarray            # sorted ts_ns
@@ -68,60 +51,6 @@ class IntermediateData:
     bag_start_ns: int
     bag_end_ns: int
 
-
-def load_intermediate(path: Path) -> IntermediateData:
-    calib = json.loads((path / "calib.json").read_text())
-    meta = json.loads((path / "meta.json").read_text())
-
-    # camera ts per channel
-    cam_root = path / "cameras"
-    cam_ts: dict[str, np.ndarray] = {}
-    cam_size: dict[str, tuple[int, int]] = {}
-    for ch_dir in sorted(cam_root.iterdir()):
-        if not ch_dir.is_dir():
-            continue
-        ts = np.array(sorted(int(p.stem) for p in ch_dir.glob("*.jpg")), dtype=np.int64)
-        cam_ts[ch_dir.name] = ts
-        if len(ts) > 0:
-            sample = cv2.imread(str(ch_dir / f"{ts[0]}.jpg"))
-            if sample is None:
-                raise SystemExit(f"unreadable JPEG: {ch_dir / f'{ts[0]}.jpg'}")
-            cam_size[ch_dir.name] = (sample.shape[0], sample.shape[1])
-
-    # lidar ts
-    lidar_ts = np.array(
-        sorted(int(p.name.split(".", 1)[0]) for p in (path / "lidar").glob("*.bin.zst")),
-        dtype=np.int64,
-    )
-
-    # odom
-    odom_tbl = pq.read_table(path / "odom.parquet")
-    odom_ts = np.asarray(odom_tbl.column("ts_ns")).astype(np.int64)
-    sort_idx = np.argsort(odom_ts)
-    odom_ts = odom_ts[sort_idx]
-    odom_t = np.stack([
-        np.asarray(odom_tbl.column("tx"))[sort_idx],
-        np.asarray(odom_tbl.column("ty"))[sort_idx],
-        np.asarray(odom_tbl.column("tz"))[sort_idx],
-    ], axis=-1)
-    qw = np.asarray(odom_tbl.column("qw"))[sort_idx]
-    qx = np.asarray(odom_tbl.column("qx"))[sort_idx]
-    qy = np.asarray(odom_tbl.column("qy"))[sort_idx]
-    qz = np.asarray(odom_tbl.column("qz"))[sort_idx]
-    odom_R = Rotation.from_quat(np.stack([qx, qy, qz, qw], axis=-1))
-
-    return IntermediateData(
-        root=path,
-        calib=calib,
-        cam_ts=cam_ts,
-        lidar_ts=lidar_ts,
-        odom_ts=odom_ts,
-        odom_t=odom_t,
-        odom_R=odom_R,
-        cam_size=cam_size,
-        bag_start_ns=meta["bag_start_ns"],
-        bag_end_ns=meta["bag_end_ns"],
-    )
 
 
 def nearest_ts(query: np.ndarray, target: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
@@ -139,7 +68,7 @@ def nearest_ts(query: np.ndarray, target: np.ndarray) -> tuple[np.ndarray, np.nd
     return matched, diff
 
 
-def sync_keyframes(data: IntermediateData, channels: list[str], sync_ns: int,
+def sync_keyframes(data: SensorData, channels: list[str], sync_ns: int,
                    keyframe_stride: int) -> list[dict]:
     """Pick every Kth lidar ts as keyframe anchor. Match nearest cam ts per
     channel; drop keyframes that miss any channel within tolerance.
@@ -202,7 +131,7 @@ def partition_scenes(keyframes: list[dict], scene_dur_s: float) -> list[list[dic
     return scenes
 
 
-def interp_pose(query_ns: np.ndarray, data: IntermediateData) -> tuple[np.ndarray, np.ndarray]:
+def interp_pose(query_ns: np.ndarray, data: SensorData) -> tuple[np.ndarray, np.ndarray]:
     """Interpolate ego pose at each query ns. Returns (translations, quaternions[wxyz])."""
     odom_ts = data.odom_ts
     odom_t = data.odom_t
@@ -238,7 +167,7 @@ def assign_to_nearest_sample(target_ts: np.ndarray, sample_ts: np.ndarray) -> np
     return np.where(d_l <= d_r, idx_l, idx_r)
 
 
-def build_tables(data: IntermediateData, scenes: list[list[dict]],
+def build_tables(data: SensorData, scenes: list[list[dict]],
                  channels: list[str], log_token: str, log_name: str,
                  existing: dict | None = None
                  ) -> tuple[dict, list[tuple[Path, Path, str]]]:
@@ -249,11 +178,11 @@ def build_tables(data: IntermediateData, scenes: list[list[dict]],
     The returned tables contain ONLY the new records — caller merges with
     existing ones via merge_tables().
 
-    Returns (tables, plan) where plan is a list of (src_path, target_relpath,
-    format) used by materialize_files. Format is 'jpg' (hard link) or 'lidar'
-    (zstd decompress).
+    Returns (tables, plan) where plan is a list of
+    (source_timestamp_ns, channel, destination_relpath) that the caller turns
+    into real files.
     """
-    plan: list[tuple[Path, Path, str]] = []
+    plan: list[tuple[int, str, str]] = []
     scene_idx_offset = 0
     existing_sensor_tokens: dict[str, str] = {}
     if existing:
@@ -455,14 +384,11 @@ def build_tables(data: IntermediateData, scenes: list[list[dict]],
                     fname = f"{bucket}/LIDAR_TOP/{sd_token}.pcd.bin"
                     fileformat = "pcd"
                     height, width = 0, 0
-                    src = data.root / "lidar" / f"{ts_ns}.bin.zst"
-                    plan.append((src, Path(fname), "lidar"))
                 else:
                     fname = f"{bucket}/{ch_name}/{sd_token}.jpg"
                     fileformat = "jpg"
                     height, width = data.cam_size.get(ch_name, (0, 0))
-                    src = data.root / "cameras" / ch_name / f"{ts_ns}.jpg"
-                    plan.append((src, Path(fname), "jpg"))
+                plan.append((int(ts_ns), ch_name, fname))
 
                 sd = {
                     "token": sd_token,
@@ -520,47 +446,6 @@ def build_tables(data: IntermediateData, scenes: list[list[dict]],
     return tables, plan
 
 
-def _ensure_placeholder_map(out_root: Path) -> None:
-    """nuscenes-devkit's render_sample loads map raster; write a tiny PNG so
-    devkit doesn't crash on render. Real maps can replace this later."""
-    map_path = out_root / "maps" / "placeholder.png"
-    if map_path.exists():
-        return
-    map_path.parent.mkdir(parents=True, exist_ok=True)
-    blank = np.full((100, 100), 255, dtype=np.uint8)
-    cv2.imwrite(str(map_path), blank)
-
-
-def materialize_files(plan: list[tuple[Path, Path, str]], data: IntermediateData,
-                      out_root: Path) -> None:
-    """Hard-link JPEGs + decompress lidar .bin.zst -> .pcd.bin into samples/sweeps.
-
-    Hard links, not symlinks: the dataset must survive deleting the intermediate
-    dump. Both share the same inode so this costs no extra disk, but the image
-    data stays reachable once the intermediate directory entry is gone. Falls
-    back to a copy if the two trees are on different filesystems.
-    """
-    _ensure_placeholder_map(out_root)
-    for sub in ["samples", "sweeps"]:
-        for ch in ["LIDAR_TOP"] + sorted(data.cam_ts.keys()):
-            (out_root / sub / ch).mkdir(parents=True, exist_ok=True)
-
-    dctx = zstd.ZstdDecompressor()
-    n_cam = n_lidar = 0
-    for src, rel_target, fmt in plan:
-        target = out_root / rel_target
-        if target.exists():
-            continue
-        if fmt == "jpg":
-            try:
-                os.link(src, target)
-            except OSError:  # cross-filesystem — fall back to a real copy
-                target.write_bytes(src.read_bytes())
-            n_cam += 1
-        else:  # lidar
-            target.write_bytes(dctx.decompress(src.read_bytes()))
-            n_lidar += 1
-    print(f"  cam hardlinks: {n_cam}   lidar decompressed: {n_lidar}")
 
 
 def load_existing_tables(json_dir: Path) -> dict | None:
@@ -609,99 +494,3 @@ def validate_with_devkit(out_root: Path, version: str) -> None:
     print(f"  ✓ loaded: {len(nusc.scene)} scene, {len(nusc.sample)} sample, "
           f"{len(nusc.sample_data)} sample_data, {len(nusc.ego_pose)} ego_pose")
 
-
-def main():
-    p = argparse.ArgumentParser(description=__doc__.split("\n")[0])
-    p.add_argument("intermediate", type=Path,
-                   help="Stage-1 intermediate dir, e.g. /data/intermediate/<bag>")
-    p.add_argument("--out", type=Path, default=Path("/data/tcar_nuscenes"),
-                   help="NuScenes dataroot (default: /data/tcar_nuscenes).")
-    p.add_argument("--version", default="v1.0-trainval",
-                   help="NuScenes version subdir name (default: v1.0-trainval).")
-    p.add_argument("--keyframe-stride", type=int, default=5,
-                   help="Pick every Kth lidar frame as keyframe (default 5 = 2Hz from 10Hz lidar).")
-    p.add_argument("--sync-ms", type=float, default=25.0,
-                   help="Per-channel sync tolerance in ms (default 25).")
-    p.add_argument("--scene-dur", type=float, default=20.0,
-                   help="Scene length in seconds (default 20). Trailing scene shorter than 90%% is dropped.")
-    p.add_argument("--include-traffic-cam", action=argparse.BooleanOptionalAction,
-                   default=True,
-                   help="Include CAM_TRAFFIC as a 7th channel "
-                        "(--no-include-traffic-cam to omit it).")
-    p.add_argument("--no-validate", action="store_true",
-                   help="Skip NuScenes(...) load check at the end.")
-    args = p.parse_args()
-
-    if not args.intermediate.exists():
-        raise SystemExit(f"intermediate not found: {args.intermediate}")
-
-    print("[1/6] Loading intermediate...")
-    data = load_intermediate(args.intermediate)
-    print(f"  channels: {sorted(data.cam_ts.keys())}")
-    print(f"  lidar: {len(data.lidar_ts)} frames")
-    print(f"  odom: {len(data.odom_ts)} samples")
-
-    channels = list(NUSCENES_CAMS)
-    if args.include_traffic_cam and "CAM_TRAFFIC" in data.cam_ts:
-        channels.append("CAM_TRAFFIC")
-
-    print(f"\n[2/6] Sync matching (tolerance {args.sync_ms} ms, all {len(channels)} cams must pass)...")
-    keyframes = sync_keyframes(
-        data, channels,
-        sync_ns=int(args.sync_ms * 1e6),
-        keyframe_stride=args.keyframe_stride,
-    )
-
-    print(f"\n[3/6] Scene partitioning ({args.scene_dur}s windows, trailing-scene drop if <90% span)...")
-    scenes = partition_scenes(keyframes, args.scene_dur)
-    if not scenes:
-        raise SystemExit("no scenes survived partitioning")
-
-    log_name = args.intermediate.name
-    log_token = new_token()
-
-    json_dir = args.out / args.version
-    existing = load_existing_tables(json_dir)
-    if existing is not None:
-        # Sanity: prevent re-importing the same bag (matched by logfile name)
-        if any(r.get("logfile") == log_name for r in existing.get("log.json", [])):
-            raise SystemExit(
-                f"log '{log_name}' already present in {json_dir}/log.json — "
-                "skip or remove existing log entry first."
-            )
-        print(f"\n[4/6] Append mode: existing dataset found "
-              f"({len(existing['scene.json'])} scenes, "
-              f"{len(existing['sample.json'])} samples). "
-              f"New scenes will continue from idx {len(existing['scene.json']) + 1}.")
-    else:
-        print(f"\n[4/6] Fresh dataset — no existing tables in {json_dir}")
-
-    print(f"  Building tables ({len(scenes)} scenes)...")
-    tables, plan = build_tables(data, scenes, channels, log_token, log_name,
-                                existing=existing)
-    counts = {k: len(v) for k, v in tables.items()}
-    for k, n in counts.items():
-        print(f"  + {k:30} {n:>8}")
-    print(f"  materialization plan: {len(plan)} files")
-
-    print(f"\n[5/6] Materializing files under {args.out}...")
-    args.out.mkdir(parents=True, exist_ok=True)
-    materialize_files(plan, data, args.out)
-    if existing is not None:
-        tables = merge_tables(existing, tables)
-        print(f"  merged: total {len(tables['scene.json'])} scenes, "
-              f"{len(tables['sample.json'])} samples")
-    json_dir = write_tables(tables, args.out, args.version)
-    print(f"  JSON tables -> {json_dir}")
-
-    if args.no_validate:
-        print("\n[6/6] (skipped validation)")
-    else:
-        print(f"\n[6/6] Validating with nuscenes-devkit...")
-        validate_with_devkit(args.out, args.version)
-
-    print("\nDone.")
-
-
-if __name__ == "__main__":
-    main()

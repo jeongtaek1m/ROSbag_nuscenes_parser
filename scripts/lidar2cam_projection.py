@@ -11,7 +11,7 @@ translation = ego origin expressed in the sensor frame. If projections look
 flipped/rotated, the convention may be inverse — try --invert-extrinsic.
 
 Usage:
-    python scripts/lidar2cam_projection.py /data/intermediate/<bag>
+    python scripts/lidar2cam_projection.py /data/tcar_nuscenes --calib calib/2025_8_19
     python scripts/lidar2cam_projection.py <int> --frame mid --max-depth 80
 """
 from __future__ import annotations
@@ -23,10 +23,9 @@ from pathlib import Path
 
 import cv2
 import numpy as np
-import zstandard as zstd
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from common import quat_wxyz_to_R  # noqa: E402
+from common import load_calib, quat_wxyz_to_R  # noqa: E402
 
 
 def project_to_image(P_cam, K, dist, model):
@@ -50,8 +49,13 @@ def project_to_image(P_cam, K, dist, model):
 
 def main():
     p = argparse.ArgumentParser(description=__doc__.split("\n")[0])
-    p.add_argument("intermediate", type=Path,
-                   help="Stage-1 intermediate dir, e.g. /data/intermediate/<bag>")
+    p.add_argument("dataroot", type=Path,
+                   help="NuScenes dataroot, e.g. /data/tcar_nuscenes")
+    p.add_argument("--version", default="v1.0-trainval",
+                   help="NuScenes version subdirectory (default: v1.0-trainval).")
+    p.add_argument("--calib", type=Path,
+                   default=Path(__file__).resolve().parent.parent / "calib" / "2025_6_27",
+                   help="Calibration snapshot used for the conversion.")
     p.add_argument("--out", type=Path, default=Path("viz_projection"),
                    help="Output dir (default: viz_projection/).")
     p.add_argument("--frame", default="mid",
@@ -66,14 +70,15 @@ def main():
 
     args.out.mkdir(parents=True, exist_ok=True)
 
-    calib = json.loads((args.intermediate / "calib.json").read_text())
+    calib = load_calib(args.calib)
     lidar = calib["LIDAR_TOP"]
     R_lidar = quat_wxyz_to_R(lidar["rotation"])
     t_lidar = np.array(lidar["translation"], dtype=np.float64)
 
-    files = sorted((args.intermediate / "lidar").glob("*.bin.zst"))
+    lidar_dir = args.dataroot / "samples" / "LIDAR_TOP"
+    files = sorted(lidar_dir.glob("*.pcd.bin"))
     if not files:
-        raise SystemExit(f"no lidar in {args.intermediate}/lidar")
+        raise SystemExit(f"no lidar in {lidar_dir}")
 
     if args.frame == "first":
         idx = 0
@@ -84,11 +89,9 @@ def main():
     else:
         idx = int(args.frame)
     f = files[idx]
-    lidar_ts = int(f.name.split(".", 1)[0])
-    print(f"lidar frame {idx}/{len(files)}: ts={lidar_ts}")
+    print(f"lidar frame {idx}/{len(files)}: {f.name}")
 
-    arr = np.frombuffer(zstd.ZstdDecompressor().decompress(f.read_bytes()),
-                        dtype=np.float32).reshape(-1, 5)
+    arr = np.fromfile(f, dtype=np.float32).reshape(-1, 5)
     P_lidar = arr[:, :3].astype(np.float64)
     print(f"  n_points: {len(P_lidar)}")
 
@@ -96,23 +99,32 @@ def main():
     cmap = cv2.applyColorMap(np.arange(256).reshape(1, -1).astype(np.uint8),
                              cv2.COLORMAP_JET).reshape(-1, 3)  # (256, 3) BGR
 
-    cam_root = args.intermediate / "cameras"
+    # Filenames are tokens in a converted dataset, so the camera frame that goes
+    # with this sweep is found through sample_data rather than by timestamp.
+    sd_path = args.dataroot / args.version / "sample_data.json"
+    if not sd_path.exists():
+        raise SystemExit(f"missing {sd_path} — is --version right?")
+    sample_data = json.loads(sd_path.read_text())
+    rel = f"samples/LIDAR_TOP/{f.name}"
+    lidar_sd = next((r for r in sample_data if r["filename"] == rel), None)
+    if lidar_sd is None:
+        raise SystemExit(f"{rel} is not in sample_data.json")
+    sample_token, lidar_ts = lidar_sd["sample_token"], lidar_sd["timestamp"]
+    by_channel = {}
+    for r in sample_data:
+        if r["sample_token"] == sample_token and r["is_key_frame"] \
+                and r["filename"].endswith(".jpg"):
+            by_channel[Path(r["filename"]).parent.name] = r
+
     for cam_name, params in calib.items():
         if cam_name == "LIDAR_TOP":
             continue
-        cam_dir = cam_root / cam_name
-        if not cam_dir.exists():
-            print(f"  [skip] {cam_name}: no cam dir")
+        cam_sd = by_channel.get(cam_name)
+        if cam_sd is None:
+            print(f"  [skip] {cam_name}: no keyframe image for this sample")
             continue
-        cam_ts = sorted(int(p.stem) for p in cam_dir.glob("*.jpg"))
-        if not cam_ts:
-            print(f"  [skip] {cam_name}: no images")
-            continue
-        cam_ts_arr = np.array(cam_ts)
-        nearest_idx = int(np.argmin(np.abs(cam_ts_arr - lidar_ts)))
-        nearest_ts = cam_ts[nearest_idx]
-        diff_ms = abs(nearest_ts - lidar_ts) / 1e6
-        cam_path = cam_dir / f"{nearest_ts}.jpg"
+        diff_ms = abs(cam_sd["timestamp"] - lidar_ts) / 1e3   # timestamps are us
+        cam_path = args.dataroot / cam_sd["filename"]
 
         img = cv2.imread(str(cam_path))
         if img is None:

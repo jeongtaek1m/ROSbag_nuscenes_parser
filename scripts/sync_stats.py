@@ -1,43 +1,42 @@
-"""Sync analysis from a stage-1 intermediate folder.
+"""Sync analysis straight from a rosbag — run it before converting.
 
-For each lidar timestamp (keyframe anchor), computes |cam_ts - lidar_ts| per
-channel via nearest-neighbor (both sides). Reports per-channel distribution and
-'all channels must pass' acceptance rate per tolerance.
+For each lidar timestamp (the keyframe anchor), computes |cam_ts - lidar_ts| per
+channel by two-sided nearest neighbour. Reports the per-channel distribution and
+the 'all channels must pass' acceptance rate at each candidate tolerance, which
+is how --sync-ms gets chosen.
 
 Usage:
-    python scripts/sync_stats.py /data/intermediate/<bag_name>
+    python scripts/sync_stats.py /path/to.bag
+    python scripts/sync_stats.py /path/to.bag --max-seconds 300
 """
 import argparse
+import sys
 from pathlib import Path
 
 import numpy as np
 
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from common import collect_header_timestamps, make_typestore  # noqa: E402
+
 
 def main():
+    here = Path(__file__).resolve().parent.parent
     p = argparse.ArgumentParser(description=__doc__.split("\n")[0])
-    p.add_argument("intermediate", type=Path,
-                   help="Stage-1 intermediate dir, e.g. /data/intermediate/<bag>")
+    p.add_argument("bag", type=Path, help="Path to a .bag file.")
+    p.add_argument("--max-seconds", type=float, default=0.0,
+                   help="Only inspect the first N seconds (0 = whole bag).")
+    p.add_argument("--msg-dir", type=Path, default=here / "msg")
+    p.add_argument("--packet-msg-dir", type=Path,
+                   default=here / "packet_decoder" / "src" / "rslidar_msg" / "msg")
     args = p.parse_args()
 
-    cam_root = args.intermediate / "cameras"
-    lidar_root = args.intermediate / "lidar"
-    if not cam_root.exists():
-        raise SystemExit(f"missing: {cam_root}")
-    if not lidar_root.exists():
-        raise SystemExit(f"missing: {lidar_root}")
-
-    cam_channels = sorted([d.name for d in cam_root.iterdir() if d.is_dir()])
+    typestore = make_typestore((args.msg_dir, "data_processing"),
+                               (args.packet_msg_dir, "rslidar_msg"))
+    ts_by_ch = collect_header_timestamps(args.bag, typestore, args.max_seconds)
+    if "LIDAR_TOP" not in ts_by_ch:
+        raise SystemExit(f"no lidar topic in {args.bag}")
+    cam_channels = sorted(c for c in ts_by_ch if c != "LIDAR_TOP")
     print(f"channels: {cam_channels}")
-
-    ts_by_ch: dict = {}
-    for ch in cam_channels:
-        ts = np.array(sorted(int(f.stem) for f in (cam_root / ch).glob("*.jpg")),
-                      dtype=np.int64)
-        ts_by_ch[ch] = ts
-    ts_by_ch["LIDAR_TOP"] = np.array(
-        sorted(int(f.name.split(".", 1)[0]) for f in lidar_root.glob("*.bin.zst")),
-        dtype=np.int64,
-    )
 
     for ch in cam_channels + ["LIDAR_TOP"]:
         ts = ts_by_ch[ch]

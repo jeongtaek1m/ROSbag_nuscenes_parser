@@ -1,30 +1,29 @@
-"""Visualize one decoded lidar frame from intermediate (BEV + side view).
+"""Visualize one lidar sweep from a converted dataset (BEV + side view).
 
 Usage:
-    python scripts/viz_lidar_frame.py /data/intermediate/<bag> --out viz_lidar
-    python scripts/viz_lidar_frame.py <intermediate> --frame mid|first|last|<index>
+    python scripts/viz_lidar_frame.py /data/tcar_nuscenes --out viz_lidar
+    python scripts/viz_lidar_frame.py <dataroot> --frame mid|first|last|<index>
 """
 import argparse
 from pathlib import Path
 
 import numpy as np
-import zstandard as zstd
 import matplotlib.pyplot as plt
 
 
 def main():
     p = argparse.ArgumentParser(description=__doc__.split("\n")[0])
-    p.add_argument("intermediate", type=Path,
-                   help="Stage-1 intermediate dir, e.g. /data/intermediate/<bag>")
+    p.add_argument("dataroot", type=Path,
+                   help="NuScenes dataroot, e.g. /data/tcar_nuscenes")
     p.add_argument("--out", type=Path, default=Path("viz_lidar"),
                    help="Output dir (default: viz_lidar/).")
     p.add_argument("--frame", default="mid",
                    help="Which frame: 'first' | 'mid' | 'last' | integer index.")
     args = p.parse_args()
 
-    files = sorted((args.intermediate / "lidar").glob("*.bin.zst"))
+    files = sorted((args.dataroot / "samples" / "LIDAR_TOP").glob("*.pcd.bin"))
     if not files:
-        raise SystemExit(f"No lidar files in {args.intermediate / 'lidar'}")
+        raise SystemExit(f"No lidar files in {args.dataroot / 'samples' / 'LIDAR_TOP'}")
 
     if args.frame == "first":
         idx = 0
@@ -39,8 +38,7 @@ def main():
     args.out.mkdir(parents=True, exist_ok=True)
     print(f"frame {idx}/{len(files)}: {f.name}")
 
-    dctx = zstd.ZstdDecompressor()
-    arr = np.frombuffer(dctx.decompress(f.read_bytes()), dtype=np.float32).reshape(-1, 5)
+    arr = np.fromfile(f, dtype=np.float32).reshape(-1, 5)
     print(f"n_points={arr.shape[0]}")
     x, y, z, intensity, ring = arr[:, 0], arr[:, 1], arr[:, 2], arr[:, 3], arr[:, 4]
 

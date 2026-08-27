@@ -1,25 +1,30 @@
 """Auto-generated QA report for the produced NuScenes-formatted dataset.
 
 Sections:
-  1. Per-channel sync drop (from intermediate raw timestamps)
+  1. Per-channel sync drop (from the source bag's raw timestamps)
   2. Per-scene sync survival (from nuscenes samples)
   3. Ego pose anomalies (large translation/rotation jumps between samples)
-  4. Camera frame drops (per-channel long gaps in intermediate)
+  4. Camera frame drops (per-channel long gaps in the source bag)
   5. Per-scene stats (samples, span, ego trajectory length, lidar point counts)
 
 Usage:
-    python scripts/qa_report.py /data/tcar_nuscenes [--intermediate /data/intermediate]
+    python scripts/qa_report.py /data/tcar_nuscenes [--bag /path/to.bag]
 """
 from __future__ import annotations
 
 import argparse
 import json
+import sys
 from pathlib import Path
 
 import numpy as np
-import zstandard as zstd
 from nuscenes.nuscenes import NuScenes
 from scipy.spatial.transform import Rotation
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from common import collect_header_timestamps, make_typestore  # noqa: E402
+
+_ROOT = Path(__file__).resolve().parent.parent
 
 
 def section(title: str) -> None:
@@ -27,26 +32,13 @@ def section(title: str) -> None:
     print(f"=== {title} " + "=" * max(0, 60 - len(title)))
 
 
-def per_channel_sync_drops(intermediate_root: Path, log_name: str,
-                           sync_ms: float = 25.0) -> None:
-    interm = intermediate_root / log_name
-    cam_root = interm / "cameras"
-    lidar_root = interm / "lidar"
-    if not cam_root.exists() or not lidar_root.exists():
-        print(f"  [skip] no intermediate at {interm}")
+def per_channel_sync_drops(ts_by_ch: dict, sync_ms: float = 25.0) -> None:
+    """ts_by_ch: channel -> sorted header timestamps (ns), from the source bag."""
+    cam_channels = sorted(c for c in ts_by_ch if c != "LIDAR_TOP")
+    lidar_ts = ts_by_ch.get("LIDAR_TOP")
+    if lidar_ts is None or not len(cam_channels):
+        print("  [skip] need both lidar and camera timestamps")
         return
-
-    cam_channels = sorted(d.name for d in cam_root.iterdir() if d.is_dir())
-    ts_by_ch = {}
-    for ch in cam_channels:
-        ts_by_ch[ch] = np.array(
-            sorted(int(f.stem) for f in (cam_root / ch).glob("*.jpg")),
-            dtype=np.int64,
-        )
-    lidar_ts = np.array(
-        sorted(int(f.name.split(".", 1)[0]) for f in lidar_root.glob("*.bin.zst")),
-        dtype=np.int64,
-    )
 
     sync_ns = int(sync_ms * 1e6)
     print(f"  Lidar anchor: {len(lidar_ts)} frames")
@@ -124,27 +116,20 @@ def ego_pose_anomalies(nusc: NuScenes,
             print(f"    {sname}: {cnt}")
 
 
-def camera_frame_drops(intermediate_root: Path, log_name: str) -> None:
-    interm = intermediate_root / log_name / "cameras"
-    if not interm.exists():
-        print(f"  [skip] no intermediate at {interm}")
-        return
-    print(f"  {'channel':18} {'frames':>7} {'med dt':>8} {'>3×med':>8} {'longest':>10}")
-    for ch_dir in sorted(interm.iterdir()):
-        if not ch_dir.is_dir():
-            continue
-        ts = np.array(sorted(int(f.stem) for f in ch_dir.glob("*.jpg")), dtype=np.int64)
+def camera_frame_drops(ts_by_ch: dict) -> None:
+    """Long gaps mean frames were dropped before they ever reached the bag."""
+    print(f"  {'channel':18} {'frames':>7} {'med dt':>8} {'>3x med':>8} {'longest':>10}")
+    for ch in sorted(c for c in ts_by_ch if c != "LIDAR_TOP"):
+        ts = ts_by_ch[ch]
         if len(ts) < 2:
             continue
         dts = np.diff(ts) / 1e6
         med = float(np.median(dts))
-        long_gaps = int(np.sum(dts > 3 * med))
-        longest = float(dts.max())
-        print(f"  {ch_dir.name:18} {len(ts):>7} {med:7.2f}ms {long_gaps:>8} {longest:8.1f}ms")
+        print(f"  {ch:18} {len(ts):>7} {med:7.2f}ms "
+              f"{int(np.sum(dts > 3 * med)):>8} {float(dts.max()):8.1f}ms")
 
 
 def per_scene_stats(nusc: NuScenes, dataroot: Path) -> None:
-    dctx = zstd.ZstdDecompressor()
     print(f"  {'scene':12} {'samples':>8} {'span(s)':>8} {'traj(m)':>8} "
           f"{'avg_v':>7} {'lidar_pts(med)':>14}")
     for sc in nusc.scene:
@@ -180,8 +165,9 @@ def per_scene_stats(nusc: NuScenes, dataroot: Path) -> None:
 def main():
     p = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     p.add_argument("dataroot", type=Path, help="NuScenes dataroot, e.g. /data/tcar_nuscenes")
-    p.add_argument("--intermediate", type=Path, default=Path("/data/intermediate"),
-                   help="Intermediate root (parent of <bag> dirs).")
+    p.add_argument("--bag", type=Path, default=None,
+                   help="Source .bag, for the raw-timestamp sections [1] and [2]. "
+                        "Those are skipped when it is not given.")
     p.add_argument("--version", default="v1.0-trainval")
     p.add_argument("--sync-ms", type=float, default=25.0)
     args = p.parse_args()
@@ -191,16 +177,22 @@ def main():
     print(f"  {len(nusc.log)} log(s), {len(nusc.scene)} scenes, {len(nusc.sample)} samples, "
           f"{len(nusc.sample_data)} sample_data")
 
-    # Process per log
+    if args.bag:
+        # Sections [1] and [2] measure what the bag contained, which is the only
+        # place frames that never made it into the dataset can still be counted.
+        typestore = make_typestore((_ROOT / "msg", "data_processing"),
+                                   (_ROOT / "packet_decoder" / "src" / "rslidar_msg"
+                                    / "msg", "rslidar_msg"))
+        ts_by_ch = collect_header_timestamps(args.bag, typestore)
+        section(f"[1] Per-channel sync (source bag)  — {args.bag.name}")
+        per_channel_sync_drops(ts_by_ch, args.sync_ms)
+        section(f"[2] Camera frame drops (source bag)  — {args.bag.name}")
+        camera_frame_drops(ts_by_ch)
+    else:
+        section("[1,2] Raw-timestamp sections skipped (pass --bag to enable)")
+
     for log in nusc.log:
-        log_name = log["logfile"]
-        section(f"LOG: {log_name}  (date={log['date_captured']})")
-
-        section(f"[1] Per-channel sync (intermediate)  — {log_name}")
-        per_channel_sync_drops(args.intermediate, log_name, args.sync_ms)
-
-        section(f"[2] Camera frame drops (intermediate)  — {log_name}")
-        camera_frame_drops(args.intermediate, log_name)
+        print(f"  log: {log['logfile']}  (date={log['date_captured']})")
 
     section("[3] Per-scene sync survival (kept vs expected at 2Hz)")
     per_scene_sync(nusc)

@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 from pathlib import Path
 
 import cv2
@@ -28,6 +29,9 @@ import rerun as rr
 from nuscenes.nuscenes import NuScenes
 from nuscenes.utils.data_classes import LidarPointCloud
 from scipy.spatial.transform import Rotation
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from common import load_calib  # noqa: E402
 
 
 CAM_PRIORITY = [  # which camera "wins" if multiple see the same lidar point
@@ -51,9 +55,11 @@ def intensity_colors(intensity: np.ndarray) -> np.ndarray:
     return lut[(norm * 255).astype(np.int32)][:, ::-1].astype(np.uint8)  # -> RGB
 
 
-def find_intermediate_calib(intermediate_root: Path, log_name: str) -> dict | None:
-    f = intermediate_root / log_name / "calib.json"
-    return json.loads(f.read_text()) if f.exists() else None
+def find_snapshot_calib(calib_dir: Path) -> dict | None:
+    """Load the calibration snapshot, for the distortion NuScenes cannot store."""
+    if not calib_dir.exists():
+        return None
+    return load_calib(calib_dir)
 
 
 def colorize_lidar_from_cams(
@@ -121,7 +127,7 @@ def colorize_lidar_from_cams(
 
 
 def log_sample(nusc: NuScenes, dataroot: Path, sample: dict,
-               intermediate_calib: dict | None) -> None:
+               snapshot_calib: dict | None) -> None:
     rr.set_time("ts", duration=sample["timestamp"] / 1e6)
 
     # Ego pose (world -> ego)
@@ -177,9 +183,9 @@ def log_sample(nusc: NuScenes, dataroot: Path, sample: dict,
             cam_K[ch] = K
             cam_R_ego[ch] = quat_wxyz_to_R(cs["rotation"])
             cam_t_ego[ch] = np.asarray(cs["translation"], dtype=np.float64)
-            # distortion: nuscenes doesn't store; fall back to intermediate calib
-            if intermediate_calib and ch in intermediate_calib:
-                p = intermediate_calib[ch]
+            # NuScenes has no distortion field; take it from the snapshot
+            if snapshot_calib and ch in snapshot_calib:
+                p = snapshot_calib[ch]
                 cam_dist[ch] = np.asarray(p["distortion"], dtype=np.float64) if p.get("distortion") else None
                 cam_model[ch] = p.get("model", "pinhole")
             else:
@@ -214,8 +220,9 @@ def main():
     p.add_argument("--version", default="v1.0-trainval")
     p.add_argument("--scene", default="0",
                    help="Scene index (int) or scene name (e.g. scene-0001).")
-    p.add_argument("--intermediate-root", type=Path, default=Path("/data/intermediate"),
-                   help="Where to look up intermediate calib for distortion params.")
+    p.add_argument("--calib", type=Path,
+                   default=Path(__file__).resolve().parent.parent / "calib" / "2025_6_27",
+                   help="Calibration snapshot, for the distortion NuScenes cannot store.")
     p.add_argument("--max-samples", type=int, default=None,
                    help="Limit number of samples (for quick preview).")
     p.add_argument("--save", type=Path, default=None,
@@ -235,9 +242,9 @@ def main():
     print(f"Scene: {scene['name']}  ({scene['nbr_samples']} samples)")
 
     log_name = nusc.get("log", scene["log_token"])["logfile"]
-    intermediate_calib = find_intermediate_calib(args.intermediate_root, log_name)
-    if intermediate_calib is None:
-        print("  [warn] no intermediate calib.json — projecting without distortion "
+    snapshot_calib = find_snapshot_calib(args.calib)
+    if snapshot_calib is None:
+        print("  [warn] no calibration snapshot — projecting without distortion "
               "(cam_colored may misalign at image edges, esp. fisheye)")
 
     if args.save:
@@ -251,7 +258,7 @@ def main():
     n = 0
     while tok:
         s = nusc.get("sample", tok)
-        log_sample(nusc, args.dataroot, s, intermediate_calib)
+        log_sample(nusc, args.dataroot, s, snapshot_calib)
         n += 1
         if args.max_samples and n >= args.max_samples:
             break

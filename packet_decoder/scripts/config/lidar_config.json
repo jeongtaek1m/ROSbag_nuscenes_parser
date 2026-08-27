@@ -1,0 +1,52 @@
+{
+    "lidars": [
+        {
+            "name": "/middle/rslidar_packets", // Ruby 128ch LiDAR topic name
+            "type": "RSP128",
+            "pc_topic": "/top/pointcloud_from_packet",
+            "frame_id": "ruby"
+        },
+        {
+            "name": "/middle_m1_front/rslidar_packets",
+            "type": "RSM1",
+            "pc_topic": "/middle_m1_front/pointcloud_from_packet",
+            "frame_id": "middle_m1_front"
+        },
+        {
+            "name": "/middle_m1_left/rslidar_packets",
+            "type": "RSM1",
+            "pc_topic": "/middle_m1_left/pointcloud_from_packet",
+            "frame_id": "middle_m1_left"
+        },
+        {
+            "name": "/middle_m1_right/rslidar_packets",
+            "type": "RSM1",
+            "pc_topic": "/middle_m1_right/pointcloud_from_packet",
+            "frame_id": "middle_m1_right"
+        },
+        {
+            "name": "/down_bp_left/rslidar_packets",
+            "type": "RSBP",
+            "pc_topic": "/bottom_bp_left/pointcloud_from_packet",
+            "frame_id": "bottom_bp_left"
+        },
+        {
+            "name": "/down_bp_right/rslidar_packets",
+            "type": "RSBP",
+            "pc_topic": "/bottom_bp_right/pointcloud_from_packet",
+            "frame_id": "bottom_bp_right"
+        },
+        {
+            "name": "/down_m1_front/rslidar_packets",
+            "type": "RSM1",
+            "pc_topic": "/bottom_m1_front/pointcloud_from_packet",
+            "frame_id": "bottom_m1_front"
+        },
+        {
+            "name": "/down_m1_rear/rslidar_packets",
+            "type": "RSM1",
+            "pc_topic": "/bottom_m1_rear/pointcloud_from_packet",
+            "frame_id": "bottom_m1_rear"
+        }
+    ]
+}

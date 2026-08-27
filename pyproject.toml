@@ -1,0 +1,29 @@
+[project]
+name = "rosbag_nuscenes_parser"
+version = "0.1.0"
+description = "Convert ROS1 rosbags (TCAR sensors) into NuScenes v1.0-trainval format."
+requires-python = ">=3.10"
+dependencies = [
+    "rosbags>=0.10",
+    "numpy>=1.24",
+    "scipy>=1.10",
+    "opencv-python>=4.6",
+    "pyarrow>=14.0",
+    "zstandard>=0.21",
+    "tqdm>=4.65",
+]
+
+[project.optional-dependencies]
+# Output verification and the QA report
+verify = ["nuscenes-devkit>=1.1.11"]
+# scripts/clock_diagnosis.py plots, notebooks
+plots = ["matplotlib>=3.7", "jupyter"]
+# scripts/rerun_viz.py
+viz = ["rerun-sdk>=0.16"]
+
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+py-modules = []

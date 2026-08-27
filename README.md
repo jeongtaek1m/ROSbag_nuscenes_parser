@@ -263,3 +263,4 @@ the vendor: required fields and types for both tables, frame conventions, the
 - [`docs/labeling_handoff.md`](docs/labeling_handoff.md) — what the labelling vendor must return
 - [`docs/pipeline_overview.md`](docs/pipeline_overview.md) — design rationale, why a single stage
 - [`docs/sync_reference.md`](docs/sync_reference.md) — how our sync tolerance compares to public datasets
+- [`CHANGELOG.md`](CHANGELOG.md) — what changed, why, and how it was verified

@@ -15,18 +15,20 @@ import cv2
 import numpy as np
 from rosbags.highlevel import AnyReader
 
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from common import CAM_CHANNEL_TO_TOPIC  # noqa: E402
 
-# Topic → (grid row, col) for the 3×3 layout.
+# Channel → (grid row, col) for the 3×3 layout; the topic comes from common.py,
+# so the sheet shows the mapping the converter actually uses. Each tile is
+# labelled with both, and a tile whose picture does not match its label means
+# the table in common.py is wrong for this bag.
 # Row 0 = front row, Row 1 = back row, Row 2 = traffic (col 1 only).
-GRID_LAYOUT = {
-    "/camera_6/compressed": ((0, 0), "CAM_FRONT_LEFT"),
-    "/camera_4/compressed": ((0, 1), "CAM_FRONT"),
-    "/camera_1/compressed": ((0, 2), "CAM_FRONT_RIGHT"),
-    "/camera_5/compressed": ((1, 0), "CAM_BACK_LEFT"),
-    "/camera_2/compressed": ((1, 1), "CAM_BACK"),
-    "/camera_0/compressed": ((1, 2), "CAM_BACK_RIGHT"),
-    "/camera_3/compressed": ((2, 1), "CAM_TRAFFIC"),
+_GRID_POS = {
+    "CAM_FRONT_LEFT": (0, 0), "CAM_FRONT": (0, 1), "CAM_FRONT_RIGHT": (0, 2),
+    "CAM_BACK_LEFT": (1, 0), "CAM_BACK": (1, 1), "CAM_BACK_RIGHT": (1, 2),
+    "CAM_TRAFFIC": (2, 1),
 }
+GRID_LAYOUT = {CAM_CHANNEL_TO_TOPIC[ch]: (pos, ch) for ch, pos in _GRID_POS.items()}
 CELL_W, CELL_H = 640, 360  # 16:9 tiles
 
 
@@ -48,7 +50,7 @@ def build_grid(out_dir: Path) -> Path:
         if img is None:
             continue
         img = cv2.resize(img, (CELL_W, CELL_H))
-        _put_label(img, ch_name)
+        _put_label(img, f"{ch_name}  ({topic.split('/')[1]})")
         y0, y1 = row * CELL_H, (row + 1) * CELL_H
         x0, x1 = col * CELL_W, (col + 1) * CELL_W
         grid[y0:y1, x0:x1] = img

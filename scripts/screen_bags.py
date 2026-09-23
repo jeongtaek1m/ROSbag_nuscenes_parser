@@ -3,7 +3,8 @@
 
 Everything here is measured on header timestamps — the clock the converter
 synchronizes on — with the converter's own rules (`coverage_window`,
-`nearest_ts`, six standard cameras gate a keyframe, CAM_TRAFFIC is best-effort),
+`plan_frames`, `partition_scenes`: six standard cameras must share a capture
+instant within --sync-ms of every LiDAR frame, CAM_TRAFFIC is best-effort),
 so the numbers are the numbers the conversion will produce.
 
 Per bag:
@@ -17,7 +18,8 @@ Per bag:
     nothing downstream can detect
   - INS solution status from INSPVA: the driver keeps publishing odom while the
     INS is still aligning or has lost GNSS, and the converter does not look
-  - keyframe acceptance per sync tolerance, to choose --sync-ms
+  - scene yield per sync tolerance: the converter's own frame selection and
+    scene cutting, i.e. how many seconds of the bag become scenes
 
 Verdict PASS / MARGINAL / DROP with every reason listed; thresholds are flags.
 
@@ -48,7 +50,7 @@ from common import (  # noqa: E402
     make_typestore,
     stamp_to_ns,
 )
-from nuscenes_writer import coverage_window, nearest_ts  # noqa: E402
+from nuscenes_writer import coverage_window, partition_scenes, plan_frames  # noqa: E402
 
 INS_GOOD = 3  # novatel_oem7_msgs/InertialSolutionStatus.INS_SOLUTION_GOOD
 _INS_NAMES = {
@@ -181,27 +183,30 @@ def status_runs(ts: np.ndarray, status: np.ndarray, names: dict[int, str]
     return runs
 
 
-def keyframe_acceptance(bs: BagStreams, window: dict, stride: int,
-                        usable: list[str]) -> list[dict]:
-    """Keyframe survival per tolerance, using the converter's rule: anchors are
-    every `stride`th lidar frame inside the window, the six standard cameras
-    must all be within tolerance, CAM_TRAFFIC is attached when it happens to be."""
+def scene_yield(bs: BagStreams, window: dict, args) -> list[dict]:
+    """What the converter's frame selection makes of this bag, per tolerance.
+
+    Runs nuscenes_writer.plan_frames and partition_scenes unchanged: a LiDAR
+    frame is usable when one capture instant with all six standard cameras lies
+    within the tolerance; unusable frames and LiDAR gaps break the sequence; the
+    unbroken runs are cut into scenes of exactly --scene-dur seconds.
+    """
     lidar = bs.stamps["LIDAR_TOP"]
-    anchors = lidar[::stride]
-    anchors = anchors[(anchors >= window["start_ns"]) & (anchors <= window["end_ns"])]
-    required = [c for c in NUSCENES_CAMS if c in usable]
-    if not len(anchors) or not required:
+    if len(lidar) < 2 or any(c not in bs.stamps for c in NUSCENES_CAMS):
         return []
-    diffs = {c: nearest_ts(anchors, bs.stamps[c])[1] for c in required}
-    worst = np.max(np.stack([diffs[c] for c in required]), axis=0)
-    traffic = nearest_ts(anchors, bs.stamps["CAM_TRAFFIC"])[1] if "CAM_TRAFFIC" in usable else None
+    period = float(np.median(np.diff(lidar)))
+    frames_per_scene = int(round(args.scene_dur * 1e9 / period))
     rows = []
     for tol_ms in TOLERANCES_MS:
-        tol = tol_ms * 1_000_000
-        kept = worst <= tol
+        plan = plan_frames(lidar, bs.stamps, list(NUSCENES_CAMS), int(tol_ms * 1e6), window,
+                           group_ns=int(args.camera_group_ms * 1e6),
+                           max_gap_ns=int(1.5 * period))
+        scenes, _ = partition_scenes(plan["segments"], frames_per_scene)
+        st = plan["stats"]
         rows.append({
-            "tol_ms": tol_ms, "n": len(anchors), "kept": int(kept.sum()),
-            "traffic": (float(np.mean(traffic[kept] <= tol)) if traffic is not None and kept.any() else None),
+            "tol_ms": tol_ms, "in_window": st["n_in_window"], "valid": st["n_valid"],
+            "breaks": max(len(plan["segments"]) - 1, 0), "scenes": len(scenes),
+            "scene_s": len(scenes) * args.scene_dur, "blamed": st["frames_lost_by_camera"],
         })
     return rows
 
@@ -272,7 +277,7 @@ def screen(bag: Path, args, typestore) -> tuple[str, list[str], float]:
               f"{st['delivery'] * 100:>6.1f}% {st['n_gaps']:>5} {st['max_gap_s'] * 1e3:>7.0f}ms "
               f"{offs}{note}")
         if s == "LIDAR_TOP" and st["max_gap_s"] > args.max_lidar_gap:
-            flag(1, f"lidar gap {st['max_gap_s']:.2f}s (no keyframes there)")
+            flag(1, f"lidar gap {st['max_gap_s']:.2f}s (the scene sequence breaks there)")
     if worst_cam < args.min_delivery:
         flag(1 if worst_cam >= 0.90 else 2,
              f"worst standard-camera delivery {worst_cam * 100:.1f}% < {args.min_delivery * 100:.0f}% "
@@ -329,21 +334,26 @@ def screen(bag: Path, args, typestore) -> tuple[str, list[str], float]:
         elif bad_frac > args.max_ins_bad_frac:
             flag(1, f"INS not SOLUTION_GOOD for {100 * bad_frac:.1f}% of samples")
 
-    # ------------------------------------------------------ sync acceptance
+    # ------------------------------------------------------------ scene yield
     if "LIDAR_TOP" in present and not bs.lidar_from_packets and window["end_ns"] > window["start_ns"]:
-        rows = keyframe_acceptance(bs, window, args.keyframe_stride, present + extra)
+        rows = scene_yield(bs, window, args)
         if rows:
-            print(f"  keyframe acceptance (every {args.keyframe_stride}th lidar frame in window, "
-                  f"{sum(c in present for c in NUSCENES_CAMS)} standard cams gate; "
-                  f"{rows[0]['n']} candidates):")
-            print(f"    {'tol':>6} {'kept':>7} {'CAM_TRAFFIC attached':>22}")
+            win_s = (window["end_ns"] - window["start_ns"]) / 1e9
+            print(f"  scene yield (complete six-camera set within tol of every lidar frame, "
+                  f"{args.scene_dur:g} s scenes; window {win_s:.0f} s):")
+            print(f"    {'tol':>6} {'usable':>7} {'breaks':>7} {'scenes':>7} {'in scenes':>14}")
             for r in rows:
                 mark = "  <- --sync-ms" if r["tol_ms"] == args.sync_ms else ""
-                tr = f"{100 * r['traffic']:.1f}%" if r["traffic"] is not None else "n/a"
-                print(f"    {r['tol_ms']:>4}ms {100 * r['kept'] / r['n']:>6.1f}% {tr:>22}{mark}")
+                print(f"    {r['tol_ms']:>4}ms {100 * r['valid'] / max(r['in_window'], 1):>6.1f}% "
+                      f"{r['breaks']:>7} {r['scenes']:>7} {r['scene_s']:>6.0f} s ({100 * r['scene_s'] / win_s:>3.0f}%)"
+                      f"{mark}")
             at = next((r for r in rows if r["tol_ms"] == args.sync_ms), None)
-            if at and at["kept"] < 0.9 * at["n"]:
-                flag(1, f"only {100 * at['kept'] / at['n']:.0f}% of keyframes survive --sync-ms {args.sync_ms:g}")
+            if at and at["blamed"]:
+                print("    at --sync-ms, camera missing at the lost frames: " + ", ".join(
+                    f"{ch} {n}" for ch, n in sorted(at["blamed"].items(), key=lambda kv: -kv[1])))
+            if at and at["scene_s"] < args.min_scene_frac * win_s:
+                flag(1, f"only {at['scene_s']:.0f} s of {win_s:.0f} s end up in scenes at "
+                        f"--sync-ms {args.sync_ms:g} ({at['breaks']} breaks)")
 
     verdict = ("PASS", "MARGINAL", "DROP")[level]
     print(f"  --> {verdict}" + (": " + "; ".join(reasons) if reasons else ""))
@@ -357,7 +367,11 @@ def main() -> None:
     p.add_argument("--nominal-hz", type=float, default=0.0,
                    help="Known camera source rate (e.g. 30). Default: infer from the modal inter-arrival gap.")
     p.add_argument("--sync-ms", type=float, default=25.0, help="Sync tolerance the conversion will use (default 25).")
-    p.add_argument("--keyframe-stride", type=int, default=5, help="Keyframe stride the conversion will use (default 5).")
+    p.add_argument("--scene-dur", type=float, default=20.0, help="Scene length the conversion will use (default 20 s).")
+    p.add_argument("--camera-group-ms", type=float, default=5.0,
+                   help="Camera stamps closer than this are one capture instant (default 5, as the converter).")
+    p.add_argument("--min-scene-frac", type=float, default=0.6,
+                   help="Fraction of the coverage window that must end up in scenes to pass (default 0.6).")
     p.add_argument("--min-delivery", type=float, default=0.99, help="Per-camera delivery ratio required to pass (default 0.99).")
     p.add_argument("--max-odom-gap", type=float, default=0.5, help="Odom gap (s) that fails a bag (default 0.5).")
     p.add_argument("--max-lidar-gap", type=float, default=0.3, help="Lidar gap (s) that marks a bag marginal (default 0.3).")

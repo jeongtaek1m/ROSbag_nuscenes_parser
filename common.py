@@ -16,16 +16,18 @@ from rosbags.typesys import Stores, get_types_from_msg, get_typestore
 from scipy.spatial.transform import Rotation
 
 # --------------------------------------------------------------- topic layout
-# Verified against scripts/extract_cam_viz.py output (see docs/pipeline_overview.md);
-# the channel names are the NuScenes ones, the topics are what the vehicle publishes.
+# The channel names are the NuScenes ones, the topics are what the vehicle
+# publishes. Checked on the 2026-09-23 bags with scripts/extract_cam_viz.py:
+# camera_3 looks down the road ahead, camera_4 is tilted up at the traffic
+# lights. Earlier revisions of this table had those two swapped.
 TOPIC_TO_CAM_CHANNEL = {
-    "/camera_4/compressed": "CAM_FRONT",
+    "/camera_3/compressed": "CAM_FRONT",
     "/camera_1/compressed": "CAM_FRONT_RIGHT",
     "/camera_6/compressed": "CAM_FRONT_LEFT",
     "/camera_2/compressed": "CAM_BACK",
     "/camera_0/compressed": "CAM_BACK_RIGHT",
     "/camera_5/compressed": "CAM_BACK_LEFT",
-    "/camera_3/compressed": "CAM_TRAFFIC",
+    "/camera_4/compressed": "CAM_TRAFFIC",
 }
 CAM_CHANNEL_TO_TOPIC = {v: k for k, v in TOPIC_TO_CAM_CHANNEL.items()}
 
@@ -40,8 +42,22 @@ ODOM_TOPIC = "/novatel/oem7/odom"
 # Carries GPS week/ms internally, so it is the only absolute time reference in
 # a bag — used by scripts/clock_diagnosis.py to anchor the host clock.
 INSPVA_TOPIC = "/novatel/oem7/inspva"
+# Gravity-compensated IMU increments; the CAN bus export turns them into rates.
+CORRIMU_TOPIC = "/novatel/oem7/corrimu"
 LIDAR_PACKETS_TOPIC = "/middle/rslidar_packets"
-LIDAR_POINTS_TOPIC = "/middle/rslidar_points"
+LIDAR_POINTS_TOPIC = "/middle/rslidar_points"   # the roof Ruby 128: LIDAR_TOP
+
+# Sensors only the full-data converter emits. Names follow the mounting that
+# /bsw/ad_state reports (lidar_bottom_m1_front, lidar_bottom_bp_left, ...).
+EXTRA_LIDAR_TOPIC_TO_CHANNEL = {
+    "/down_m1_front/rslidar_points": "LIDAR_BOTTOM_FRONT",
+    "/down_m1_rear/rslidar_points": "LIDAR_BOTTOM_REAR",
+    "/down_bp_left/rslidar_points": "LIDAR_BOTTOM_LEFT",
+    "/down_bp_right/rslidar_points": "LIDAR_BOTTOM_RIGHT",
+}
+# Continental ARS548. The PointCloud2 is the driver's filtered detection list,
+# in the sensor frame (plain polar -> cartesian, no mounting offset applied).
+RADAR_TOPIC_TO_CHANNEL = {"/radar/PointCloudDetection": "RADAR_FRONT"}
 
 
 # ------------------------------------------------------------------ rosbag io
@@ -97,38 +113,92 @@ def opencv_ext_to_nuscenes_pose(R_cam_ego, t_cam_ego) -> tuple[list[float], list
 
 
 # -------------------------------------------------------------- calibration
-def load_calib(calib_dir: Path) -> dict:
+CAMERA_CALIB_FILES = ("intrinsic.txt", "distortion.txt", "quat_r.txt", "t.txt")
+POINT_SENSOR_CALIB_FILES = ("r.txt", "t.txt")
+
+
+def _calib_files(channel: str) -> tuple[str, ...]:
+    return CAMERA_CALIB_FILES if channel.startswith("CAM_") else POINT_SENSOR_CALIB_FILES
+
+
+def missing_calib(calib_dir: Path, channels) -> list[str]:
+    """The channels in `channels` whose calibration files are not all present."""
+    return [ch for ch in channels
+            if not all((Path(calib_dir) / ch / f).exists() for f in _calib_files(ch))]
+
+
+def default_calib(channel: str) -> dict:
+    """Calibration for a channel that has none, in load_calib's format.
+
+    Identity extrinsic (sensor frame = ego frame, at the origin). A camera gets
+    no distortion (its images are copied as recorded, not rectified) and
+    intrinsic None: the caller fills in a 90° pinhole K once it knows the image
+    size (see default_intrinsic). Only good enough for the devkit to load and
+    render — not for any geometry.
+    """
+    ext = {"rotation": [1.0, 0.0, 0.0, 0.0], "translation": [0.0, 0.0, 0.0]}
+    if channel.startswith("CAM_"):
+        return {"intrinsic": None, "distortion": [0.0] * 5, "model": "pinhole", **ext}
+    return ext
+
+
+def default_intrinsic(width: int, height: int) -> list[list[float]]:
+    """90° horizontal field of view, principal point at the image centre."""
+    f = width / 2.0
+    return [[f, 0.0, width / 2.0], [0.0, f, height / 2.0], [0.0, 0.0, 1.0]]
+
+
+def resolve_calib(calib_dir: Path | None, channels) -> tuple[dict, list[str]]:
+    """load_calib for the channels calib_dir has, default_calib for the rest.
+
+    Returns (calib, channels that fell back to the default).
+    """
+    have = [] if calib_dir is None else [
+        ch for ch in channels if ch not in missing_calib(calib_dir, [ch])]
+    calib = load_calib(calib_dir, have) if have else {}
+    defaulted = [ch for ch in channels if ch not in have]
+    for ch in defaulted:
+        calib[ch] = default_calib(ch)
+    return {ch: calib[ch] for ch in channels}, defaulted
+
+
+def load_calib(calib_dir: Path, channels=None) -> dict:
     """Read a calibration snapshot directory into the dict stored as calib.json.
 
-    Per camera: intrinsic.txt (3x3 K), distortion.txt, quat_r.txt (w,x,y,z) and
-    t.txt, both in the OpenCV extrinsic convention. The number of distortion
-    coefficients selects the projection model: 4 -> OpenCV fisheye (equidistant),
-    5 -> plumb_bob pinhole. LIDAR_TOP carries r.txt (also a w,x,y,z quaternion)
-    and t.txt.
+    One subdirectory per channel. Cameras (CAM_*): intrinsic.txt (3x3 K),
+    distortion.txt, quat_r.txt (w,x,y,z) and t.txt, the last two in the OpenCV
+    extrinsic convention. The number of distortion coefficients selects the
+    projection model: 4 -> OpenCV fisheye (equidistant), 5 -> plumb_bob pinhole.
+    Point sensors (LIDAR_*, RADAR_*): r.txt (also a w,x,y,z quaternion) and t.txt,
+    same convention.
+
+    `channels` defaults to the six standard cameras and LIDAR_TOP.
     """
     calib_dir = Path(calib_dir)
+    channels = [*NUSCENES_CAMS, "LIDAR_TOP"] if channels is None else list(channels)
     out: dict = {}
-    for cam in NUSCENES_CAMS:
-        d = calib_dir / cam
-        distortion = np.loadtxt(d / "distortion.txt").reshape(-1).tolist()
-        if len(distortion) == 4:
-            model = "fisheye"
-        elif len(distortion) == 5:
-            model = "pinhole"
+    for ch in channels:
+        d = calib_dir / ch
+        if ch.startswith("CAM_"):
+            distortion = np.loadtxt(d / "distortion.txt").reshape(-1).tolist()
+            if len(distortion) == 4:
+                model = "fisheye"
+            elif len(distortion) == 5:
+                model = "pinhole"
+            else:
+                model = "unknown"
+            out[ch] = {
+                "intrinsic": np.loadtxt(d / "intrinsic.txt").tolist(),
+                "distortion": distortion,
+                "model": model,
+                "rotation": np.loadtxt(d / "quat_r.txt").reshape(-1).tolist(),
+                "translation": np.loadtxt(d / "t.txt").reshape(-1).tolist(),
+            }
         else:
-            model = "unknown"
-        out[cam] = {
-            "intrinsic": np.loadtxt(d / "intrinsic.txt").tolist(),
-            "distortion": distortion,
-            "model": model,
-            "rotation": np.loadtxt(d / "quat_r.txt").reshape(-1).tolist(),
-            "translation": np.loadtxt(d / "t.txt").reshape(-1).tolist(),
-        }
-    lidar_d = calib_dir / "LIDAR_TOP"
-    out["LIDAR_TOP"] = {
-        "rotation": np.loadtxt(lidar_d / "r.txt").reshape(-1).tolist(),
-        "translation": np.loadtxt(lidar_d / "t.txt").reshape(-1).tolist(),
-    }
+            out[ch] = {
+                "rotation": np.loadtxt(d / "r.txt").reshape(-1).tolist(),
+                "translation": np.loadtxt(d / "t.txt").reshape(-1).tolist(),
+            }
     return out
 
 

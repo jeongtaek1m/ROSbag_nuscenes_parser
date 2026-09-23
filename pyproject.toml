@@ -9,11 +9,11 @@ dependencies = [
     "scipy>=1.10",
     "opencv-python>=4.6",
     "tqdm>=4.65",
+    # scene names come from its official split lists; the run ends with a load check
+    "nuscenes-devkit>=1.1.11",
 ]
 
 [project.optional-dependencies]
-# Output verification and the QA report
-verify = ["nuscenes-devkit>=1.1.11"]
 # scripts/clock_diagnosis.py plots, notebooks
 plots = ["matplotlib>=3.7", "jupyter"]
 # scripts/rerun_viz.py

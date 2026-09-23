@@ -5,22 +5,37 @@ hands it timestamps plus a calibration dict and gets back the tables and a
 materialization plan of (timestamp_ns, channel, destination_relpath) that it is
 free to satisfy however it likes.
 
+Frame selection (plan_frames / partition_scenes):
+  - LIDAR_TOP is the anchor. Every LiDAR frame must have a *complete camera
+    set*: one capture instant at which every gating camera delivered a frame,
+    all within --sync-ms of the LiDAR stamp. The cameras share a trigger, so a
+    set is picked as a whole, never camera by camera.
+  - A LiDAR frame without one, a missing LiDAR frame, or leaving the coverage
+    window breaks the sequence. The unbroken runs are cut into scenes of exactly
+    --scene-dur seconds; a remainder shorter than that is not used.
+  - Samples (keyframes) are every --keyframe-stride-th LiDAR frame of a scene.
+    Sweeps are every frame of every channel between a scene's first and last
+    sample — all 30 fps camera frames, all 10 Hz LiDAR frames.
+
 Conventions:
   - Calibration arrives in the OpenCV extrinsic convention
     (P_sensor = R @ P_ego + t); NuScenes wants the sensor pose in the ego frame,
     so it is inverted when writing calibrated_sensor.json.
+  - Camera intrinsics are whatever the caller passes in `SensorData.intrinsic`:
+    the pinhole K of the rectified images (see rectify.py).
+  - Scene names are taken from the official nuScenes train/val lists, so every
+    tool that splits by `nuscenes.utils.splits` works unchanged.
   - sample_annotation/instance are emitted empty on purpose: labels are produced
     externally. category/attribute carry the label taxonomy (from the perception
     stack's enums, see common.py) and visibility the four nuScenes bins with
     nuScenes' literal tokens "1".."4", so a vendor fills the two empty tables
     against a complete, standard-looking schema.
-  - Images are not undistorted anywhere in this pipeline; NuScenes has no
-    distortion field. See "Known limitations" in README.md.
 """
 from __future__ import annotations
 
 import json
 import uuid
+from collections import Counter
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -36,6 +51,13 @@ from common import (
     quat_wxyz_to_R,
 )
 
+# nuscenes-devkit's NuScenesCanBus refuses these scene numbers outright
+# (can_bus_api.py, `can_blacklist`), so they are never handed out.
+CAN_BUS_BLACKLIST = frozenset({161, 162, 163, 164, 165, 166, 167, 168, 170, 171, 172,
+                               173, 174, 175, 176, 309, 310, 311, 312, 313, 314})
+
+FILE_EXT = {"lidar": ".pcd.bin", "radar": ".pcd", "camera": ".jpg"}
+
 
 def new_token() -> str:
     return uuid.uuid4().hex
@@ -44,20 +66,20 @@ def new_token() -> str:
 @dataclass
 class SensorData:
     """Everything the table builder needs, however the caller obtained it."""
-    calib: dict
-    cam_ts: dict[str, np.ndarray]   # channel -> sorted ts_ns (int64)
-    lidar_ts: np.ndarray            # sorted ts_ns
-    odom_ts: np.ndarray             # sorted ts_ns
-    odom_t: np.ndarray              # (N, 3) translation
-    odom_R: Rotation                # rotation samples for SLERP
-    cam_size: dict[str, tuple[int, int]]  # channel -> (height, width)
+    calib: dict                                # channel -> calibration (common.load_calib)
+    frames: dict[str, np.ndarray]              # channel -> sorted ts_ns of the staged frames
+    modality: dict[str, str]                   # channel -> "lidar" | "camera" | "radar"
+    intrinsic: dict[str, list]                 # camera channel -> K for calibrated_sensor
+    cam_size: dict[str, tuple[int, int]]       # camera channel -> (height, width)
+    odom_ts: np.ndarray                        # sorted ts_ns
+    odom_t: np.ndarray                         # (N, 3) translation
+    odom_R: Rotation                           # rotation samples for SLERP
     bag_start_ns: int
     bag_end_ns: int
     # Built lazily by interp_pose and reused. Slerp's constructor preprocesses
     # every odom sample (O(N)); build_tables interpolates once per
     # (scene, channel), so rebuilding it per call cost scenes x channels x N.
     _slerp: Slerp | None = field(default=None, repr=False, compare=False)
-
 
 
 def nearest_ts(query: np.ndarray, target: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
@@ -75,11 +97,12 @@ def nearest_ts(query: np.ndarray, target: np.ndarray) -> tuple[np.ndarray, np.nd
     return matched, diff
 
 
-def required_streams(data: SensorData, required: list[str]) -> dict[str, np.ndarray]:
-    """The streams a keyframe cannot do without: LiDAR, the gating cameras, odom."""
-    out: dict[str, np.ndarray] = {"LIDAR_TOP": data.lidar_ts}
-    out.update({ch: data.cam_ts[ch] for ch in required})
-    out["ODOM"] = data.odom_ts
+def required_streams(lidar_ts: np.ndarray, cam_ts: dict[str, np.ndarray],
+                     gating: list[str], odom_ts: np.ndarray) -> dict[str, np.ndarray]:
+    """The streams a frame cannot do without: LiDAR, the gating cameras, odom."""
+    out: dict[str, np.ndarray] = {"LIDAR_TOP": lidar_ts}
+    out.update({ch: cam_ts[ch] for ch in gating})
+    out["ODOM"] = odom_ts
     return out
 
 
@@ -87,9 +110,9 @@ def coverage_window(streams: dict[str, np.ndarray], sync_ns: int) -> dict:
     """The interval in which every stream in `streams` has data, shrunk by sync_ns.
 
     Sensors start and stop at different times (up to ~1.4 s apart on the
-    2026-08-19 bags). A keyframe outside this interval would have no image or
+    2026-08-19 bags). A frame outside this interval would have no image or
     no pose to attach; the margin exists because a camera frame matched to a
-    keyframe may sit up to sync_ns away from it and still needs a pose.
+    LiDAR frame may sit up to sync_ns away from it and still needs a pose.
     `streams` is name -> sorted timestamps (ns). The result is JSON-friendly.
     """
     present = {k: v for k, v in streams.items() if len(v)}
@@ -127,112 +150,195 @@ def format_coverage(window: dict) -> list[str]:
     return lines
 
 
-def sync_keyframes(data: SensorData, channels: list[str], sync_ns: int,
-                   keyframe_stride: int,
-                   required: list[str] | None = None,
-                   window: dict | None = None) -> list[dict]:
-    """Pick every Kth lidar ts as a keyframe anchor and match cameras to it.
+# ------------------------------------------------------------ frame selection
+def camera_instants(cam_ts: dict[str, np.ndarray], channels: list[str], group_ns: int
+                    ) -> tuple[np.ndarray, dict[str, np.ndarray]]:
+    """Group the cameras' frames into capture instants.
 
-    Candidates are restricted to the coverage window (see coverage_window): the
-    span in which LiDAR, every required camera and odom are all present. Since
-    scenes and sweeps only ever lie between keyframes, that is what guarantees
-    every frame in the dataset has both an image and a pose. `window` may be
-    passed in when the caller has already computed it.
-
-    `required` channels must all land within `sync_ns` or the keyframe is
-    dropped. Channels outside `required` are best-effort: they are attached when
-    they happen to be in tolerance and simply omitted when they are not, so they
-    can never veto a keyframe. That is how CAM_TRAFFIC is carried — it is a
-    seventh, non-standard channel with placeholder calibration, and letting it
-    gate the six real cameras would throw away good samples for nothing.
-
-    Returns [{"lidar_ts": int, "cam_ts": {channel: ts}}], where cam_ts is
-    guaranteed to hold every required channel and may hold the optional ones.
+    The cameras share a trigger: frames taken together carry stamps within
+    ~0.04 ms of each other, but never bit-identical ones. Stamps from all
+    `channels` are merged and split wherever consecutive stamps are more than
+    `group_ns` apart. Returns (instant_ns, members): instant_ns[i] is the
+    earliest stamp of instant i and members[ch][i] is ch's stamp there, or -1
+    where that camera dropped the frame.
     """
-    required = list(channels) if required is None else [c for c in required if c in channels]
-    optional = [c for c in channels if c not in required]
-
-    if window is None:
-        window = coverage_window(required_streams(data, required), sync_ns)
-    all_anchors = data.lidar_ts[::keyframe_stride]
-    in_window = (all_anchors >= window["start_ns"]) & (all_anchors <= window["end_ns"])
-    anchors = all_anchors[in_window]
-    print(f"  candidate keyframes: {len(anchors)} "
-          f"(every {keyframe_stride}th of {len(data.lidar_ts)} lidar; "
-          f"{int((~in_window).sum())} outside the coverage window)")
-    print(f"  gating on {len(required)} channel(s); "
-          f"best-effort: {optional or 'none'}")
-
-    cam_match = {ch: nearest_ts(anchors, data.cam_ts[ch]) for ch in channels}
-
-    valid = np.ones(len(anchors), dtype=bool)
-    for ch in required:
-        valid &= cam_match[ch][1] <= sync_ns
-    n_drop = int((~valid).sum())
-    print(f"  dropped {n_drop} ({100 * n_drop / max(len(anchors), 1):.2f}%) "
-          f"for sync miss; kept {int(valid.sum())}")
-
-    out: list[dict] = []
-    for i in np.where(valid)[0]:
-        cam_ts = {ch: int(cam_match[ch][0][i]) for ch in required}
-        for ch in optional:
-            matched, diff = cam_match[ch]
-            if diff[i] <= sync_ns:
-                cam_ts[ch] = int(matched[i])
-        out.append({"lidar_ts": int(anchors[i]), "cam_ts": cam_ts})
-
-    for ch in optional:
-        n = sum(1 for kf in out if ch in kf["cam_ts"])
-        print(f"    {ch}: attached to {n}/{len(out)} keyframes "
-              f"({100 * n / max(len(out), 1):.1f}%)")
-    return out
+    parts = [np.asarray(cam_ts[ch], dtype=np.int64) for ch in channels]
+    ts = np.concatenate(parts) if parts else np.zeros(0, dtype=np.int64)
+    who = np.concatenate([np.full(len(p), k) for k, p in enumerate(parts)]) if parts \
+        else np.zeros(0, dtype=np.int64)
+    order = np.argsort(ts, kind="stable")
+    ts, who = ts[order], who[order]
+    if not len(ts):
+        return ts, {ch: ts.copy() for ch in channels}
+    new_group = np.concatenate([[True], np.diff(ts) > group_ns])
+    gid = np.cumsum(new_group) - 1
+    instants = ts[new_group]
+    members = {ch: np.full(len(instants), -1, dtype=np.int64) for ch in channels}
+    for k, ch in enumerate(channels):
+        sel = who == k
+        members[ch][gid[sel]] = ts[sel]
+    return instants, members
 
 
-def partition_scenes(keyframes: list[dict], scene_dur_s: float) -> list[list[dict]]:
-    """Group keyframes into scenes by fixed time window. By construction all
-    scenes except possibly the last have full duration; the last scene is
-    dropped if it didn't reach >=90% of the target duration."""
-    if not keyframes:
-        return []
-    scene_dur_ns = int(scene_dur_s * 1e9)
-    scenes: list[list[dict]] = []
-    current: list[dict] = []
-    scene_start_ns = keyframes[0]["lidar_ts"]
-    for kf in keyframes:
-        if kf["lidar_ts"] - scene_start_ns >= scene_dur_ns and current:
-            scenes.append(current)
-            current = []
-            scene_start_ns = kf["lidar_ts"]
-        current.append(kf)
-    if current:
-        scenes.append(current)
+def plan_frames(lidar_ts: np.ndarray, cam_ts: dict[str, np.ndarray], gating: list[str],
+                sync_ns: int, window: dict, group_ns: int, max_gap_ns: int) -> dict:
+    """Decide which LiDAR frames the dataset can use, and with which camera set.
 
-    # Drop trailing incomplete scene (time-based, not count-based, since sync
-    # drops can leave a fully-spanning scene with fewer than expected samples).
-    if scenes:
-        last = scenes[-1]
-        last_span_ns = last[-1]["lidar_ts"] - last[0]["lidar_ts"]
-        threshold = int(scene_dur_s * 0.9 * 1e9)
-        if last_span_ns < threshold:
-            print(f"  dropping last scene (span {last_span_ns/1e9:.1f}s < {threshold/1e9:.1f}s)")
-            scenes = scenes[:-1]
+    For each LiDAR frame, of the camera instants whose every gating frame lies
+    within sync_ns of the LiDAR stamp, the nearest *complete* one is taken — one
+    where no gating camera dropped its frame. A frame without such an instant
+    cannot be used; neither can one outside the coverage window. Unusable frames
+    and LiDAR gaps longer than max_gap_ns cut the sequence into segments.
 
-    print(f"  {len(scenes)} scenes  ({sum(len(s) for s in scenes)} total samples)")
-    return scenes
+    Returns a dict:
+      valid     bool[n_lidar]
+      cam       {channel: int64[n_lidar]}   chosen camera stamps, -1 where invalid
+      dev_ns    int64[n_lidar]              worst |camera - lidar| of the chosen set
+      segments  [int array of lidar indices] unbroken runs of valid frames
+      stats     JSON-friendly counters
+    """
+    L = np.asarray(lidar_ts, dtype=np.int64)
+    n = len(L)
+    instants, members = camera_instants(cam_ts, gating, group_ns)
+    complete = (np.all(np.stack([members[ch] >= 0 for ch in gating]), axis=0)
+                if len(instants) else np.zeros(0, dtype=bool))
+    ci = np.flatnonzero(complete)
+    C = instants[ci]
+
+    chosen = np.full(n, -1, dtype=np.int64)
+    best = np.full(n, np.iinfo(np.int64).max, dtype=np.int64)
+    if len(C):
+        pos = np.searchsorted(C, L)
+        for cand in (pos - 1, pos):   # the nearest complete instant on either side
+            inside = (cand >= 0) & (cand < len(C))
+            c = ci[np.clip(cand, 0, len(C) - 1)]
+            dev = np.max(np.stack([np.abs(members[ch][c] - L) for ch in gating]), axis=0)
+            better = inside & (dev <= sync_ns) & (dev < best)
+            chosen[better] = c[better]
+            best[better] = dev[better]
+
+    in_window = (L >= window["start_ns"]) & (L <= window["end_ns"])
+    has_set = chosen >= 0
+    valid = in_window & has_set
+    gap_before = np.concatenate([[False], np.diff(L) > max_gap_ns])
+
+    idx = np.flatnonzero(valid)
+    if len(idx):
+        cuts = np.flatnonzero((np.diff(idx) > 1) | gap_before[idx[1:]]) + 1
+        segments = np.split(idx, cuts)
+    else:
+        segments = []
+
+    cam = {ch: np.where(valid, members[ch][np.clip(chosen, 0, None)], -1)
+           if len(instants) else np.full(n, -1, dtype=np.int64) for ch in gating}
+
+    # Why frames inside the window were lost: which cameras had dropped their
+    # frame at the nearest instant (complete or not).
+    blamed: Counter = Counter()
+    lost = np.flatnonzero(in_window & ~has_set)
+    if len(lost) and len(instants):
+        near = np.clip(np.searchsorted(instants, L[lost]), 0, len(instants) - 1)
+        left = np.clip(near - 1, 0, len(instants) - 1)
+        pick = np.where(np.abs(instants[left] - L[lost]) <= np.abs(instants[near] - L[lost]),
+                        left, near)
+        for i in pick:
+            for ch in gating:
+                if members[ch][i] < 0:
+                    blamed[ch] += 1
+    dev_ms = best[valid] / 1e6
+    stats = {
+        "n_lidar": int(n),
+        "n_in_window": int(in_window.sum()),
+        "n_valid": int(valid.sum()),
+        "n_no_camera_set": int((in_window & ~has_set).sum()),
+        "n_lidar_gaps": int((gap_before & in_window).sum()),
+        "n_segments": len(segments),
+        "n_camera_instants": int(len(instants)),
+        "n_complete_instants": int(len(ci)),
+        "frames_lost_by_camera": dict(blamed),
+        "sync_dev_ms": ({"p50": float(np.percentile(dev_ms, 50)),
+                         "p99": float(np.percentile(dev_ms, 99)),
+                         "max": float(dev_ms.max())} if len(dev_ms) else None),
+        "sync_ns": int(sync_ns), "group_ns": int(group_ns), "max_gap_ns": int(max_gap_ns),
+    }
+    return {"valid": valid, "cam": cam, "dev_ns": best, "segments": segments, "stats": stats}
 
 
+def format_plan(plan: dict) -> list[str]:
+    s = plan["stats"]
+    lines = [
+        f"lidar frames: {s['n_lidar']}, in coverage window {s['n_in_window']}, "
+        f"usable {s['n_valid']}",
+        f"camera instants: {s['n_camera_instants']}, complete {s['n_complete_instants']} "
+        f"({100 * s['n_complete_instants'] / max(s['n_camera_instants'], 1):.2f}%)",
+        f"breaks: {s['n_no_camera_set']} frame(s) without a complete camera set within "
+        f"{s['sync_ns'] / 1e6:g} ms, {s['n_lidar_gaps']} lidar gap(s) "
+        f"-> {s['n_segments']} segment(s)",
+    ]
+    if s["frames_lost_by_camera"]:
+        lines.append("  camera missing at the lost frames: " + ", ".join(
+            f"{ch} {n}" for ch, n in sorted(s["frames_lost_by_camera"].items(),
+                                              key=lambda kv: -kv[1])))
+    if s["sync_dev_ms"]:
+        d = s["sync_dev_ms"]
+        lines.append(f"camera set vs lidar: p50 {d['p50']:.1f} ms, p99 {d['p99']:.1f} ms, "
+                     f"max {d['max']:.1f} ms")
+    return lines
+
+
+def partition_scenes(segments: list[np.ndarray], frames_per_scene: int
+                     ) -> tuple[list[tuple[int, np.ndarray]], dict]:
+    """Cut every segment into consecutive scenes of exactly frames_per_scene frames.
+
+    Returns ([(segment_index, lidar_indices)], stats). A segment's remainder
+    shorter than a full scene is not used; stats says how much that was.
+    """
+    scenes: list[tuple[int, np.ndarray]] = []
+    unused = 0
+    for k, seg in enumerate(segments):
+        n_full = len(seg) // frames_per_scene
+        for j in range(n_full):
+            scenes.append((k, seg[j * frames_per_scene:(j + 1) * frames_per_scene]))
+        unused += len(seg) - n_full * frames_per_scene
+    stats = {"n_scenes": len(scenes), "frames_per_scene": int(frames_per_scene),
+             "frames_in_scenes": len(scenes) * frames_per_scene,
+             "frames_unused": int(unused)}
+    return scenes, stats
+
+
+def official_scene_names(split: str, used: set[str], n: int) -> list[str]:
+    """The next n unused names from the official nuScenes list for `split`.
+
+    Our scenes are named after official ones so that anything splitting a
+    nuScenes dataset by `nuscenes.utils.splits` — the devkit's detection and
+    tracking evaluation, mmdetection3d / BEVFusion info generation — puts them
+    in the intended split without modification. Numbers the CAN bus API
+    refuses are skipped. The lists hold 700 train and 150 val names.
+    """
+    from nuscenes.utils.splits import create_splits_scenes  # local: optional dep elsewhere
+    if split not in ("train", "val"):
+        raise ValueError(f"split must be 'train' or 'val', not {split!r}")
+    names = sorted(create_splits_scenes()[split])
+    free = [s for s in names if s not in used and int(s[-4:]) not in CAN_BUS_BLACKLIST]
+    if len(free) < n:
+        raise SystemExit(f"the official '{split}' list has {len(free)} unused scene "
+                         f"names left, {n} needed — the dataset is full for this split")
+    return free[:n]
+
+
+# ---------------------------------------------------------------- ego pose
 def interp_pose(query_ns: np.ndarray, data: SensorData) -> tuple[np.ndarray, np.ndarray]:
     """Interpolate ego pose at each query ns. Returns (translations, quaternions[wxyz])."""
     odom_ts = data.odom_ts
     odom_t = data.odom_t
-    # Every frame must lie inside odom coverage; coverage_window guarantees it
-    # for anything sync_keyframes lets through. Clipping here instead would
+    # Every frame must lie inside odom coverage; the coverage window guarantees
+    # it for anything plan_frames lets through. Clipping here instead would
     # silently freeze the pose at the first/last odom sample.
     outside = (query_ns < odom_ts[0]) | (query_ns > odom_ts[-1])
     if outside.any():
         raise ValueError(
             f"{int(outside.sum())} frame timestamp(s) outside odom coverage "
-            f"[{int(odom_ts[0])}, {int(odom_ts[-1])}] ns — keyframes were not "
+            f"[{int(odom_ts[0])}, {int(odom_ts[-1])}] ns — frames were not "
             "restricted to the coverage window")
     q = query_ns
 
@@ -269,75 +375,60 @@ def assign_to_following_sample(target_ts: np.ndarray, sample_ts: np.ndarray) -> 
     return np.clip(idx, 0, len(sample_ts) - 1)
 
 
-def build_tables(data: SensorData, scenes: list[list[dict]],
-                 channels: list[str], log_token: str, log_name: str,
-                 existing: dict | None = None
-                 ) -> tuple[dict, list[tuple[Path, Path, str]]]:
+# ------------------------------------------------------------------ tables
+def build_tables(data: SensorData, scenes: list[dict], channels: list[str],
+                 gating: list[str], kf_tol_ns: dict[str, int],
+                 log_token: str, log_name: str, existing: dict | None = None
+                 ) -> tuple[dict, list[tuple[int, str, str]], dict]:
     """Build all 13 NuScenes JSON tables.
 
-    If `existing` (loaded JSONs) is provided, reuse stable tokens (sensor,
-    category, attribute, visibility, map) and continue the scene index.
-    The returned tables contain ONLY the new records — caller merges with
-    existing ones via merge_tables().
+    `scenes` are {"name", "description", "keyframes": [{"lidar_ts", "cam_ts"}]}
+    where cam_ts holds the chosen frame of every gating camera. `channels` is
+    every sample_data channel to emit, LIDAR_TOP first. Channels that are
+    neither LIDAR_TOP nor gating are best-effort: a sample gets the frame
+    nearest its LiDAR instant when that is within kf_tol_ns[channel], and no
+    frame of that channel otherwise.
 
-    Returns (tables, plan) where plan is a list of
+    If `existing` (loaded JSONs) is provided, reuse stable tokens (sensor,
+    category, attribute, visibility) and return ONLY the new records — the
+    caller merges them via merge_tables().
+
+    Returns (tables, plan, attach) where plan is a list of
     (source_timestamp_ns, channel, destination_relpath) that the caller turns
-    into real files.
+    into real files, and attach counts best-effort keyframes per channel.
     """
     plan: list[tuple[int, str, str]] = []
-    scene_idx_offset = 0
     existing_sensor_tokens: dict[str, str] = {}
     if existing:
-        scene_idx_offset = len(existing.get("scene.json", []))
         for s in existing.get("sensor.json", []):
             existing_sensor_tokens[s["channel"]] = s["token"]
     # ---------- sensor.json (reuse existing tokens if any) ----------
     sensor_tokens: dict[str, str] = {}
     sensors = []
-    for ch, modality in [("LIDAR_TOP", "lidar")] + [(c, "camera") for c in channels]:
+    for ch in channels:
         if ch in existing_sensor_tokens:
             sensor_tokens[ch] = existing_sensor_tokens[ch]
         else:
             tk = new_token()
             sensor_tokens[ch] = tk
-            sensors.append({"token": tk, "channel": ch, "modality": modality})
+            sensors.append({"token": tk, "channel": ch, "modality": data.modality[ch]})
 
-    # ---------- calibrated_sensor.json (8 records, one per (sensor, log)) ----------
+    # ---------- calibrated_sensor.json (one per (sensor, log)) ----------
     cs_tokens: dict[str, str] = {}
     cs_records = []
-    # LIDAR_TOP
-    L = data.calib["LIDAR_TOP"]
-    R_lidar = quat_wxyz_to_R(L["rotation"])
-    t_lidar = np.asarray(L["translation"], dtype=np.float64)
-    rot_q, trans = opencv_ext_to_nuscenes_pose(R_lidar, t_lidar)
-    cs_tokens["LIDAR_TOP"] = new_token()
-    cs_records.append({
-        "token": cs_tokens["LIDAR_TOP"],
-        "sensor_token": sensor_tokens["LIDAR_TOP"],
-        "translation": trans,
-        "rotation": rot_q,
-        "camera_intrinsic": [],
-    })
     for ch in channels:
+        params = data.calib[ch]
+        rot_q, trans = opencv_ext_to_nuscenes_pose(
+            quat_wxyz_to_R(params["rotation"]),
+            np.asarray(params["translation"], dtype=np.float64))
         cs_tokens[ch] = new_token()
-        if ch in data.calib:
-            params = data.calib[ch]
-            R_c = quat_wxyz_to_R(params["rotation"])
-            t_c = np.asarray(params["translation"], dtype=np.float64)
-            rot_q, trans = opencv_ext_to_nuscenes_pose(R_c, t_c)
-            K = params["intrinsic"]
-        else:
-            # placeholder for CAM_TRAFFIC (no calib) — identity transform
-            rot_q = [1.0, 0.0, 0.0, 0.0]
-            trans = [0.0, 0.0, 0.0]
-            h, w = data.cam_size.get(ch, (1080, 1920))
-            K = [[w / 2, 0.0, w / 2], [0.0, h / 2, h / 2], [0.0, 0.0, 1.0]]
         cs_records.append({
             "token": cs_tokens[ch],
             "sensor_token": sensor_tokens[ch],
             "translation": trans,
             "rotation": rot_q,
-            "camera_intrinsic": K,
+            "camera_intrinsic": ([list(map(float, row)) for row in data.intrinsic[ch]]
+                                 if data.modality[ch] == "camera" else []),
         })
 
     # ---------- log.json ----------
@@ -385,7 +476,7 @@ def build_tables(data: SensorData, scenes: list[list[dict]],
         ]
     # Map: append a record per log so log_tokens reference is set per bag.
     # devkit's render_sample expects a real PNG at filename; we point all maps
-    # at a single shared placeholder created in materialize_files().
+    # at a single shared placeholder created by the caller.
     maps = [{
         "token": new_token(),
         "category": "semantic_prior",
@@ -398,24 +489,15 @@ def build_tables(data: SensorData, scenes: list[list[dict]],
     sample_records = []
     sample_data_records = []
     ego_pose_records = []
+    attach: Counter = Counter()
+    odom_lo, odom_hi = int(data.odom_ts[0]), int(data.odom_ts[-1])
 
-    # All sample_data we will emit (samples + sweeps), per channel, indexed by ts_ns
-    # so we can chain prev/next within scene.
-    # Strategy:
-    #   - For samples: lidar @ keyframe ts + 7 cams @ matched ts (is_key_frame=True)
-    #   - For sweeps:  every other lidar/cam frame in [scene_start, scene_end] window
-    #                  whose nearest sample is within scene
-    #
-    # We'll build sample_data records per scene and link prev/next per sensor channel.
-
-    # Pre-compute keyframe sample tokens & timestamps so sweeps can attach.
-    for scene_idx, scene_kfs in enumerate(scenes):
+    for scene in scenes:
+        scene_kfs = scene["keyframes"]
         scene_token = new_token()
         scene_kf_ts = np.array([kf["lidar_ts"] for kf in scene_kfs], dtype=np.int64)
         scene_kf_tokens = [new_token() for _ in scene_kfs]
-
-        scene_start_ns = scene_kf_ts[0]
-        scene_end_ns = scene_kf_ts[-1]
+        scene_start_ns, scene_end_ns = scene_kf_ts[0], scene_kf_ts[-1]
 
         # ----- sample records (keyframes) -----
         for i, (kf, sample_token) in enumerate(zip(scene_kfs, scene_kf_tokens)):
@@ -427,83 +509,58 @@ def build_tables(data: SensorData, scenes: list[list[dict]],
                 "prev": scene_kf_tokens[i - 1] if i > 0 else "",
             })
 
-        # ----- collect all sample_data per (channel) for this scene window -----
-        channel_frames: dict[str, list[tuple[int, bool, str]]] = {}
-        # (frame_ts_ns, is_key_frame, sample_data_token)
-
-        # LIDAR_TOP: keyframe lidar ts + every other lidar in window
-        lidar_in_scene = data.lidar_ts[
-            (data.lidar_ts >= scene_start_ns) & (data.lidar_ts <= scene_end_ns)
-        ]
-        kf_lidar_set = set(scene_kf_ts.tolist())
-        ld_frames = []
-        for t in lidar_in_scene:
-            ld_frames.append((int(t), int(t) in kf_lidar_set, new_token()))
-        channel_frames["LIDAR_TOP"] = ld_frames
-
-        # Cameras: keyframe cam ts (from scene_kfs) + sweeps in window
-        for ch in channels:
-            kf_cam_ts_set = {kf["cam_ts"][ch] for kf in scene_kfs
-                             if ch in kf["cam_ts"]}
-            cam_in_scene_mask = (
-                (data.cam_ts[ch] >= scene_start_ns) & (data.cam_ts[ch] <= scene_end_ns)
-            )
-            cam_in_scene = data.cam_ts[ch][cam_in_scene_mask]
-            # ensure all keyframe cam ts are included
-            full_set = set(int(t) for t in cam_in_scene) | kf_cam_ts_set
-            cam_sorted = sorted(full_set)
-            ch_frames = []
-            for t in cam_sorted:
-                is_kf = t in kf_cam_ts_set
-                ch_frames.append((int(t), is_kf, new_token()))
-            channel_frames[ch] = ch_frames
-
-        # A keyframe frame belongs to the sample it was synchronized into: the
-        # lidar frame by its own timestamp, a camera frame by the match
-        # sync_keyframes made — it may sit a few ms after the lidar instant, so
-        # it must not be re-assigned by time. Sweeps attach to the following
-        # keyframe, as in nuScenes (see assign_to_following_sample). Anchors are
-        # this scene's keyframes only, so every sample_data stays in its scene.
-        kf_frame_to_sample: dict[tuple[str, int], str] = {}
-        for kf, tok in zip(scene_kfs, scene_kf_tokens):
-            kf_frame_to_sample[("LIDAR_TOP", int(kf["lidar_ts"]))] = tok
-            for ch, t in kf["cam_ts"].items():
-                kf_frame_to_sample[(ch, int(t))] = tok
-
-        for ch_name, frames in channel_frames.items():
-            frame_ts_arr = np.array([f[0] for f in frames], dtype=np.int64)
+        for ch_name in channels:
+            ts_all = data.frames[ch_name]
+            # A keyframe frame belongs to the sample it was synchronized into:
+            # LIDAR_TOP by its own timestamp, a gating camera by the set
+            # plan_frames chose — it may sit a few ms after the lidar instant, so
+            # it must not be re-assigned by time.
+            if ch_name == "LIDAR_TOP":
+                kf_map = {int(t): tok for t, tok in zip(scene_kf_ts, scene_kf_tokens)}
+            elif ch_name in gating:
+                kf_map = {int(kf["cam_ts"][ch_name]): tok
+                          for kf, tok in zip(scene_kfs, scene_kf_tokens)}
+            else:
+                cand = ts_all[(ts_all >= odom_lo) & (ts_all <= odom_hi)]
+                matched, diff = nearest_ts(scene_kf_ts, cand)
+                kf_map = {int(m): tok for m, d, tok in zip(matched, diff, scene_kf_tokens)
+                          if d <= kf_tol_ns[ch_name]}
+                attach[ch_name] += len(kf_map)
+            in_scene = ts_all[(ts_all >= scene_start_ns) & (ts_all <= scene_end_ns)]
+            frame_ts_arr = np.array(sorted(set(in_scene.tolist()) | set(kf_map)),
+                                    dtype=np.int64)
+            # Sweeps attach to the following keyframe, as in nuScenes (see
+            # assign_to_following_sample). Anchors are this scene's keyframes
+            # only, so every sample_data stays in its scene.
             following_kf = assign_to_following_sample(frame_ts_arr, scene_kf_ts)
 
             # interp ego pose for every frame ts in this channel (one ego_pose per sample_data)
             trans, quats = interp_pose(frame_ts_arr, data)
 
-            prev_token = ""
-            for i, (ts_ns, is_kf, sd_token) in enumerate(frames):
+            modality = data.modality[ch_name]
+            ext = FILE_EXT[modality]
+            if modality == "camera":
+                height, width = data.cam_size[ch_name]
+                fileformat = "jpg"
+            else:
+                height, width = 0, 0
+                fileformat = "pcd"
+
+            prev_sd: dict | None = None
+            for i, ts_ns in enumerate(frame_ts_arr.tolist()):
                 ego_token = new_token()
                 ego_pose_records.append({
                     "token": ego_token,
                     "translation": trans[i].tolist(),
                     "rotation": [float(x) for x in quats[i]],
-                    "timestamp": int(ts_ns) // 1000,
+                    "timestamp": ts_ns // 1000,
                 })
-
-                if is_kf:
-                    sample_token = kf_frame_to_sample[(ch_name, int(ts_ns))]
-                else:
-                    sample_token = scene_kf_tokens[following_kf[i]]
-
-                # filename: samples/<channel>/<token>.<ext> or sweeps/<channel>/<token>.<ext>
+                is_kf = ts_ns in kf_map
+                sample_token = kf_map[ts_ns] if is_kf else scene_kf_tokens[following_kf[i]]
+                sd_token = new_token()
                 bucket = "samples" if is_kf else "sweeps"
-                if ch_name == "LIDAR_TOP":
-                    fname = f"{bucket}/LIDAR_TOP/{sd_token}.pcd.bin"
-                    fileformat = "pcd"
-                    height, width = 0, 0
-                else:
-                    fname = f"{bucket}/{ch_name}/{sd_token}.jpg"
-                    fileformat = "jpg"
-                    height, width = data.cam_size.get(ch_name, (0, 0))
-                plan.append((int(ts_ns), ch_name, fname))
-
+                fname = f"{bucket}/{ch_name}/{sd_token}{ext}"
+                plan.append((ts_ns, ch_name, fname))
                 sd = {
                     "token": sd_token,
                     "sample_token": sample_token,
@@ -511,36 +568,28 @@ def build_tables(data: SensorData, scenes: list[list[dict]],
                     "calibrated_sensor_token": cs_tokens[ch_name],
                     "filename": fname,
                     "fileformat": fileformat,
-                    "is_key_frame": bool(is_kf),
+                    "is_key_frame": is_kf,
                     "height": int(height),
                     "width": int(width),
-                    "timestamp": int(ts_ns) // 1000,
-                    "next": "",  # filled in second pass below
-                    "prev": prev_token,
+                    "timestamp": ts_ns // 1000,
+                    "next": "",
+                    "prev": prev_sd["token"] if prev_sd else "",
                 }
+                if prev_sd:
+                    prev_sd["next"] = sd_token
                 sample_data_records.append(sd)
-                if prev_token:
-                    # Set prev->next link
-                    for r in reversed(sample_data_records):
-                        if r["token"] == prev_token:
-                            r["next"] = sd_token
-                            break
-                prev_token = sd_token
+                prev_sd = sd
 
         # ----- scene record -----
         scene_records.append({
             "token": scene_token,
-            "name": f"scene-{scene_idx_offset + scene_idx + 1:04d}",
-            "description": f"auto-generated from {log_name}",
+            "name": scene["name"],
+            "description": scene["description"],
             "log_token": log_token,
             "nbr_samples": len(scene_kfs),
             "first_sample_token": scene_kf_tokens[0],
             "last_sample_token": scene_kf_tokens[-1],
         })
-
-    # ---------- empty/placeholder annotation tables ----------
-    sample_annotations: list = []
-    instances: list = []
 
     tables = {
         "sensor.json": sensors,
@@ -550,16 +599,14 @@ def build_tables(data: SensorData, scenes: list[list[dict]],
         "sample.json": sample_records,
         "sample_data.json": sample_data_records,
         "ego_pose.json": ego_pose_records,
-        "sample_annotation.json": sample_annotations,
-        "instance.json": instances,
+        "sample_annotation.json": [],
+        "instance.json": [],
         "category.json": categories,
         "attribute.json": attributes,
         "visibility.json": visibilities,
         "map.json": maps,
     }
-    return tables, plan
-
-
+    return tables, plan, dict(attach)
 
 
 def load_existing_tables(json_dir: Path) -> dict | None:

@@ -9,56 +9,34 @@ arrays on purpose. Everything they reference — samples, sample_data, ego poses
 sensor calibration, and the label taxonomy — is already populated, so the vendor
 only has to fill in the two annotation tables.
 
-`calibrated_sensor.json` is populated from whatever snapshot the conversion ran
-with. If the vendor is also producing calibration, treat those values as
-provisional and overwrite them.
-
 ## Sensor configuration
+
+The vendor receives the **standard** dataset (`bag2nuscenes.py`), which has
+exactly the sensor set of nuScenes minus the radars.
 
 | | |
 |---|---|
-| LiDAR | **1** channel, `LIDAR_TOP`. 10 Hz. Files are `.pcd.bin`, 5 × float32 per point: `x, y, z, intensity, ring`. Points are in the LiDAR frame. |
-| Cameras | **7** channels. Six standard NuScenes channels plus `CAM_TRAFFIC`. 30 Hz source. |
-| Keyframes (samples) | 2 Hz, anchored on a LiDAR sweep. |
+| LiDAR | **1** channel, `LIDAR_TOP`. 10 Hz. Files are `.pcd.bin`, 5 × float32 per point: `x, y, z, intensity, ring`. Points are in the LiDAR frame. The frame timestamp is the **start** of the 100 ms sweep. |
+| Cameras | The **6** standard channels (`CAM_FRONT`, `CAM_FRONT_LEFT`, `CAM_FRONT_RIGHT`, `CAM_BACK`, `CAM_BACK_LEFT`, `CAM_BACK_RIGHT`), 30 Hz, every one present on every sample. |
+| Samples | 2 Hz, 40 per scene, anchored on a LiDAR frame. Scenes are exactly 20 s. |
+| Radar | none — `num_radar_pts` is always 0. |
 
-### The seventh camera is different — read this
+All six cameras of a sample were captured at the same instant (the cameras
+share a trigger), within 25 ms of the sample's LiDAR frame.
 
-`CAM_TRAFFIC` is a forward, upward-tilted camera for traffic lights and signs. It
-is **not** part of the standard six and is handled differently in three ways:
+### Images are rectified pinhole images
 
-1. **Its calibration is a placeholder.** `calibrated_sensor` for `CAM_TRAFFIC`
-   holds an identity extrinsic and a fabricated intrinsic. **Do not use it for
-   any 3D geometry** — no projection, no 3D-to-2D transfer, no cross-camera
-   consistency checks.
-2. **It never gates a keyframe.** Only the six standard cameras must be in sync
-   tolerance for a sample to exist. `CAM_TRAFFIC` is attached when it happens to
-   be in tolerance and is simply absent otherwise, so **some samples have six
-   camera channels and some have seven**. Handle the missing key.
-3. **It is for 2D work only** — traffic light state, sign classification — not
-   for 3D box annotation.
+The source cameras are wide-angle (OpenCV fisheye, and plumb_bob for the front
+camera). The converter undistorts every image with the calibration, so
+`camera_intrinsic` in `calibrated_sensor.json` is the exact pinhole `K` of the
+image as delivered and there are no distortion coefficients to apply. Projecting
+3D points with `K` — as `nuscenes-devkit` does — is correct, and 2D boxes may be
+derived by projecting 3D boxes.
 
-The six standard channels (`CAM_FRONT`, `CAM_FRONT_LEFT`, `CAM_FRONT_RIGHT`,
-`CAM_BACK`, `CAM_BACK_LEFT`, `CAM_BACK_RIGHT`) are always present on every sample
-and carry real calibration.
-
-### Images are not undistorted
-
-NuScenes has no distortion field, so `camera_intrinsic` is a plain pinhole `K`.
-**Five of the six standard cameras are OpenCV fisheye** (equidistant, 4
-coefficients, ~96° HFOV); only `CAM_FRONT` is `plumb_bob`. Projecting 3D points
-with `K` alone is wrong by a median of 10–60 px and up to ~300 px at the image
-edge.
-
-Practical consequence for labelling: **annotate 3D boxes in the LiDAR point
-cloud**, and treat camera images as visual context rather than as a source of
-precise 2D-3D correspondence. If 2D boxes are required, label them directly in
-the image rather than by projecting the 3D box.
-
-The true distortion coefficients and projection model live in the calibration
-snapshot used for the conversion, which is not part of the code repository.
-Request it if you need it — and if you are producing your own calibration,
-`calibrated_sensor.json` in the delivered dataset is provisional and can be
-replaced wholesale.
+`calibrated_sensor.json` is populated from whatever calibration snapshot the
+conversion ran with. If the vendor is also producing calibration, note that it
+applies to the **raw** images, which are not part of the delivery; ask for them
+together with the snapshot.
 
 ## Taxonomy the vendor labels against
 
@@ -101,7 +79,7 @@ Two JSON files, matching the NuScenes schema exactly.
 | `size` | [w, l, h] | width, length, height in metres |
 | `rotation` | [w, x, y, z] | box orientation quaternion in the **global** frame |
 | `num_lidar_pts` | int | LiDAR points inside the box for this sample |
-| `num_radar_pts` | int | 0 — no radar in this dataset |
+| `num_radar_pts` | int | 0 — no radar in the standard dataset |
 | `prev` | str | previous annotation of the same instance, `""` at the start |
 | `next` | str | next annotation of the same instance, `""` at the end |
 

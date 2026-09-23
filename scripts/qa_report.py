@@ -23,7 +23,7 @@ from scipy.spatial.transform import Rotation
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from common import NUSCENES_CAMS, collect_header_timestamps, make_typestore  # noqa: E402
-from nuscenes_writer import nearest_ts  # noqa: E402
+from nuscenes_writer import format_plan, nearest_ts, plan_frames  # noqa: E402
 
 _ROOT = Path(__file__).resolve().parent.parent
 
@@ -33,29 +33,29 @@ def section(title: str) -> None:
     print(f"=== {title} " + "=" * max(0, 60 - len(title)))
 
 
-def per_channel_sync_drops(ts_by_ch: dict, sync_ms: float = 25.0) -> None:
+def per_channel_sync_drops(ts_by_ch: dict, sync_ms: float = 25.0,
+                           group_ms: float = 5.0) -> None:
     """ts_by_ch: channel -> sorted header timestamps (ns), from the source bag.
 
-    Same matching as the converter (nuscenes_writer.nearest_ts) and the same
-    rule: only the six standard cameras gate a frame; CAM_TRAFFIC is best-effort
-    and is reported but never counted against a frame.
+    Per channel: the nearest frame to each LiDAR frame (nuscenes_writer.nearest_ts).
+    Then the converter's own rule (nuscenes_writer.plan_frames): a LiDAR frame
+    is usable when one capture instant with all six standard cameras lies
+    within the tolerance. CAM_TRAFFIC is best-effort and is reported but never
+    counted against a frame. The coverage window is not applied here.
     """
     cam_channels = sorted(c for c in ts_by_ch if c != "LIDAR_TOP")
     lidar_ts = ts_by_ch.get("LIDAR_TOP")
-    if lidar_ts is None or not len(cam_channels):
-        print("  [skip] need both lidar and camera timestamps")
+    gating = [ch for ch in NUSCENES_CAMS if ch in ts_by_ch]
+    if lidar_ts is None or len(gating) < len(NUSCENES_CAMS):
+        print("  [skip] need lidar and all six standard camera timestamps")
         return
 
     sync_ns = int(sync_ms * 1e6)
     print(f"  Lidar anchor: {len(lidar_ts)} frames")
     print(f"  Tolerance:    {sync_ms} ms")
     print(f"  {'channel':18} {'p50':>7} {'p99':>7} {'>tol':>7}  {'pct in tol':>11}")
-    worst = np.zeros_like(lidar_ts)
-    gating = [ch for ch in cam_channels if ch in NUSCENES_CAMS]
     for ch in cam_channels:
         _, d = nearest_ts(lidar_ts, ts_by_ch[ch])
-        if ch in gating:
-            worst = np.maximum(worst, d)
         p50 = np.median(d) / 1e6
         p99 = np.percentile(d, 99) / 1e6
         n_over = int(np.sum(d > sync_ns))
@@ -63,9 +63,13 @@ def per_channel_sync_drops(ts_by_ch: dict, sync_ms: float = 25.0) -> None:
         print(f"  {ch:18} {p50:7.2f} {p99:7.2f} {n_over:7d}  {pct_in:10.2f}%"
               + ("" if ch in gating else "   (best-effort, not gating)"))
 
-    n_drop = int(np.sum(worst > sync_ns))
-    print(f"  Worst of {len(gating)} standard cams ≤ {sync_ms}ms:  {len(lidar_ts) - n_drop}/{len(lidar_ts)} "
-          f"({100*(len(lidar_ts)-n_drop)/len(lidar_ts):.2f}%)")
+    everything = {"start_ns": int(lidar_ts[0]), "end_ns": int(lidar_ts[-1])}
+    plan = plan_frames(lidar_ts, ts_by_ch, gating, sync_ns, everything,
+                       group_ns=int(group_ms * 1e6),
+                       max_gap_ns=int(1.5 * np.median(np.diff(lidar_ts))))
+    print("  Converter rule (complete camera set):")
+    for line in format_plan(plan):
+        print("    " + line)
 
 
 def per_scene_sync(nusc: NuScenes) -> None:

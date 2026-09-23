@@ -1,5 +1,80 @@
 # Changelog
 
+## 2026-09-23 — 두 도구(표준형 / 전체 데이터형), 완전한 카메라 세트 규칙, rectify, 공식 scene 이름, CAN bus
+
+2026-09-23 실측 bag(`0923_Calib_sample`의 A-8·A-9·A-10)으로 파서를 점검한 결과를 반영했다.
+
+### 요약
+
+| 항목 | 전 | 후 |
+|---|---|---|
+| 도구 | `bag2nuscenes.py` 하나 | 표준형 `bag2nuscenes.py` + 전체 데이터형 `bag2nuscenes_full.py` (공통 `converter.py`) |
+| 카메라 매핑 | camera_4 = `CAM_FRONT`, camera_3 = `CAM_TRAFFIC` | **camera_3 = `CAM_FRONT`, camera_4 = `CAM_TRAFFIC`** (0923 bag 이미지로 확인) |
+| 카메라 선택 | keyframe에서만, 카메라별 최근접 25 ms | 라이다 프레임마다 **6대가 모두 찍힌 한 시점**이 25 ms 안에 있어야 함 |
+| 동기 실패 시 | keyframe만 빠지고 scene은 그대로 (A-10: scene 안에 최대 1.5 s 구멍 8개) | 그 자리에서 **시퀀스가 끊김** |
+| 라이다 누락 | 무시 (keyframe을 인덱스로 뽑아 간격이 밀림) | 시퀀스 끊김 |
+| scene | 첫 keyframe부터 20 s 창, 마지막 90 % 미만 버림 | 끊기지 않은 구간을 **정확히 20 s**로 자르고 나머지는 버림 (sample 40개) |
+| scene 이름 | `scene-0001`부터 순번 | **공식 nuScenes train/val 목록**에서 `--split`에 따라 배정 |
+| 이미지 | 원본 JPEG (어안 왜곡 그대로, K만 기록) | **pinhole로 rectify**, 새 K 기록 |
+| GNSS/INS | 없음 | `can_bus/<scene>_pose.json`, `_ms_imu.json`, `_meta.json` |
+| 추가 센서 | CAM_TRAFFIC(placeholder calib) | 전체 데이터형: CAM_TRAFFIC, 하단 라이다 4개, ARS548 레이더, 포인트별 시각, 나머지 토픽 전부 |
+
+### 점검에서 확인한 사실 (2026-09-23 bag)
+
+- 카메라: camera_3이 전방 도로, camera_4는 위로 기울어진 신호등 카메라. 기존 매핑은 이 bag에서 신호등 카메라를 `CAM_FRONT`로 넣고 있었다.
+- `camera_info`는 placeholder(K = 960/540, D = 0). 캘리브 소스로 쓸 수 없다.
+- 라이다 header stamp = **스윕 시작**(포인트 `timestamp`가 header+0~100 ms). 중앙 라이다는 0°(전방)에서 시작해 시계 방향. README 한계 4의 "sweep 끝"은 이 bag에 해당하지 않았다.
+- 카메라 7대는 같은 시점 stamp가 0.04 ms 이내(트리거 공유, 비트 동일은 아님). 주기 33.448 ms(29.898 Hz)로 자유 동작해 10 Hz 라이다 대비 위상이 약 9.8초마다 한 주기씩 흐른다.
+- 라이다 5개는 bag 3개 모두 드랍 0. 카메라 드랍은 대부분 1–2 프레임, camera_5(`CAM_BACK_LEFT`)가 가장 많다(A-10 delivery 97.8 %).
+- PTP 정상(`/diag/ptp` 오프셋 ≤ 2 µs), INSPVA 전 구간 SOLUTION_GOOD. ARS548 자체 시계는 미동기(`timestamp_syncstatus` 2).
+- CORRIMU는 IMU 샘플(125 Hz)을 `imu_data_count`개 누적한 값, NovAtel 차량 축(x 우, y 전, z 상). `/bsw/vehicle_can` yaw rate, odom 자세 변화율과 대조해 스케일·부호 확인(세 축 상관 0.95, 기울기 1.00/1.01/1.08).
+- nuscenes-devkit: `render_scene*`·lidarseg 렌더러·mmdet3d는 표준 6채널 이름을 하드코딩, `ref_chan='LIDAR_TOP'` 고정, 카메라는 pinhole만. `NuScenesCanBus`는 scene 이름 `scene-NNNN`과 고정 메시지 이름만 받고 161–176·309–314번 scene을 거부. 레이더 PCD 파서는 마지막 필드 뒤에 1바이트가 더 있어야 하고(`end_p < len`), 빈 프레임은 NaN 포인트 1개로 표현한다.
+
+### 변환기
+
+- **`converter.py` (신규).** 두 CLI가 공유하는 파이프라인. `Profile`이 싣는 데이터(카메라 채널, 추가 라이다, 레이더, 포인트별 시각, sidecar)를 정한다. 기존 `bag2nuscenes.py`의 PointCloud2 변환과 `_StagingWriter`를 옮기고 일반화했다(작업을 callable로도 받아 워커에서 rectify).
+- **`bag2nuscenes.py` / `bag2nuscenes_full.py`.** 각각 `run(STANDARD)` / `run(FULL)`을 부르는 얇은 CLI. `--split {train,val}` 추가, `--include-traffic-cam` 제거(표준형은 항상 제외, 전체형은 항상 포함), `--rectify-balance`, `--jpeg-quality`(기본 90), `--camera-group-ms`, `--workers`.
+- **`nuscenes_writer.py`.** `sync_keyframes`를 `camera_instants` + `plan_frames`로 교체(완전한 카메라 세트, 끊김 이유 집계), `partition_scenes`는 segment를 정확한 길이로 자름, `official_scene_names` 추가, `build_tables`는 채널 수·모달리티(lidar/camera/radar)에 무관하게 동작하고 gating이 아닌 채널은 best-effort로 붙인다. `SensorData`는 채널별 `frames`/`modality`/`intrinsic`으로 바뀌었다. prev/next 연결은 레코드 참조로.
+- **`rectify.py` (신규).** fisheye(4계수)·plumb_bob(5계수) → pinhole, 크기 유지. 왜곡이 0이면 바이트 그대로 통과.
+- **`canbus.py` (신규).** odom + CORRIMU + INSPVA → `pose`(100 Hz; pos/orientation은 ego_pose와 동일, vel/accel/rotation_rate는 ego 프레임, lat/lon/height/ins_status 추가 키), `ms_imu`(100 Hz), `meta`. 가속도는 중력 제거 상태(nuScenes `ms_imu`와 다름, meta에 명시).
+- **전체 데이터형**: `LIDAR_BOTTOM_FRONT/REAR/LEFT/RIGHT`(.pcd.bin), 모든 라이다 파일 옆 `<token>.time.bin`(float32, 프레임 시각 기준 초), `RADAR_FRONT`(nuScenes 18필드 radar .pcd, 반경 속도를 시선 방향으로 분해, odom·CORRIMU로 ego-motion 보정), 나머지 토픽은 `ext/<scene>/<topic>.json`(scene ± 0.5 s, 스트리밍으로 분할).
+- **`common.py`.** 카메라 매핑 수정, 추가 라이다·레이더·CORRIMU 토픽, `load_calib(calib_dir, channels)`가 임의 채널(카메라 / `r.txt`·`t.txt` 포인트 센서)을 읽고 `missing_calib` 추가. 인자 없이 부르면 예전처럼 6캠 + LIDAR_TOP.
+- **캘리브 없이도 실행.** `--calib`는 선택. 폴더에 없는 채널(생략하면 전부)은 기본값: extrinsic 항등(원점, ego 축과 일치), 카메라는 90° pinhole K(`f = width/2`)에 왜곡 0이라 rectify 없이 원본 JPEG을 그대로 쓴다(`common.default_calib`, `resolve_calib`). 기본값을 쓴 채널은 실행 로그와 `<log>.import.json`의 `calib_defaulted`에 남는다. 전체형의 `--skip-uncalibrated`는 없앴다.
+- `pyproject.toml`: nuscenes-devkit이 기본 의존성으로(scene 이름에 공식 split 목록 사용). `verify` extra 제거.
+
+### 진단 스크립트
+
+- `scripts/screen_bags.py`: keyframe 수용률 대신 **scene 수율** — 허용오차별로 쓸 수 있는 라이다 프레임, 끊김 수, 20 s scene에 들어가는 초(변환기의 `plan_frames`·`partition_scenes` 그대로). `--scene-dur`, `--camera-group-ms`, `--min-scene-frac`(기본 0.6) 추가, `--keyframe-stride` 제거.
+- `scripts/qa_report.py`: sync 섹션이 변환기 규칙(`plan_frames`)으로 판정.
+- `scripts/extract_cam_viz.py`: 자체 매핑 표를 지우고 `common.py`의 매핑을 쓴다. 타일에 채널과 토픽을 같이 표시.
+
+### 문서
+
+README 재작성(두 도구, 프레임 선택, scene 이름, rectify, CAN bus, 전체형 형식, devkit 사용법("Using the dataset": 로드·순회·포인트클라우드·렌더링·CAN bus·split·전체형 추가 데이터, 안 되는 것), 캘리브 레이아웃, 한계 목록 갱신 — 기존 1(미보정)·7(placeholder calib) 해소, 라이다 stamp·taxonomy/평가 불일치·공식 이름 용량·레이더 시각 추가), `docs/pipeline_overview.md`, `docs/labeling_handoff.md`(벤더에는 표준형: 6캠 pinhole, 레이더 없음), `docs/sync_reference.md`.
+
+### 검증
+
+- 실측 bag 3개의 header stamp로 `plan_frames`: 선택된 세트는 모두 완전하고 25 ms 이내(최대 24.7 ms), 카메라 프레임 중복 사용 0.
+
+  | bag | 길이 | 끊김 | 20 s scene |
+  |---|---|---|---|
+  | A-8 | 344 s | 5 | 14 (280 s) |
+  | A-9 | 285 s | 9 | 12 (240 s) |
+  | A-10 | 317 s | 44 | 8 (160 s) |
+
+  `screen_bags.py` 출력과 변환기 로그가 같은 수치.
+- 가짜 캘리브(어안 5 + plumb_bob 1, 모든 센서)로 A-9 0–56 s: 표준형·전체형 모두 devkit 로드, `render_sample`, `render_pointcloud_in_image`, `LidarPointCloud.from_file_multisweep`(LIDAR_TOP, 하단 라이다 ref LIDAR_TOP), `RadarPointCloud.from_file`·multisweep·`render_sample_data`, `NuScenesCanBus.get_messages`·`print_message_stats`, `load_gt(nusc, 'train', DetectionBox)`(80 sample 전부 인식) 통과. scene당 sample 40개, 간격 500 ms, 카메라 29.9 Hz·라이다 10 Hz·레이더 20 Hz. 레이더 보정: |v| 중앙값 7.46 m/s → |v_comp| 0.03 m/s.
+- A-9 전체(285 s) 표준형: 2분 11초, 최대 RSS 758 MB, 12 scene, 26 GB. 이어서 A-8 일부를 `--split val`로 append: val 이름(`scene-0003`, `scene-0012`) 배정, 센서 토큰 재사용, 같은 bag 재import 거부.
+- **실제 캘리브로 변환한 데이터는 없다.** rectify·투영의 기하 정확도는 캘리브가 나온 뒤 `scripts/lidar2cam_projection.py`와 devkit 투영을 비교해 확인해야 한다.
+
+### 기존 데이터셋에 대한 영향
+
+모든 것이 바뀐다(카메라 매핑, 이미지, scene 경계와 이름, sweep 구성). 기존 데이터셋에 append하지 말고 새 루트에 다시 변환할 것.
+
+### 하지 않은 것
+
+차량 CAN(`/bsw/vehicle_can` 등)을 nuScenes CAN bus 메시지(`steeranglefeedback`, `vehicle_monitor`, `zoe_veh_info`)로 옮기는 것 — 단위·의미가 Renault Zoe 기준이라 전체형의 `ext/`에 원본 필드로 두었다. 라벨 taxonomy → devkit detection 평가 이름 매핑. 라이다 포인트 motion compensation(`time.bin`으로 가능). 2026-09 이전 bag의 카메라 매핑 재확인.
+
 ## 2026-08-27 — 성능, coverage window, nuScenes 관례, 진단 도구
 
 커밋 `5d9adb7`(변환기·문서), `14fe46d`(진단 스크립트). 9개 파일, +680 / −282.

@@ -2,6 +2,7 @@
 """Convert a ROS1 rosbag into a NuScenes dataset carrying every sensor and topic.
 
     python bag2nuscenes_full.py /path/to.bag --out /data/tcar_nuscenes_full --calib /path/to/calib
+    python bag2nuscenes_full.py /path/to/bags/ --out /data/tcar_nuscenes_full   # every *.bag under it
 
 The standard converter (bag2nuscenes.py) with more kinds of data: the same
 frame selection, the same 20 s scenes and scene names, the same rectified six

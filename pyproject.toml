@@ -7,7 +7,7 @@ dependencies = [
     "rosbags>=0.10",
     "numpy>=1.24",
     "scipy>=1.10",
-    "opencv-python>=4.6",
+    "opencv-python>=4.6,<5",   # verified on 4.13; 5.x reorganised calib3d (cv2.fisheye)
     "tqdm>=4.65",
     # scene names come from its official split lists; the run ends with a load check
     "nuscenes-devkit>=1.1.11",
@@ -20,7 +20,7 @@ plots = ["matplotlib>=3.7", "jupyter"]
 viz = ["rerun-sdk>=0.16"]
 
 [build-system]
-requires = ["setuptools>=61"]
+requires = ["setuptools>=64"]   # 64+ for editable installs (PEP 660)
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools]

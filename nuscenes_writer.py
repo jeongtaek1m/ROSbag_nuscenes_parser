@@ -637,10 +637,18 @@ def merge_tables(existing: dict, new: dict) -> dict:
 
 
 def write_tables(tables: dict, out_root: Path, version: str) -> Path:
+    """Write every table to a temporary file first, then swap them all in.
+
+    In append mode these files hold every earlier import too; a run stopped
+    halfway through writing them must not leave tables that disagree.
+    """
     json_dir = out_root / version
     json_dir.mkdir(parents=True, exist_ok=True)
+    tmp = {name: json_dir / f".{name}.tmp" for name in tables}
     for name, records in tables.items():
-        (json_dir / name).write_text(json.dumps(records, indent=2))
+        tmp[name].write_text(json.dumps(records, indent=2))
+    for name in tables:
+        tmp[name].replace(json_dir / name)
     return json_dir
 
 

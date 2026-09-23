@@ -82,6 +82,7 @@ sys.path.insert(0, str(_HERE / "packet_decoder" / "scripts"))
 from modules import RSP128Decoder  # noqa: E402
 
 STAGING_DIRNAME = ".staging"
+LOCK_NAME = ".convert.lock"
 # Staged file suffix per modality. Radar frames are staged raw and turned into
 # NuScenes PCD at materialization, when the ego motion they are compensated
 # with is fully known.
@@ -732,7 +733,9 @@ def export_sidecars(staging: Path, out_root: Path, spans: list[tuple[str, int, i
 def _parser(profile: Profile, doc: str) -> argparse.ArgumentParser:
     here = Path(__file__).parent
     p = argparse.ArgumentParser(description=doc.split("\n")[0])
-    p.add_argument("bag", type=Path, help="Path to a single .bag file.")
+    p.add_argument("bags", type=Path, nargs="+", metavar="BAG",
+                   help=".bag files, or directories: every *.bag under them, in name "
+                        "order. Bags already in the dataset are skipped.")
     p.add_argument("--out", type=Path, default=profile.default_out,
                    help=f"NuScenes dataroot (default: {profile.default_out}).")
     p.add_argument("--calib", type=Path, default=None,
@@ -772,14 +775,101 @@ def _parser(profile: Profile, doc: str) -> argparse.ArgumentParser:
     return p
 
 
+def _expand_bags(paths: list[Path]) -> list[Path]:
+    """Files as given, directories as every *.bag under them (sorted), no repeats."""
+    out: list[Path] = []
+    for path in paths:
+        found = sorted(path.rglob("*.bag")) if path.is_dir() else [path]
+        if path.is_dir() and not found:
+            print(f"  [!] no .bag files under {path}")
+        out.extend(f for f in found if f not in out)
+    return out
+
+
+def _imported_logs(json_dir: Path) -> set[str]:
+    f = json_dir / "log.json"
+    return {r["logfile"] for r in json.loads(f.read_text())} if f.exists() else set()
+
+
 def run(profile: Profile, doc: str, argv: list[str] | None = None) -> None:
+    """Parse the CLI and convert each bag into args.out, appending to what is there.
+
+    Bags are converted one after another; one that is already in the dataset
+    (same file name) is skipped, and one that fails is reported and the rest
+    still run. The devkit check runs once, at the end.
+
+    Runs into one dataroot take turns: the tables are read at the start and
+    rewritten at the end of every bag, and the staging directory is shared, so
+    a second process on the same root is refused while the first holds the lock
+    file.
+    """
     args = _parser(profile, doc).parse_args(argv)
-    for path, label in [(args.bag, "bag"), (args.calib, "calib")]:
+    for path, label in [*((b, "bag") for b in args.bags), (args.calib, "calib")]:
         if path is not None and not path.exists():
             raise SystemExit(f"{label} not found: {path}")
+    bags = _expand_bags(args.bags)
+    if not bags:
+        raise SystemExit("no .bag files to convert")
+    args.out.mkdir(parents=True, exist_ok=True)
+    lock = args.out / LOCK_NAME
+    try:
+        fd = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+    except FileExistsError:
+        raise SystemExit(
+            f"{lock} exists: another conversion is writing to {args.out} "
+            f"({lock.read_text().strip() or 'unknown'}). Runs into one dataroot must "
+            "take turns. If none is running — a killed run leaves the file behind — "
+            "delete it.") from None
+    with os.fdopen(fd, "w") as f:
+        f.write(f"pid {os.getpid()} converting {', '.join(map(str, args.bags))}\n")
+
+    results: list[tuple[Path, str, str]] = []    # (bag, status, detail)
+    first_scene = None
+    try:
+        for i, bag in enumerate(bags, 1):
+            if len(bags) > 1:
+                print(f"\n{'=' * 78}\n[{i}/{len(bags)}] {bag}")
+            if bag.stem in _imported_logs(args.out / args.version):
+                print(f"  already in the dataset (log '{bag.stem}') — skipped")
+                results.append((bag, "skipped", "already imported"))
+                continue
+            try:
+                names = _convert(profile, args, bag)
+            except (Exception, SystemExit) as exc:
+                if len(bags) == 1:
+                    raise
+                detail = str(exc) or type(exc).__name__
+                print(f"  !! {bag.name} failed: {detail}")
+                results.append((bag, "failed", detail))
+                continue
+            first_scene = first_scene or names[0]
+            results.append((bag, "converted", f"{len(names)} scenes "
+                                               f"({names[0]} .. {names[-1]})"))
+        if args.no_validate or first_scene is None:
+            print("\n(validation skipped)")
+        else:
+            print("\nValidating with nuscenes-devkit...")
+            validate_with_devkit(args.out, args.version)
+            from nuscenes.can_bus.can_bus_api import NuScenesCanBus
+            pose = NuScenesCanBus(dataroot=str(args.out)).get_messages(first_scene, "pose")
+            print(f"  ✓ NuScenesCanBus: {first_scene} pose has {len(pose)} messages")
+    finally:
+        lock.unlink(missing_ok=True)
+
+    if len(bags) > 1:
+        print(f"\n{'=' * 78}\nSUMMARY  -> {args.out}")
+        for bag, status, detail in results:
+            print(f"  {status:10} {bag.name}  {detail}")
+    print("\nDone.")
+    if any(status == "failed" for _, status, _ in results):
+        raise SystemExit(1)
+
+
+def _convert(profile: Profile, args: argparse.Namespace, bag: Path) -> list[str]:
+    """Convert one bag into args.out; returns the new scene names."""
     cv2.setNumThreads(1)   # parallelism comes from the staging pool
 
-    log_name = args.bag.stem
+    log_name = bag.stem
     json_dir = args.out / args.version
     existing = load_existing_tables(json_dir)
     if existing and any(r.get("logfile") == log_name
@@ -800,14 +890,13 @@ def run(profile: Profile, doc: str, argv: list[str] | None = None) -> None:
               f"{', '.join(defaulted)} — using defaults: identity extrinsic, 90° pinhole K, "
               "no distortion (not for geometry; these cameras are not rectified)")
 
-    args.out.mkdir(parents=True, exist_ok=True)
     staging = args.out / STAGING_DIRNAME
     if staging.exists():
         shutil.rmtree(staging)
 
     try:
-        print(f"[1/5] Reading {args.bag.name} ({profile.name}: {profile.description}) ...")
-        contents = read_bag(args.bag, staging, profile, channels, calib,
+        print(f"[1/5] Reading {bag.name} ({profile.name}: {profile.description}) ...")
+        contents = read_bag(bag, staging, profile, channels, calib,
                             args.packet_msg_dir, args.rectify_balance,
                             args.jpeg_quality, args.workers)
         data, stats = contents.data, contents.stats
@@ -904,7 +993,7 @@ def run(profile: Profile, doc: str, argv: list[str] | None = None) -> None:
         write_tables(tables, args.out, args.version)
         import_record = {
             "tool": profile.name,
-            "source_bag": str(args.bag.resolve()),
+            "source_bag": str(bag.resolve()),
             "calib_source": str(args.calib.resolve()) if args.calib else None,
             "created_at": datetime.now(timezone.utc).isoformat(),
             "split": args.split,
@@ -927,12 +1016,4 @@ def run(profile: Profile, doc: str, argv: list[str] | None = None) -> None:
         if staging.exists() and not args.keep_staging:
             shutil.rmtree(staging, ignore_errors=True)
 
-    if args.no_validate:
-        print("\n(validation skipped)")
-    else:
-        print("\nValidating with nuscenes-devkit...")
-        validate_with_devkit(args.out, args.version)
-        from nuscenes.can_bus.can_bus_api import NuScenesCanBus
-        pose = NuScenesCanBus(dataroot=str(args.out)).get_messages(scenes[0]["name"], "pose")
-        print(f"  ✓ NuScenesCanBus: {scenes[0]['name']} pose has {len(pose)} messages")
-    print("\nDone.")
+    return [sc["name"] for sc in scenes]

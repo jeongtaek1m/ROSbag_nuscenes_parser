@@ -2,6 +2,7 @@
 """Convert a ROS1 rosbag into a standard NuScenes v1.0-trainval dataset.
 
     python bag2nuscenes.py /path/to.bag --out /data/tcar_nuscenes --calib /path/to/calib
+    python bag2nuscenes.py /path/to/bags/ --out /data/tcar_nuscenes   # every *.bag under it
 
 Shaped like the real nuScenes so the devkit and nuScenes-based training code
 work unchanged:
@@ -14,9 +15,9 @@ work unchanged:
 The traffic-light camera (camera_4), the bottom LiDARs, the radar and all other
 topics are left out; bag2nuscenes_full.py carries them.
 
-Running it again on another bag appends: scene names continue down the
-official list, sensor and category tokens are reused, and re-importing the
-same bag is refused.
+Running it again on other bags appends: scene names continue down the
+official list, sensor and category tokens are reused, and bags already in the
+dataset are skipped.
 """
 from converter import STANDARD, run
 

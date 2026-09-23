@@ -23,10 +23,17 @@ reads `.bag` files directly.
 ## Install
 
 ```bash
-python -m venv .venv && source .venv/bin/activate
+python3 -m venv .venv && source .venv/bin/activate
+pip install -U pip            # Ubuntu 22.04's pip 22 cannot install this pyproject
 pip install -e .              # includes nuscenes-devkit (split lists, validation)
 pip install -e '.[plots]'     # matplotlib/jupyter, for diagnostics and notebooks
 ```
+
+Nothing importable is installed — the scripts run from the checkout
+(`python3 bag2nuscenes.py ...`) — so `pip install` only brings the dependencies.
+If the system Python already has them (rosbags, opencv-python 4.x, scipy,
+tqdm, nuscenes-devkit), skip the venv and run with `python3` directly. A venv
+made with `--system-site-packages` sees them too and needs no `pip install`.
 
 ## Convert
 
@@ -34,7 +41,14 @@ pip install -e '.[plots]'     # matplotlib/jupyter, for diagnostics and notebook
 python bag2nuscenes.py      /path/to.bag --calib /path/to/calib --split train   # -> /data/tcar_nuscenes
 python bag2nuscenes_full.py /path/to.bag --calib /path/to/calib --split train   # -> /data/tcar_nuscenes_full
 python bag2nuscenes.py      /path/to.bag --out /tmp/try                         # no calibration: defaults
+python bag2nuscenes.py      /path/to/bags/ a.bag b.bag --split val              # several bags in one go
 ```
+
+Give any mix of `.bag` files and directories; a directory means every `*.bag`
+under it, in name order. The bags are converted one after another into the same
+dataset, a bag that is already in it (same file name) is skipped, one that fails
+is reported and the rest still run, and a summary follows at the end. `--split`
+applies to all of them.
 
 One pass over the bag. Sensor payloads stream into a staging directory inside
 the output root — camera JPEGs are rectified on the way, on a thread pool —
@@ -43,7 +57,11 @@ the staged files are **renamed** into place. Nothing is written twice.
 
 Running it again on another bag **appends**: scene names continue down the
 official list, sensor and category tokens are reused, and re-importing the same
-bag is refused. Keep the standard and the full dataset in separate roots.
+bag is skipped. Keep the standard and the full dataset in separate roots.
+Runs into one root take turns: while one holds `<out>/.convert.lock`, another is
+refused (a killed run leaves the file behind — delete it). The tables are
+swapped in only once all of them are written, so an interrupted run leaves the
+earlier imports intact.
 
 ### Frame selection
 

@@ -39,8 +39,10 @@
 - **`canbus.py` (신규).** odom + CORRIMU + INSPVA → `pose`(100 Hz; pos/orientation은 ego_pose와 동일, vel/accel/rotation_rate는 ego 프레임, lat/lon/height/ins_status 추가 키), `ms_imu`(100 Hz), `meta`. 가속도는 중력 제거 상태(nuScenes `ms_imu`와 다름, meta에 명시).
 - **전체 데이터형**: `LIDAR_BOTTOM_FRONT/REAR/LEFT/RIGHT`(.pcd.bin), 모든 라이다 파일 옆 `<token>.time.bin`(float32, 프레임 시각 기준 초), `RADAR_FRONT`(nuScenes 18필드 radar .pcd, 반경 속도를 시선 방향으로 분해, odom·CORRIMU로 ego-motion 보정), 나머지 토픽은 `ext/<scene>/<topic>.json`(scene ± 0.5 s, 스트리밍으로 분할).
 - **`common.py`.** 카메라 매핑 수정, 추가 라이다·레이더·CORRIMU 토픽, `load_calib(calib_dir, channels)`가 임의 채널(카메라 / `r.txt`·`t.txt` 포인트 센서)을 읽고 `missing_calib` 추가. 인자 없이 부르면 예전처럼 6캠 + LIDAR_TOP.
+- **여러 bag 한 번에.** 위치 인자로 `.bag` 파일과 디렉토리를 여러 개 받는다(디렉토리는 아래의 `*.bag` 전부, 이름순). 차례로 같은 데이터셋에 변환하고, 이미 들어간 bag(같은 파일명)은 건너뛰며, 실패한 bag은 보고하고 나머지를 계속한 뒤 요약을 출력한다(실패가 있으면 종료 코드 1). devkit 검증은 마지막에 한 번.
+- **append 안전장치.** 같은 출력 루트에 변환 두 개가 동시에 돌면 staging을 서로 지우고 테이블을 덮어쓰므로, `<out>/.convert.lock`으로 한 번에 하나만 돌게 했다(기존 테이블 읽기도 잠금 뒤로). `write_tables`는 13개 테이블을 임시 파일에 다 쓴 뒤 한꺼번에 교체한다 — 중간에 멈춰도 이전 import가 보존된다.
 - **캘리브 없이도 실행.** `--calib`는 선택. 폴더에 없는 채널(생략하면 전부)은 기본값: extrinsic 항등(원점, ego 축과 일치), 카메라는 90° pinhole K(`f = width/2`)에 왜곡 0이라 rectify 없이 원본 JPEG을 그대로 쓴다(`common.default_calib`, `resolve_calib`). 기본값을 쓴 채널은 실행 로그와 `<log>.import.json`의 `calib_defaulted`에 남는다. 전체형의 `--skip-uncalibrated`는 없앴다.
-- `pyproject.toml`: nuscenes-devkit이 기본 의존성으로(scene 이름에 공식 split 목록 사용). `verify` extra 제거.
+- `pyproject.toml`: nuscenes-devkit이 기본 의존성으로(scene 이름에 공식 split 목록 사용). `verify` extra 제거. opencv-python `<5`(4.13에서 검증; 5.x는 calib3d 재편). 빌드 요구 setuptools `>=64`(editable 설치, PEP 660). Ubuntu 22.04 기본 pip 22는 이 pyproject를 설치하지 못하므로 README에 `pip install -U pip` 추가.
 
 ### 진단 스크립트
 

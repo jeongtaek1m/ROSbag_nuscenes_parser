@@ -100,11 +100,21 @@ sample과 마지막 sample 사이의 모든 프레임(라이다 10 Hz, 카메라
 ### Coverage window
 
 센서마다 녹화 시작·종료 시점이 다르다(2026-08-19 bag에서 최대 1.4초). 라이다,
-표준 카메라 6개, odom이 **모두** 살아 있는 교집합 구간을 `--sync-ms`만큼 안쪽으로
+표준 카메라 6개, INS pose가 **모두** 살아 있는 교집합 구간을 `--sync-ms`만큼 안쪽으로
 줄인 것이 coverage window이고, 그 밖의 라이다 프레임은 쓰지 않는다. scene과 sweep은
 그 안에만 놓이므로 모든 프레임에 이미지와 pose가 있음이 구조적으로 보장되고,
-`interp_pose`는 odom 범위 밖 쿼리를 clip하는 대신 에러로 취급한다. 중간에 끊기는
-경우(odom gap, INS 상태 불량)는 변환기가 아니라 `scripts/screen_bags.py`가 잡는다.
+`interp_pose`는 INS pose 범위 밖 쿼리를 clip하는 대신 에러로 취급한다. 중간에 끊기는
+경우(INS gap, INS 상태 불량)는 변환기가 아니라 `scripts/screen_bags.py`가 잡는다.
+
+### Ego pose와 global 좌표계
+
+ego pose는 `/novatel/oem7/inspva`(100 Hz)를 수신기 GPS 측정 시각에 놓아 만든다.
+`/novatel/oem7/odom`은 0923 bag에서 이동 중 샘플의 55–80 %가 1초씩 위치를 붙잡고
+있고(1 Hz 위치 소스, 변환본 ego_pose 오차 log별 중앙값 0.8–2.6 m, 최대 15 m) 헤더 스탬프도 도착 시각이라, INSPVA가 없는
+bag의 대체로만 쓴다. global 좌표계는 nuScenes처럼 장소마다 고정 원점을 둔 미터 좌표
+— 원점 접평면의 동-북-상(ENU) — 이고 `log.json`의 `global_frame`에 기록한다. 좌표계가
+다른 데이터셋에는 이어 쓰지 않으며, 그 전에 변환한 데이터셋은
+`scripts/rebuild_ego_pose.py`로 테이블만 다시 쓴다.
 
 ### 공식 scene 이름
 
@@ -138,4 +148,4 @@ CAN bus 파일 경로가 한 번에 검증된다.
 README의 "Known limitations"를 참조. 요약하면 녹화 시 카메라 프레임 유실(25 ms 완전 세트
 규칙에서 곧바로 scene 끊김으로 이어짐), 캘리브 품질에 좌우되는 rectify, 라이다 stamp가
 스윕 시작인 점, 구 bag의 카메라 stamp 체계와 매핑, 어노테이션 미출력, 라벨 taxonomy와
-devkit detection 평가 이름의 불일치, UTM 절대좌표, 공식 scene 이름의 용량, 레이더 시각.
+devkit detection 평가 이름의 불일치, 2026-09-24 이전 변환본의 odom/UTM ego pose, 공식 scene 이름의 용량, 레이더 시각.

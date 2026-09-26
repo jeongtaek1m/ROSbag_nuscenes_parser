@@ -1,5 +1,44 @@
 # Changelog
 
+## 2026-09-24 — ego_pose를 INSPVA(GPS 시각)로, global 좌표계를 장소별 ENU로
+
+온라인 캘리브레이션 작업 중 `/novatel/oem7/odom` 위치가 1초씩 멈춰 있는 것을 발견해 ego pose 소스를 바꿨다.
+
+### 요약
+
+| 항목 | 전 | 후 |
+|---|---|---|
+| ego_pose / CAN bus `pose` 소스 | `/novatel/oem7/odom` | **`/novatel/oem7/inspva`** (100 Hz). odom은 INSPVA가 없는 bag에서만 (경고) |
+| 시각 | 헤더 스탬프 (도착 시각: 측정보다 중앙값 1.7 ms, 최대 ~10 ms 늦음) | 수신기 **GPS 측정 시각** − 18 s (헤더와 같은 UTC 시계). CORRIMU도 동일 |
+| global 좌표계 | UTM 52N 절대좌표 (위치는 UTM 격자, 방향은 진북 ENU — 약 1.3° 어긋남) | nuScenes처럼 장소별 고정 원점의 **동-북-상(ENU)**, `korea-test` = 37.20° N 126.83° E, 타원체고 0 |
+| 높이 | odom z = 해수면 높이 | INSPVA 타원체고 기준 ENU up |
+| log.json | — | `location`, `global_frame` (`enu@37.200000,126.830000,0.000`; devkit은 무시) |
+| 이어쓰기 | 제한 없음 | 좌표계가 다른 데이터셋에는 거부 → `scripts/rebuild_ego_pose.py` 안내 |
+| 기존 데이터셋 | — | **`scripts/rebuild_ego_pose.py` (신규)**: ego_pose·CAN bus·log.json만 bag의 INSPVA로 다시 씀 (토큰·타임스탬프·센서 파일 그대로) |
+
+### 근거 (0923 bag, A-8·A-9·A-10)
+
+- odom 위치는 이동 중 샘플의 55–80 %에서 직전 값 그대로 — 1 Hz 위치 소스. 변환된 데이터셋(A-8·A-9·A-10, ego_pose 125,769개)을 다시 계산하니 기존 ego_pose가 수평으로 log별 중앙값 0.77–2.57 m, p95 7.2–10.4 m, 최대 9.3–15.1 m 틀려 있었음.
+- odom이 갱신되는 샘플에서는 odom = UTM(INSPVA 위경도)가 0.15 mm로 일치 → 기준점 동일, `common.geodetic_to_utm` 검증. odom 쿼터니언은 INSPVA 자세(`common.novatel_attitude`)와 0.000°로 일치 → 진북 ENU.
+- INSPVA 높이는 타원체고: 수신기 로그의 BESTPOS(해수면 높이 + 지오이드고 22.70 m)와 0.86 m(안테나–INS 기준점 높이차) 차이. odom z는 INSPVA 높이 − 22.70 m = 해수면 높이.
+- 실시간 해는 이미 RTK 고정해 98 %(BESTPOS σ 수평 2 cm) — INSPVA가 cm급, odom의 문제는 1 Hz 위치 소스뿐.
+
+### 변경 파일
+
+- `common.py`: `LOCATION`, `GLOBAL_ORIGINS`, `global_frame_id`, `geodetic_to_enu`, `geodetic_to_utm`/`utm_to_geodetic`(Krüger 3차, 왕복 0.3 mm), `novatel_gps_ns`, `novatel_attitude`, `GEOID_UNDULATION`(odom 대체용).
+- `canbus.py`: `inspva_row`/`odom_row`/`corrimu_row`, `pose_from_inspva`/`pose_from_odom`, `build_ins`(변환기와 재작성 도구가 공유). `InsData`의 `odom_*` → `pose_*`, `pose_source`, `global_frame`. meta에 시각 기준과 좌표계 기록.
+- `converter.py`: INSPVA 전 필드를 읽고 `build_ins`로 궤적 생성. 요약 줄에 소스·좌표계·헤더 지연. 좌표계 다른 데이터셋 이어쓰기 거부. `import.json` 통계 키 `odom_max_gap_ms` → `pose_max_gap_ms`, `pose_source`, `global_frame`, `ins_header_lag_ms` 추가.
+- `nuscenes_writer.py`: `SensorData.odom_*` → `pose_*`, `location`, `global_frame`; `required_streams`의 `ODOM` → `INS`; log.json에 `global_frame`.
+- `scripts/screen_bags.py`: 필수 스트림 `ODOM` → `INS`(INSPVA, 없으면 odom + MARGINAL 플래그). `--max-odom-gap` → `--max-ins-gap`(구 이름도 받음).
+- `scripts/rebuild_ego_pose.py` (신규), `README.md`, `docs/pipeline_overview.md`, `docs/labeling_handoff.md`.
+
+### 검증
+
+A-10 20–50 s를 잘라낸 bag(`--scene-dur 10`, scene 2개)으로:
+- 구 변환기(HEAD) 출력을 `rebuild_ego_pose.py`로 고친 결과 = 새 변환기 출력: ego_pose 3,611개 최대 10 µm(µs 타임스탬프 반올림), 쿼터니언 2.4e-7, CAN bus pose 동일.
+- 이 구간은 odom이 100 Hz로 갱신되던 구간이라 구/신 차이는 타이밍 효과(수평 중앙값 1.2 cm, 최대 11 cm, 회전 최대 0.31°)뿐이고 높이 차 1 mm.
+- 구 데이터셋에 새 변환기로 이어쓰기 → 거부. `--in-place` 재작성(하드링크 사본, 원본 불변) 후 이어쓰기 → scene 4개, devkit·`NuScenesCanBus` 로드.
+
 ## 2026-09-23 — 두 도구(표준형 / 전체 데이터형), 완전한 카메라 세트 규칙, rectify, 공식 scene 이름, CAN bus
 
 2026-09-23 실측 bag(`0923_Calib_sample`의 A-8·A-9·A-10)으로 파서를 점검한 결과를 반영했다.

@@ -112,8 +112,124 @@ def opencv_ext_to_nuscenes_pose(R_cam_ego, t_cam_ego) -> tuple[list[float], list
     return R_to_quat_wxyz(R_ego_cam), t_ego_cam
 
 
+# ------------------------------------------------------------ global frame
+# NuScenes places every log of a location in that location's own metric map
+# frame (x east, y north, z up) and gives ego_pose in it. Ours is the local
+# tangent plane (east-north-up) at a fixed point per location: a rigid
+# transform of Earth-centred coordinates, so distances and point clouds moved
+# into it keep their true scale everywhere (a map projection such as UTM does
+# not: 0.035 % short here), and heading in it is heading from true north, as
+# the INS measures it. The origin must never change for a location, or logs
+# converted at different times stop sharing a frame. Height is ellipsoidal.
+LOCATION = "korea-test"
+GLOBAL_ORIGINS = {"korea-test": (37.20, 126.83, 0.0)}      # lat, lon (deg), height (m)
+UTM_ZONE = 52   # what /novatel/oem7/odom positions are in on these bags (northern hemisphere)
+# Geoid undulation at the location (m): odom heights are above sea level, the
+# frame wants ellipsoidal ones. Measured from BESTPOS in the 2026-09-23 receiver
+# log (22.70 m); only the odom fallback uses it.
+GEOID_UNDULATION = {"korea-test": 22.70}
+
+WGS84_A = 6378137.0
+WGS84_F = 1 / 298.257223563
+
+
+def global_frame_id(location: str = LOCATION) -> str:
+    """The id stored in log.json, so appends can check they share the frame."""
+    lat, lon, h = GLOBAL_ORIGINS[location]
+    return f"enu@{lat:.6f},{lon:.6f},{h:.3f}"
+
+
+def geodetic_to_ecef(lat_deg, lon_deg, h) -> np.ndarray:
+    la, lo = np.radians(lat_deg), np.radians(lon_deg)
+    e2 = WGS84_F * (2 - WGS84_F)
+    n = WGS84_A / np.sqrt(1 - e2 * np.sin(la) ** 2)
+    return np.stack([(n + h) * np.cos(la) * np.cos(lo), (n + h) * np.cos(la) * np.sin(lo),
+                     (n * (1 - e2) + h) * np.sin(la)], axis=-1)
+
+
+def geodetic_to_enu(lat_deg, lon_deg, h, origin) -> np.ndarray:
+    """WGS84 latitude/longitude (deg) and ellipsoidal height -> (N, 3) east, north, up
+    in the tangent plane at origin = (lat, lon, height)."""
+    lat0, lon0, h0 = origin
+    la, lo = np.radians(lat0), np.radians(lon0)
+    R = np.array([[-np.sin(lo), np.cos(lo), 0.0],
+                  [-np.sin(la) * np.cos(lo), -np.sin(la) * np.sin(lo), np.cos(la)],
+                  [np.cos(la) * np.cos(lo), np.cos(la) * np.sin(lo), np.sin(la)]])
+    d = geodetic_to_ecef(lat_deg, lon_deg, h) - geodetic_to_ecef(lat0, lon0, h0)
+    return d @ R.T
+
+
+def _utm_series():
+    n = WGS84_F / (2 - WGS84_F)
+    A = WGS84_A / (1 + n) * (1 + n ** 2 / 4 + n ** 4 / 64)
+    alpha = (n / 2 - 2 * n ** 2 / 3 + 5 * n ** 3 / 16, 13 * n ** 2 / 48 - 3 * n ** 3 / 5, 61 * n ** 3 / 240)
+    beta = (n / 2 - 2 * n ** 2 / 3 + 37 * n ** 3 / 96, n ** 2 / 48 + n ** 3 / 15, 17 * n ** 3 / 480)
+    delta = (2 * n - 2 * n ** 2 / 3 - 2 * n ** 3, 7 * n ** 2 / 3 - 8 * n ** 3 / 5, 56 * n ** 3 / 15)
+    return n, A, alpha, beta, delta
+
+
+def geodetic_to_utm(lat_deg, lon_deg, zone: int = UTM_ZONE) -> tuple[np.ndarray, np.ndarray]:
+    """WGS84 -> UTM easting, northing (northern hemisphere). Krüger series to n^3,
+    accurate to about a millimetre inside the zone."""
+    n, A, alpha, _, _ = _utm_series()
+    k0, lon0 = 0.9996, np.radians(zone * 6 - 183)
+    la, dl = np.radians(lat_deg), np.radians(lon_deg) - lon0
+    e = 2 * np.sqrt(n) / (1 + n)
+    t = np.sinh(np.arctanh(np.sin(la)) - e * np.arctanh(e * np.sin(la)))
+    xi, eta = np.arctan2(t, np.cos(dl)), np.arctanh(np.sin(dl) / np.sqrt(1 + t * t))
+    E = eta + sum(a * np.cos(2 * j * xi) * np.sinh(2 * j * eta) for j, a in enumerate(alpha, 1))
+    N = xi + sum(a * np.sin(2 * j * xi) * np.cosh(2 * j * eta) for j, a in enumerate(alpha, 1))
+    return 500000.0 + k0 * A * E, k0 * A * N
+
+
+def utm_to_geodetic(easting, northing, zone: int = UTM_ZONE) -> tuple[np.ndarray, np.ndarray]:
+    """UTM (northern hemisphere) -> WGS84 latitude, longitude in degrees."""
+    n, A, _, beta, delta = _utm_series()
+    k0, lon0 = 0.9996, np.radians(zone * 6 - 183)
+    xi = np.asarray(northing, dtype=np.float64) / (k0 * A)
+    eta = (np.asarray(easting, dtype=np.float64) - 500000.0) / (k0 * A)
+    xi_ = xi - sum(b * np.sin(2 * j * xi) * np.cosh(2 * j * eta) for j, b in enumerate(beta, 1))
+    eta_ = eta - sum(b * np.cos(2 * j * xi) * np.sinh(2 * j * eta) for j, b in enumerate(beta, 1))
+    chi = np.arcsin(np.sin(xi_) / np.cosh(eta_))
+    lat = chi + sum(d * np.sin(2 * j * chi) for j, d in enumerate(delta, 1))
+    lon = lon0 + np.arctan2(np.sinh(eta_), np.cos(xi_))
+    return np.degrees(lat), np.degrees(lon)
+
+
+# ------------------------------------------------------------------ GNSS/INS
+# Receiver GPS time (week, milliseconds) -> the header stamps' clock. The
+# NovAtel topics' header stamps are arrival times: on the 2026-09-23 bags
+# 1.7 ms after the measurement on median and up to ~10 ms, with jitter.
+GPS_EPOCH_UNIX_S = 315_964_800        # 1980-01-06T00:00:00Z
+GPS_MINUS_UTC_S = 18                  # leap seconds since 2017-01-01
+
+
+def novatel_gps_ns(nov_header) -> int:
+    """Measurement time of a NovAtel message as UTC nanoseconds."""
+    ms = int(nov_header.gps_week_number) * 604_800_000 + int(nov_header.gps_week_milliseconds)
+    return (ms + (GPS_EPOCH_UNIX_S - GPS_MINUS_UTC_S) * 1000) * 1_000_000
+
+
+# NovAtel vehicle frame (x right, y forward, z up) -> base_link (x forward, y left, z up).
+_R_NOVATEL_BASE = np.array([[0.0, -1.0, 0.0], [1.0, 0.0, 0.0], [0.0, 0.0, 1.0]])
+
+
+def novatel_attitude(roll_deg, pitch_deg, azimuth_deg) -> Rotation:
+    """INSPVA angles -> rotation from base_link to local east-north-up.
+
+    NovAtel: roll right-handed about y (forward), pitch right-handed about x
+    (right), azimuth left-handed about z, clockwise from true north, applied
+    z-x-y. Matches the /novatel/oem7/odom orientation exactly (checked on the
+    2026-09-23 bags), which is therefore also true-north ENU, not UTM grid.
+    """
+    R_enu_vehicle = Rotation.from_euler(
+        "ZXY", np.stack([-np.asarray(azimuth_deg, dtype=np.float64), pitch_deg, roll_deg], -1),
+        degrees=True)
+    return R_enu_vehicle * Rotation.from_matrix(_R_NOVATEL_BASE)
+
+
 # -------------------------------------------------------------- calibration
-CAMERA_CALIB_FILES = ("intrinsic.txt", "distortion.txt", "quat_r.txt", "t.txt")
+CAMERA_CALIB_FILES =("intrinsic.txt", "distortion.txt", "quat_r.txt", "t.txt")
 POINT_SENSOR_CALIB_FILES = ("r.txt", "t.txt")
 
 

@@ -85,10 +85,12 @@ Two JSON files, matching the NuScenes schema exactly.
 
 ### Constraints that must hold
 
-- The global frame is **UTM zone 52N in metres** — coordinates are of order
-  (3.0e5, 4.1e6). Keep them in float64: float32 quantizes to a 0.25 m grid at
-  that magnitude, which would corrupt box centres. If your tooling is float32,
-  subtract a fixed origin on import and add it back on export.
+- The global frame is the location's **east-north-up frame in metres** (x east,
+  y north, z up) at a fixed origin; `log.json`'s `global_frame` names it
+  (`enu@37.200000,126.830000,0.000`). Coordinates stay within a few km of the
+  origin. Datasets converted before 2026-09-24 were in UTM zone 52N (order
+  (3.0e5, 4.1e6)) until rebuilt with `scripts/rebuild_ego_pose.py`: label only a
+  dataset whose `log.json` carries `global_frame`, or boxes and poses disagree.
 - `translation`/`rotation` are in the **global** frame, not the ego or LiDAR
   frame. Convert with the `ego_pose` referenced by that sample's `LIDAR_TOP`
   `sample_data`, then the `calibrated_sensor` for `LIDAR_TOP`.

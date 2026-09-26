@@ -74,8 +74,8 @@ camera by camera; of the (at most two) instants in range, the nearest complete
 one wins.
 
 A LiDAR frame without such a set, a missing LiDAR frame, or leaving the
-*coverage window* (the interval in which LiDAR, the six cameras and odom are all
-live) **breaks the sequence**. Each unbroken run is cut into scenes of exactly
+*coverage window* (the interval in which LiDAR, the six cameras and the INS pose
+are all live) **breaks the sequence**. Each unbroken run is cut into scenes of exactly
 `--scene-dur` (20 s); a remainder shorter than that is not used. In a scene:
 
 - **samples** are every `--keyframe-stride`-th LiDAR frame: 2 Hz, 40 per scene;
@@ -128,6 +128,8 @@ GNSS/INS goes in the nuScenes CAN bus expansion layout, so
 
 Accelerations come from CORRIMU and have **gravity removed** — nuScenes'
 `ms_imu` includes it. Each file covers its scene plus 0.5 s on both sides.
+Pose and IMU records are at the receiver's GPS measurement time (see
+*Conventions*).
 
 ### Full tool extras
 
@@ -139,8 +141,8 @@ Accelerations come from CORRIMU and have **gravity removed** — nuScenes'
 - `RADAR_FRONT` is NuScenes radar `.pcd` (18 fields), read by
   `RadarPointCloud.from_file` with the default filters. The ARS548 reports only
   radial velocity: `vx, vy` are it resolved along the line of sight, and
-  `vx_comp, vy_comp` the same after adding the radar's own motion (from odom and
-  CORRIMU), so static targets come out near zero. Fields the ARS548 does not
+  `vx_comp, vy_comp` the same after adding the radar's own motion (from the INS
+  velocity and CORRIMU), so static targets come out near zero. Fields the ARS548 does not
   report are set to pass the default filters (`dyn_prop` 4 = unknown,
   `ambig_state` 3, `invalid_state` 0).
 - `ext/<scene>/<topic>.json` (topic `/` → `__`) is a JSON array of
@@ -166,7 +168,7 @@ python scripts/screen_bags.py /path/to/bags/ --nominal-hz 29.9
 ```
 
 It measures each bag with the converter's own rules and prints what a conversion
-would do with it: per-stream delivery and gaps, the coverage window, odom gaps,
+would do with it: per-stream delivery and gaps, the coverage window, INS pose gaps,
 the INS solution status over time, and the **scene yield** per sync tolerance —
 how many LiDAR frames are usable, how often the sequence breaks, and how many
 seconds end up in 20 s scenes. Each bag gets a PASS / MARGINAL / DROP verdict
@@ -201,7 +203,7 @@ while sd['next']:                                # keyframes and sweeps; see sd[
 
 path = nusc.get_sample_data_path(sd['token'])
 cs = nusc.get('calibrated_sensor', sd['calibrated_sensor_token'])   # sensor in ego, camera_intrinsic
-pose = nusc.get('ego_pose', sd['ego_pose_token'])                   # ego at sd['timestamp'], UTM
+pose = nusc.get('ego_pose', sd['ego_pose_token'])                   # ego at sd['timestamp'], global frame
 ```
 
 **Point clouds and rendering.** Headless, pass `out_path` to write a file.
@@ -317,8 +319,9 @@ Defined once in `common.py`, checked visually on the 2026-09-23 bags with
 | `/down_bp_left/rslidar_points` | `LIDAR_BOTTOM_LEFT` | full |
 | `/down_bp_right/rslidar_points` | `LIDAR_BOTTOM_RIGHT` | full |
 | `/radar/PointCloudDetection` | `RADAR_FRONT` | full |
-| `/novatel/oem7/odom` | `ego_pose`, CAN bus `pose` | both |
-| `/novatel/oem7/corrimu`, `/novatel/oem7/inspva` | CAN bus `pose`, `ms_imu` | both |
+| `/novatel/oem7/inspva` | `ego_pose`, CAN bus `pose` | both |
+| `/novatel/oem7/corrimu` | CAN bus `pose`, `ms_imu` | both |
+| `/novatel/oem7/odom` | `ego_pose` only for a bag without INSPVA (warned) | both |
 
 Before 2026-09 this table had camera_3 and camera_4 the other way round. Bags
 recorded before then were not re-checked; run `extract_cam_viz.py` on one first.
@@ -363,8 +366,30 @@ Expected layout — one directory per channel the tool emits:
 **Calibration convention.** The files use the OpenCV extrinsic convention
 (`P_sensor = R · P_ego + t`). NuScenes stores the inverse — the sensor's pose
 *in* the ego frame — so `common.opencv_ext_to_nuscenes_pose` inverts it when
-writing `calibrated_sensor.json`. The ego frame is `base_link` of
-`/novatel/oem7/odom` (x forward, y left, z up).
+writing `calibrated_sensor.json`. The ego frame is `base_link` of the INS
+(x forward, y left, z up) at its output point — the point INSPVA reports, and
+the one `/novatel/oem7/odom` reports too.
+
+**Global frame.** As in nuScenes, `ego_pose` is in the location's own metric
+frame: east-north-up on the tangent plane at a fixed origin per location
+(`common.GLOBAL_ORIGINS`; `korea-test` is 37.20° N, 126.83° E, height 0 on the
+WGS84 ellipsoid), x east, y north, z up. It is a rigid transform of Earth-centred
+coordinates, so point clouds moved into it keep their true scale, and heading
+in it is heading from true north as the INS measures it. `log.json` records the
+frame in an extra `global_frame` key (ignored by the devkit); the converter
+refuses to append a log to a dataset in a different frame.
+
+**Ego pose source.** `ego_pose` and the CAN bus `pose` come from
+`/novatel/oem7/inspva` (100 Hz), placed at the receiver's GPS measurement time
+(GPS week/ms − 18 leap seconds, on the header stamps' clock). Not from
+`/novatel/oem7/odom`: on the 2026-09-23 bags its position holds for a second at
+a time for 55–80 % of the moving samples (a 1 Hz position source: ego poses
+converted from it were off by 0.8–2.6 m on median per log, up to 15 m), and like
+every NovAtel topic its header stamp is the arrival time,
+1.7 ms late on median and up to ~10 ms. INSPVA and odom agree to 0.15 mm
+wherever odom does update, and odom's orientation equals INSPVA's attitude
+exactly. odom is used only for a bag without INSPVA; its UTM positions and
+sea-level heights are then moved into the same frame.
 
 **Timestamps.** Everything is on header stamps, which are PTP-disciplined on the
 2026-09-23 bags. A LiDAR frame's stamp is the **start** of the sweep: its points
@@ -384,7 +409,8 @@ are unorganized and devkit consumers do not expect NaN.
 
 | Script | Purpose |
 |---|---|
-| `scripts/screen_bags.py` | Per-bag verdict: delivery and gaps per stream, coverage window, odom gaps, INS status, scene yield vs `--sync-ms` |
+| `scripts/screen_bags.py` | Per-bag verdict: delivery and gaps per stream, coverage window, INS pose gaps, INS status, scene yield vs `--sync-ms` |
+| `scripts/rebuild_ego_pose.py` | Rewrite an existing dataset's `ego_pose`, CAN bus files and `log.json` frame from INSPVA (for datasets converted before 2026-09-24) |
 | `scripts/clock_diagnosis.py` | Per-sensor clock offset/skew vs the bag clock, anchored to GPS |
 | `scripts/qa_report.py` | Dataset QA: sync (converter rule), ego anomalies, per-scene stats (`--bag` adds raw-timestamp sections) |
 | `scripts/lidar2cam_projection.py` | Project LiDAR onto each raw camera image with the full distortion model — calibration check |
@@ -452,17 +478,18 @@ Of our 22 categories only `vehicle.car`, `vehicle.truck`, `vehicle.construction`
 **7. `CAM_TRAFFIC` is best-effort** (full dataset only): it is attached when in
 tolerance and omitted otherwise, so some samples carry it and some do not.
 
-**8. `ego_pose` is in absolute UTM.** Ego poses come from `/novatel/oem7/odom`,
-which the Novatel driver derives from the INS solution in UTM zone 52N, so
-translations are of order (3.0e5, 4.1e6) m. The JSON and the devkit are float64
-and lose nothing, but float32 has a 0.25 m grid at that magnitude: any consumer
-that casts poses to float32 quantizes ego positions and any box positions
-produced in that frame. Keep float64 end to end, or subtract a dataset-wide
-origin before casting. The converter leaves the frame absolute so that logs
-recorded on different days stay in one coordinate system.
+**8. Datasets converted before 2026-09-24 have odom/UTM ego poses.** Their
+`ego_pose` came from `/novatel/oem7/odom` in absolute UTM zone 52N (order
+(3.0e5, 4.1e6) m, a 0.25 m grid in float32) and carries odom's one-second
+position holds. `scripts/rebuild_ego_pose.py DATAROOT --bags ... --out PATCH_DIR`
+recomputes every `ego_pose` record (same tokens and timestamps), the CAN bus
+files and `log.json`'s `global_frame` from the bags, without touching the sensor
+files; `--in-place` applies it. Until then the converter will not append to such
+a dataset. In the current frame positions stay within a few km of the origin,
+where float32 still resolves 0.5 mm.
 
 **9. INS status is not checked by the converter.** The driver keeps publishing
-odom while the INS is aligning or has lost GNSS. `scripts/screen_bags.py`
+INSPVA and odom while the INS is aligning or has lost GNSS. `scripts/screen_bags.py`
 reports the INSPVA status runs, and every CAN bus `pose` record carries
 `ins_status` — screen before converting.
 

@@ -40,7 +40,16 @@ from rosbags.highlevel import AnyReader
 from scipy.spatial.transform import Rotation
 from tqdm import tqdm
 
-from canbus import CAN_MARGIN_NS, InsData, corrimu_to_ego, scene_messages, write_scene
+from canbus import (
+    CAN_MARGIN_NS,
+    InsData,
+    build_ins,
+    corrimu_row,
+    inspva_row,
+    odom_row,
+    scene_messages,
+    write_scene,
+)
 from common import (
     CAM_CHANNEL_TO_TOPIC,
     CORRIMU_TOPIC,
@@ -49,11 +58,13 @@ from common import (
     INSPVA_TOPIC,
     LIDAR_PACKETS_TOPIC,
     LIDAR_POINTS_TOPIC,
+    LOCATION,
     NUSCENES_CAMS,
     ODOM_TOPIC,
     RADAR_TOPIC_TO_CHANNEL,
     TOPIC_TO_CAM_CHANNEL,
     default_intrinsic,
+    global_frame_id,
     make_typestore,
     quat_wxyz_to_R,
     resolve_calib,
@@ -396,6 +407,11 @@ def read_bag(bag_path: Path, staging: Path, profile: Profile, channels: list[str
     `staging/<channel>/<timestamp><ext>`; sidecar topics stream to
     `staging/_ext/<topic>.jsonl`. Odom, INSPVA and CORRIMU are small enough to
     hold in memory until the tables and CAN bus files are built.
+
+    The ego pose comes from INSPVA at the receiver's GPS measurement time, in the
+    location's global frame (see common.global_frame_id). /novatel/oem7/odom is a
+    fallback for bags without INSPVA only: on the 2026-09-23 bags its position is
+    held for a second at a time (a 1 Hz source) for 55-80 % of the moving samples.
     """
     modality = {"LIDAR_TOP": "lidar"}
     topic_channel: dict[str, str] = {}
@@ -550,20 +566,13 @@ def read_bag(bag_path: Path, staging: Path, profile: Profile, channels: list[str
                     frames[ch].append(ts_ns)
 
                 elif topic == ODOM_TOPIC:
-                    p_, q_ = msg.pose.pose.position, msg.pose.pose.orientation
-                    v_ = msg.twist.twist.linear
-                    odom_rows.append((stamp_to_ns(msg.header.stamp),
-                                      p_.x, p_.y, p_.z, q_.w, q_.x, q_.y, q_.z,
-                                      v_.x, v_.y, v_.z))
+                    odom_rows.append(odom_row(msg))
 
                 elif topic == INSPVA_TOPIC:
-                    ins_rows.append((stamp_to_ns(msg.header.stamp), msg.latitude,
-                                     msg.longitude, msg.height, int(msg.status.status)))
+                    ins_rows.append(inspva_row(msg))
 
                 elif topic == CORRIMU_TOPIC:
-                    imu_rows.append((stamp_to_ns(msg.header.stamp), msg.imu_data_count,
-                                     msg.pitch_rate, msg.roll_rate, msg.yaw_rate,
-                                     msg.lateral_acc, msg.longitudinal_acc, msg.vertical_acc))
+                    imu_rows.append(corrimu_row(msg))
 
             if LIDAR_PACKETS_TOPIC in lidar_topics_seen:
                 for points, frame_ts in decoder.flush():
@@ -577,42 +586,25 @@ def read_bag(bag_path: Path, staging: Path, profile: Profile, channels: list[str
         for f in sidecar_files.values():
             f.close()
 
-    if not odom_rows:
-        raise SystemExit(f"no {ODOM_TOPIC} in {bag_path.name} — ego_pose cannot be built. "
-                         "This bag is not convertible.")
-    if not imu_rows:
-        raise SystemExit(f"no {CORRIMU_TOPIC} in {bag_path.name} — the CAN bus pose "
-                         "(accel, rotation_rate) cannot be built.")
     if not frames["LIDAR_TOP"]:
         raise SystemExit(f"no lidar frames decoded from {bag_path.name}")
-
-    odom = np.array(sorted(odom_rows), dtype=np.float64)
-    odom_ts = np.array(sorted(r[0] for r in odom_rows), dtype=np.int64)
-    # Ego poses are interpolated between odom samples, so a gap in odom is
-    # invisible in the output; report it here and let screen_bags.py judge it.
-    odom_max_gap_ms = float(np.diff(odom_ts).max() / 1e6) if len(odom_ts) > 1 else 0.0
-    imu = np.array(sorted(imu_rows), dtype=np.float64)
-    imu_ts, imu_accel, imu_rate, imu_hz = corrimu_to_ego(
-        np.array(sorted(r[0] for r in imu_rows), dtype=np.int64), imu[:, 1], imu[:, 2],
-        imu[:, 3], imu[:, 4], imu[:, 5], imu[:, 6], imu[:, 7])
-    gnss = np.array(sorted(ins_rows), dtype=np.float64).reshape(-1, 5)
-    ins = InsData(
-        odom_ts=odom_ts, odom_t=odom[:, 1:4], odom_q=odom[:, 4:8], odom_vel=odom[:, 8:11],
-        imu_ts=imu_ts, imu_accel=imu_accel, imu_rate=imu_rate, imu_hz=imu_hz,
-        gnss_ts=np.array(sorted(r[0] for r in ins_rows), dtype=np.int64),
-        gnss_llh=gnss[:, 1:4], gnss_status=gnss[:, 4].astype(np.int64),
-    )
+    try:
+        ins, ins_stats = build_ins(ins_rows, odom_rows, imu_rows, LOCATION)
+    except ValueError as e:
+        raise SystemExit(f"{bag_path.name}: {e}. This bag is not convertible.") from None
     data = SensorData(
         calib=calib,
         frames={ch: np.array(sorted(v), dtype=np.int64) for ch, v in frames.items()},
         modality=modality,
         intrinsic={ch: r.K_new.tolist() for ch, r in rectifiers.items()},
         cam_size=cam_size,
-        odom_ts=odom_ts,
-        odom_t=odom[:, 1:4],
-        odom_R=Rotation.from_quat(odom[:, [5, 6, 7, 4]]),  # wxyz -> xyzw
+        pose_ts=ins.pose_ts,
+        pose_t=ins.pose_t,
+        pose_R=Rotation.from_quat(ins.pose_q[:, [1, 2, 3, 0]]),  # wxyz -> xyzw
         bag_start_ns=bag_start_ns,
         bag_end_ns=bag_end_ns,
+        location=LOCATION,
+        global_frame=ins.global_frame,
     )
     stats = {
         "lidar_topic": sorted(lidar_topics_seen),
@@ -620,10 +612,7 @@ def read_bag(bag_path: Path, staging: Path, profile: Profile, channels: list[str
                             else "lidar_header_stamp (sweep start)"),
         "msop_skipped_before_calib": n_msop_skipped,
         "n_frames": {ch: len(v) for ch, v in frames.items()},
-        "n_odom_samples": len(odom_rows),
-        "odom_max_gap_ms": odom_max_gap_ms,
-        "n_inspva_samples": len(ins_rows),
-        "imu_hz": imu_hz,
+        **ins_stats,
     }
     return BagContents(data, ins, rectifiers, sidecar_topics, stats)
 
@@ -878,6 +867,15 @@ def _convert(profile: Profile, args: argparse.Namespace, bag: Path) -> list[str]
             f"log '{log_name}' is already in {json_dir}/log.json — "
             "remove that log entry first if you mean to re-import it."
         )
+    frame_id = global_frame_id(LOCATION)
+    if existing:
+        frames_in = {r.get("global_frame") or "odom/UTM (before 2026-09-24)"
+                     for r in existing.get("log.json", [])}
+        if frames_in != {frame_id}:
+            raise SystemExit(
+                f"{json_dir} holds ego poses in {', '.join(sorted(frames_in))}; this converter "
+                f"writes {frame_id}. Poses from different frames cannot share a dataset — run "
+                "scripts/rebuild_ego_pose.py on it first, or convert into a new --out.")
 
     # ------------------------------------------------ channels and calibration
     gating = list(NUSCENES_CAMS)
@@ -902,10 +900,18 @@ def _convert(profile: Profile, args: argparse.Namespace, bag: Path) -> list[str]
         data, stats = contents.data, contents.stats
         for ch in channels:
             print(f"  {ch:20} {len(data.frames[ch]):>7} frames")
-        print(f"  odom: {len(data.odom_ts)} samples, max gap {stats['odom_max_gap_ms']:.0f} ms"
+        print(f"  ego pose: {stats['pose_source']} {len(data.pose_ts)} samples, max gap "
+              f"{stats['pose_max_gap_ms']:.0f} ms, frame {stats['global_frame']}"
               + ("   [!] ego pose is interpolated across gaps — run "
-                 "scripts/screen_bags.py" if stats["odom_max_gap_ms"] > 500 else ""))
-        print(f"  IMU: {stats['imu_hz']:.1f} Hz (CORRIMU), INSPVA: {stats['n_inspva_samples']} samples")
+                 "scripts/screen_bags.py" if stats["pose_max_gap_ms"] > 500 else ""))
+        if stats["pose_source"] == "odom":
+            print(f"  [!] no {INSPVA_TOPIC} — ego pose from {ODOM_TOPIC}, whose position can "
+                  "hold for a second at a time and whose stamps are arrival times")
+        else:
+            lag = stats["ins_header_lag_ms"]
+            print(f"  INS times: GPS measurement time (header stamps arrive "
+                  f"{lag['median']:.1f} ms later on median, {lag['p99']:.1f} ms at p99)")
+        print(f"  IMU: {stats['imu_hz']:.1f} Hz (CORRIMU)")
         for ch in gating:
             if not len(data.frames[ch]):
                 raise SystemExit(f"no frames on required camera channel {ch}")
@@ -920,11 +926,11 @@ def _convert(profile: Profile, args: argparse.Namespace, bag: Path) -> list[str]
         lidar_period = float(np.median(np.diff(lidar_ts)))
         print(f"\n[2/5] Frame selection (camera set within {args.sync_ms:g} ms of LIDAR_TOP) ...")
         window = coverage_window(
-            required_streams(lidar_ts, data.frames, gating, data.odom_ts), sync_ns)
+            required_streams(lidar_ts, data.frames, gating, data.pose_ts), sync_ns)
         for line in format_coverage(window):
             print("  " + line)
         if window["end_ns"] <= window["start_ns"]:
-            raise SystemExit("required streams (lidar, standard cameras, odom) "
+            raise SystemExit("required streams (lidar, standard cameras, INS pose) "
                              "do not overlap in time — nothing to convert")
         plan = plan_frames(lidar_ts, data.frames, gating, sync_ns, window,
                            group_ns=int(args.camera_group_ms * 1e6),

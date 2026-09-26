@@ -21,6 +21,10 @@ Conventions:
   - Calibration arrives in the OpenCV extrinsic convention
     (P_sensor = R @ P_ego + t); NuScenes wants the sensor pose in the ego frame,
     so it is inverted when writing calibrated_sensor.json.
+  - ego_pose is in the location's global frame, as in nuScenes: a metric
+    east-north-up frame with a fixed origin per location (common.GLOBAL_ORIGINS),
+    interpolated from the INS pose samples the caller passes. log.json keeps the
+    frame's id in an extra `global_frame` key.
   - Camera intrinsics are whatever the caller passes in `SensorData.intrinsic`:
     the pinhole K of the rectified images (see rectify.py).
   - Scene names are taken from the official nuScenes train/val lists, so every
@@ -44,6 +48,7 @@ import numpy as np
 from scipy.spatial.transform import Rotation, Slerp
 
 from common import (
+    LOCATION,
     MOTION_TYPE_TO_ATTRIBUTE,
     OBJECT_TYPE_TO_CATEGORY,
     VISIBILITY_LEVELS,
@@ -71,13 +76,15 @@ class SensorData:
     modality: dict[str, str]                   # channel -> "lidar" | "camera" | "radar"
     intrinsic: dict[str, list]                 # camera channel -> K for calibrated_sensor
     cam_size: dict[str, tuple[int, int]]       # camera channel -> (height, width)
-    odom_ts: np.ndarray                        # sorted ts_ns
-    odom_t: np.ndarray                         # (N, 3) translation
-    odom_R: Rotation                           # rotation samples for SLERP
+    pose_ts: np.ndarray                        # sorted ts_ns of the INS pose samples
+    pose_t: np.ndarray                         # (N, 3) translation, global frame
+    pose_R: Rotation                           # rotation samples for SLERP
     bag_start_ns: int
     bag_end_ns: int
+    location: str = LOCATION                   # log.location
+    global_frame: str = ""                     # common.global_frame_id, kept in log.json
     # Built lazily by interp_pose and reused. Slerp's constructor preprocesses
-    # every odom sample (O(N)); build_tables interpolates once per
+    # every pose sample (O(N)); build_tables interpolates once per
     # (scene, channel), so rebuilding it per call cost scenes x channels x N.
     _slerp: Slerp | None = field(default=None, repr=False, compare=False)
 
@@ -98,11 +105,11 @@ def nearest_ts(query: np.ndarray, target: np.ndarray) -> tuple[np.ndarray, np.nd
 
 
 def required_streams(lidar_ts: np.ndarray, cam_ts: dict[str, np.ndarray],
-                     gating: list[str], odom_ts: np.ndarray) -> dict[str, np.ndarray]:
-    """The streams a frame cannot do without: LiDAR, the gating cameras, odom."""
+                     gating: list[str], pose_ts: np.ndarray) -> dict[str, np.ndarray]:
+    """The streams a frame cannot do without: LiDAR, the gating cameras, the INS pose."""
     out: dict[str, np.ndarray] = {"LIDAR_TOP": lidar_ts}
     out.update({ch: cam_ts[ch] for ch in gating})
-    out["ODOM"] = odom_ts
+    out["INS"] = pose_ts
     return out
 
 
@@ -329,29 +336,29 @@ def official_scene_names(split: str, used: set[str], n: int) -> list[str]:
 # ---------------------------------------------------------------- ego pose
 def interp_pose(query_ns: np.ndarray, data: SensorData) -> tuple[np.ndarray, np.ndarray]:
     """Interpolate ego pose at each query ns. Returns (translations, quaternions[wxyz])."""
-    odom_ts = data.odom_ts
-    odom_t = data.odom_t
-    # Every frame must lie inside odom coverage; the coverage window guarantees
+    pose_ts = data.pose_ts
+    pose_t = data.pose_t
+    # Every frame must lie inside pose coverage; the coverage window guarantees
     # it for anything plan_frames lets through. Clipping here instead would
-    # silently freeze the pose at the first/last odom sample.
-    outside = (query_ns < odom_ts[0]) | (query_ns > odom_ts[-1])
+    # silently freeze the pose at the first/last INS sample.
+    outside = (query_ns < pose_ts[0]) | (query_ns > pose_ts[-1])
     if outside.any():
         raise ValueError(
-            f"{int(outside.sum())} frame timestamp(s) outside odom coverage "
-            f"[{int(odom_ts[0])}, {int(odom_ts[-1])}] ns — frames were not "
+            f"{int(outside.sum())} frame timestamp(s) outside INS pose coverage "
+            f"[{int(pose_ts[0])}, {int(pose_ts[-1])}] ns — frames were not "
             "restricted to the coverage window")
     q = query_ns
 
     # Linear interp translation
-    tx = np.interp(q, odom_ts, odom_t[:, 0])
-    ty = np.interp(q, odom_ts, odom_t[:, 1])
-    tz = np.interp(q, odom_ts, odom_t[:, 2])
+    tx = np.interp(q, pose_ts, pose_t[:, 0])
+    ty = np.interp(q, pose_ts, pose_t[:, 1])
+    tz = np.interp(q, pose_ts, pose_t[:, 2])
     trans = np.stack([tx, ty, tz], axis=-1)
 
     # SLERP rotation. The interpolator is cached on `data`: constructing it
-    # walks every odom sample, which dwarfs the interpolation itself.
+    # walks every pose sample, which dwarfs the interpolation itself.
     if data._slerp is None:
-        data._slerp = Slerp(odom_ts.astype(np.float64), data.odom_R)
+        data._slerp = Slerp(pose_ts.astype(np.float64), data.pose_R)
     rots = data._slerp(q.astype(np.float64))
     quats_xyzw = rots.as_quat()
     quats_wxyz = np.stack(
@@ -438,7 +445,10 @@ def build_tables(data: SensorData, scenes: list[dict], channels: list[str],
         "vehicle": "tcar",
         "date_captured": datetime.fromtimestamp(
             data.bag_start_ns / 1e9, tz=timezone.utc).date().isoformat(),
-        "location": "korea-test",
+        "location": data.location,
+        # Not a nuScenes field (the devkit ignores it): the frame ego_pose is in,
+        # so appends can refuse to mix logs from different frames.
+        "global_frame": data.global_frame,
     }
 
     # ---------- taxonomy (reuse across logs; written once) ----------
@@ -490,7 +500,7 @@ def build_tables(data: SensorData, scenes: list[dict], channels: list[str],
     sample_data_records = []
     ego_pose_records = []
     attach: Counter = Counter()
-    odom_lo, odom_hi = int(data.odom_ts[0]), int(data.odom_ts[-1])
+    pose_lo, pose_hi = int(data.pose_ts[0]), int(data.pose_ts[-1])
 
     for scene in scenes:
         scene_kfs = scene["keyframes"]
@@ -521,7 +531,7 @@ def build_tables(data: SensorData, scenes: list[dict], channels: list[str],
                 kf_map = {int(kf["cam_ts"][ch_name]): tok
                           for kf, tok in zip(scene_kfs, scene_kf_tokens)}
             else:
-                cand = ts_all[(ts_all >= odom_lo) & (ts_all <= odom_hi)]
+                cand = ts_all[(ts_all >= pose_lo) & (ts_all <= pose_hi)]
                 matched, diff = nearest_ts(scene_kf_ts, cand)
                 kf_map = {int(m): tok for m, d, tok in zip(matched, diff, scene_kf_tokens)
                           if d <= kf_tol_ns[ch_name]}

@@ -8,16 +8,16 @@ instant within --sync-ms of every LiDAR frame, CAM_TRAFFIC is best-effort),
 so the numbers are the numbers the conversion will produce.
 
 Per bag:
-  - per-stream delivery, gaps and start/end offsets (cameras, LiDAR, odom).
+  - per-stream delivery, gaps and start/end offsets (cameras, LiDAR, INS).
     Camera delivery is the record-time question: the cameras reach the ROS1 bag
     through /ros_bridge, the bag does not record the QoS, and a best_effort
     bridge silently drops frames under load — the delivery ratio is its footprint.
   - the coverage window: the interval in which every required stream is live,
     and how much the converter will cut at head and tail
-  - odom gaps: ego poses inside one are interpolated straight across it, which
-    nothing downstream can detect
-  - INS solution status from INSPVA: the driver keeps publishing odom while the
-    INS is still aligning or has lost GNSS, and the converter does not look
+  - INS pose gaps (INSPVA, or odom when a bag has none): ego poses inside one are
+    interpolated straight across it, which nothing downstream can detect
+  - INS solution status from INSPVA: the driver keeps publishing while the INS is
+    still aligning or has lost GNSS, and the converter does not look
   - scene yield per sync tolerance: the converter's own frame selection and
     scene cutting, i.e. how many seconds of the bag become scenes
 
@@ -63,7 +63,8 @@ TOLERANCES_MS = (10, 15, 20, 25, 30, 50)
 # A header.stamp further than this from the bag's receive clock is not wall
 # time at all (zero, or seconds since boot); the converter cannot sync on it.
 OFF_CLOCK_NS = 86_400 * 10**9
-REQUIRED = ["LIDAR_TOP", *NUSCENES_CAMS, "ODOM"]
+# INS is the ego-pose stream the converter uses: INSPVA, or odom when a bag has none.
+REQUIRED = ["LIDAR_TOP", *NUSCENES_CAMS, "INS"]
 
 
 def _stream_name(topic: str) -> str:
@@ -83,6 +84,7 @@ class BagStreams:
     ins_ts: np.ndarray | None = None       # INSPVA header stamps
     ins_status: np.ndarray | None = None   # INSPVA status per sample
     ins_names: dict[int, str] = field(default_factory=lambda: dict(_INS_NAMES))
+    ins_from_odom: bool = False            # no INSPVA: the converter falls back to odom
 
 
 def collect(bag: Path, max_seconds: float, typestore) -> BagStreams:
@@ -132,6 +134,12 @@ def collect(bag: Path, max_seconds: float, typestore) -> BagStreams:
         order = np.argsort(ins_ts)
         out.ins_ts = np.array(ins_ts, dtype=np.int64)[order]
         out.ins_status = np.array(ins_status, dtype=np.int64)[order]
+        out.stamps["INS"] = out.ins_ts
+        out.callerid["INS"] = callerid.get("INSPVA", "?")
+    elif "ODOM" in out.stamps:
+        out.stamps["INS"] = out.stamps["ODOM"]
+        out.callerid["INS"] = callerid.get("ODOM", "?")
+        out.ins_from_odom = True
     return out
 
 
@@ -241,8 +249,14 @@ def screen(bag: Path, args, typestore) -> tuple[str, list[str], float]:
     present = [s for s in REQUIRED if s in bs.stamps and s not in off_clock]
     missing = [s for s in REQUIRED if s not in bs.stamps]
     for s in missing:
-        flag(2, f"missing {s}" + (" (bag2nuscenes refuses without odom)" if s == "ODOM" else ""))
-    extra = [s for s in bs.stamps if s not in REQUIRED and s not in off_clock]
+        flag(2, f"missing {s}" + (" (bag2nuscenes needs INSPVA, or odom, for ego_pose)"
+                                  if s == "INS" else ""))
+    if bs.ins_from_odom:
+        flag(1, "no INSPVA — ego_pose would come from odom, whose position can hold "
+                "for a second at a time")
+    # INSPVA/ODOM are shown as INS; listing them again would double the rows.
+    extra = [s for s in bs.stamps if s not in REQUIRED and s not in off_clock
+             and not (s in ("INSPVA", "ODOM") and "INS" in bs.stamps)]
     window = (coverage_window({s: bs.stamps[s] for s in present}, int(args.sync_ms * 1e6))
               if present else coverage_window({"(none)": np.array([0, 0])}, 0))
     # Offsets for the table are shown for every stream, relative to the same
@@ -300,17 +314,17 @@ def screen(bag: Path, args, typestore) -> tuple[str, list[str], float]:
         if cut > args.max_cut:
             flag(1, f"coverage window cuts {cut:.1f}s of the bag")
 
-    # ------------------------------------------------------------ odom gaps
-    if "ODOM" in bs.stamps:
-        gaps = long_gaps(bs.stamps["ODOM"], args.max_odom_gap)
+    # ------------------------------------------------------------- INS gaps
+    if "INS" in bs.stamps:
+        gaps = long_gaps(bs.stamps["INS"], args.max_ins_gap)
         if gaps:
-            print(f"  odom gaps > {args.max_odom_gap:.2f}s: "
+            print(f"  INS pose gaps > {args.max_ins_gap:.2f}s: "
                   + ", ".join(f"{_fmt_t(s_, t0).strip()} ({g:.2f}s)" for s_, g in gaps[:8])
                   + (" ..." if len(gaps) > 8 else ""))
             worst = max(g for _, g in gaps)
-            flag(2, f"odom gap {worst:.2f}s (ego pose interpolated across it)")
+            flag(2, f"INS pose gap {worst:.2f}s (ego pose interpolated across it)")
         else:
-            print(f"  odom gaps > {args.max_odom_gap:.2f}s: none")
+            print(f"  INS pose gaps > {args.max_ins_gap:.2f}s: none")
 
     # ------------------------------------------------------------ INS status
     if bs.ins_ts is None:
@@ -373,7 +387,8 @@ def main() -> None:
     p.add_argument("--min-scene-frac", type=float, default=0.6,
                    help="Fraction of the coverage window that must end up in scenes to pass (default 0.6).")
     p.add_argument("--min-delivery", type=float, default=0.99, help="Per-camera delivery ratio required to pass (default 0.99).")
-    p.add_argument("--max-odom-gap", type=float, default=0.5, help="Odom gap (s) that fails a bag (default 0.5).")
+    p.add_argument("--max-ins-gap", "--max-odom-gap", dest="max_ins_gap", type=float, default=0.5,
+                   help="Gap (s) in the ego-pose stream (INSPVA, or odom) that fails a bag (default 0.5).")
     p.add_argument("--max-lidar-gap", type=float, default=0.3, help="Lidar gap (s) that marks a bag marginal (default 0.3).")
     p.add_argument("--max-ins-bad-run", type=float, default=2.0,
                    help="INS not SOLUTION_GOOD for this long inside the window fails a bag (s, default 2).")

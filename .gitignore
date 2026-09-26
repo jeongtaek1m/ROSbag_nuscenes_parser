@@ -31,6 +31,7 @@ clock_diag/
 # one vehicle build and the labelling vendor produces their own. Keep a snapshot
 # locally and point --calib at it.
 calib/
+online_calib/results_*/
 
 # Bags and dataset artifacts
 *.bag

@@ -38,11 +38,15 @@ made with `--system-site-packages` sees them too and needs no `pip install`.
 ## Convert
 
 ```bash
-python bag2nuscenes.py      /path/to.bag --calib /path/to/calib --split train   # -> /data/tcar_nuscenes
-python bag2nuscenes_full.py /path/to.bag --calib /path/to/calib --split train   # -> /data/tcar_nuscenes_full
+python bag2nuscenes.py      /path/to.bag --calib /path/to/calib --split train   # -> /data/parsed/tcar_nuscenes
+python bag2nuscenes_full.py /path/to.bag --calib /path/to/calib --split train   # -> /data/parsed/tcar_nuscenes_full
 python bag2nuscenes.py      /path/to.bag --out /tmp/try                         # no calibration: defaults
 python bag2nuscenes.py      /path/to/bags/ a.bag b.bag --split val              # several bags in one go
 ```
+
+Without `--out` a dataset goes to `<data root>/parsed/`, the layout the
+[desktop GUI](#desktop-gui) keeps; the data root is `/data` unless
+`$TCAR_DATA_ROOT` says otherwise.
 
 Give any mix of `.bag` files and directories; a directory means every `*.bag`
 under it, in name order. The bags are converted one after another into the same
@@ -174,6 +178,63 @@ how many LiDAR frames are usable, how often the sequence breaks, and how many
 seconds end up in 20 s scenes. Each bag gets a PASS / MARGINAL / DROP verdict
 with the reasons listed.
 
+## Desktop GUI
+
+The same workflow as a Korean desktop app, with the look and behaviour of the DM
+rig's parser GUI (IRCV-DM-Ops, `parser` branch).
+
+```bash
+pip install -e '.[gui]'                 # PyQt5 (PySide6 also works)
+python gui.py [--data <data root>]      # default /data; the choice is remembered
+./install_desktop.sh [--desktop]        # "TCAR Parser" in the app menu (--uninstall removes it)
+```
+
+Or as one file that needs nothing installed (Python, PyQt5, the converters and
+their dependencies inside, ~250 MB):
+
+```bash
+packaging/build_appimage.sh             # -> dist/TCAR_Parser-x86_64.AppImage
+./install_desktop.sh --appimage dist/TCAR_Parser-x86_64.AppImage [--desktop]
+dist/TCAR_Parser-x86_64.AppImage bag2nuscenes <bags> ...   # also: bag2nuscenes_full, yield_check, remove_log
+```
+
+The AppImage carries the code as it was when built; rebuild it after changing the
+converter. It uses the checkout's `.venv` versions when there is one, with
+`opencv-python-headless` in place of `opencv-python` (whose own Qt would sit next
+to PyQt5's).
+
+It keeps a data root laid out as
+
+```
+<data root>/raw/<course>/<bag> (+ its _integrity.csv, _recorder.log)
+<data root>/raw/_excluded/<course>/<bag>
+<data root>/parsed/tcar_nuscenes/       # one dataset for every course
+<data root>/logs/                       # job logs, logs/yield/ results
+<data root>/calib/                      # optional: passed to the converter as --calib
+```
+
+A course is the letter of the bag name (`A-1_2026-09-28-14-40-58.bag` → `A`).
+Unlike the DM GUI, which keeps a dataset per route, every course feeds the one
+dataset, so scene names never collide.
+
+- **Import** finds `.bag` files (4 levels deep) in a source such as the external
+  SSD and copies them, with the recorder's files next to them, to `raw/<course>/`.
+  Bags under a `fail/` folder, and bags already in the dataset, start unticked.
+- **Parse** runs `bag2nuscenes.py` on the course's bags that are not in the dataset
+  yet, in route order (A-2 before A-10), appending to `parsed/tcar_nuscenes`.
+- **Validate** loads the whole dataset with nuscenes-devkit.
+- **Yield check** reads only the header stamps (a few hundred bytes per message
+  through the bag's chunk index) and applies the converter's frame rule: scenes per
+  bag, and a timeline of where the rest went (camera missing or out of sync, LiDAR
+  gaps, remainders under 20 s, sensor start/stop). On the course page it checks the
+  course; "폴더 수율 검사…" checks any folder before importing. Command line:
+  `python yield_check.py <bag or folder> ... [--json out.json]`.
+- **Exclude / restore** moves a bag to `raw/_excluded/` and, if it was parsed, takes
+  its log out of the dataset with `remove_log.py <dataroot> <log>`; restoring moves
+  it back for the next parse.
+- Logs already in the dataset whose bag is not under `raw/` are listed as such.
+- One job at a time; progress, log and cancel are in the bar at the bottom.
+
 ## Using the dataset
 
 With the stock nuscenes-devkit. Worked examples live in
@@ -185,7 +246,7 @@ hold the sweeps — every 30 fps camera frame and every 10 Hz LiDAR frame.
 
 ```python
 from nuscenes.nuscenes import NuScenes
-root = '/data/tcar_nuscenes'
+root = '/data/parsed/tcar_nuscenes'
 nusc = NuScenes(version='v1.0-trainval', dataroot=root, verbose=True)
 nusc.list_scenes()
 
@@ -282,6 +343,11 @@ msgs = json.load(open(f"{root}/ext/{scene['name']}/bsw__vehicle_can.json"))
 ```
 bag2nuscenes.py       # CLI: standard dataset
 bag2nuscenes_full.py  # CLI: full dataset
+gui.py                # desktop GUI: import, parse, validate, yield check, exclude
+yield_check.py        # scenes per bag and why the rest is lost, from header stamps only
+remove_log.py         # take one log back out of a converted dataset
+install_desktop.sh, assets/  # GUI app-menu entry, icons, Pretendard font (OFL)
+packaging/            # build_appimage.sh: the GUI and CLIs as one AppImage
 converter.py          # the pipeline both CLIs run: read, stage, rectify, materialize
 nuscenes_writer.py    # frame selection, scene cutting, scene names, ego pose, 13 tables
 rectify.py            # fisheye / plumb_bob -> pinhole

@@ -1,0 +1,21 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#7c95ff"/>
+      <stop offset="1" stop-color="#4a5fd9"/>
+    </linearGradient>
+  </defs>
+  <rect x="16" y="16" width="224" height="224" rx="52" fill="url(#bg)"/>
+  <!-- recordings: a strip of frames -->
+  <g fill="none" stroke="#ffffff" stroke-width="12" stroke-linecap="round" stroke-linejoin="round">
+    <rect x="52" y="60" width="72" height="56" rx="10" opacity="0.95"/>
+    <path d="M74 60v56M102 60v56" opacity="0.6"/>
+    <!-- arrow -->
+    <path d="M140 88h40m-14-14 14 14-14 14"/>
+  </g>
+  <!-- dataset: stacked layers -->
+  <g fill="#ffffff">
+    <path d="M128 140l64 28-64 28-64-28z"/>
+    <path d="M64 188l64 28 64-28" fill="none" stroke="#ffffff" stroke-width="12" stroke-linecap="round" stroke-linejoin="round" opacity="0.7"/>
+  </g>
+</svg>

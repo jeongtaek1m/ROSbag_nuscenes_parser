@@ -1,5 +1,35 @@
 # Changelog
 
+## 2026-09-30 — 데스크톱 GUI(TCAR Parser), 기본 출력 `/data/parsed`
+
+IRCV-DM-Ops `parser` 브랜치의 DM Parser GUI를 같은 디자인·기능으로 티카(ROS 1 bag)에 옮겼다.
+
+### 요약
+
+| 항목 | 내용 |
+|---|---|
+| `gui.py` (신규) | 데이터 폴더(기본 `/data`)의 `raw/<코스>/`, `parsed/tcar_nuscenes`, `logs/`를 관리하는 PyQt5 앱: 가져오기, 파싱, 검증, 수율 검사, 제외·복원 |
+| 코스 | bag 이름의 알파벳(`A-1_…bag` → A). DM처럼 코스마다 데이터셋을 두지 않고 모든 코스가 데이터셋 하나로 — scene 이름이 겹치지 않게 |
+| `yield_check.py` (신규) | 변환 없이 bag당 scene 수와 나머지가 잘린 이유. 청크 인덱스로 메시지마다 앞 수백 바이트만 읽음 |
+| `remove_log.py` (신규) | 데이터셋에서 log 하나를 테이블(map 행 포함)·센서 파일·CAN bus·ext째로 뺌 |
+| 기본 출력 | `--out`이 없으면 `<데이터 폴더>/parsed/tcar_nuscenes(_full)`. 데이터 폴더는 `$TCAR_DATA_ROOT`, 없으면 `/data` |
+| 배포 | `install_desktop.sh`(앱 메뉴·바탕화면, `--appimage`), `packaging/build_appimage.sh` → Python·의존성까지 든 AppImage 하나(~250 MB) |
+
+### DM GUI와 다른 점
+
+- 녹화 = `.bag` 파일 하나. 옆의 `_integrity.csv`, `_recorder.log`(스탬프가 1초 달라도)를 함께 복사·이동.
+- LiDAR 시각 보정 단계 없음(Ouster 전용). 단계는 가져오기 → 파싱 → 검증.
+- `fail/` 폴더의 bag과 이미 데이터셋에 있는 bag은 가져오기 목록에서 기본 선택 해제.
+- 파싱은 루트 번호 순서(A-2 → A-10)로, 데이터 폴더에 `calib/`가 있으면 `--calib`으로 넘김.
+- 원본 bag 없이 데이터셋에만 있는 log도 목록에 표시(제외는 원본을 가져온 뒤).
+- 수율 검사 기준은 변환기와 같게: 표준 카메라 6대, 25 ms. INS는 INSPVA 헤더 시각(GPS 시각보다 1–8 ms 늦을 뿐).
+- AppImage에는 `opencv-python` 대신 `opencv-python-headless`(PyQt5 옆에 Qt가 하나 더 들어가지 않게).
+
+### 검증
+
+- 합성 bag(카메라 7대·LiDAR·INSPVA·CORRIMU, 카메라 1초 공백 포함)으로 가져오기 → 파싱 → 수율 검사 → 검증 → 제외 → 복원을 오프스크린 GUI로 실행: 개발 venv와 AppImage 둘 다 통과. 제외 뒤 devkit·`NuScenesCanBus` 로드, 다시 파싱하면 비워진 scene 이름을 재사용.
+- 수율 검사 = 변환기(0929 B-2): scene 10개, LiDAR 2,067 프레임, 카메라–LiDAR 차이 p50/p99/max 8.33/16.58/16.74 ms, 자투리 6.4 s 모두 일치. 43 GB bag을 USB 2.0에서 7.5분.
+
 ## 2026-09-24 — ego_pose를 INSPVA(GPS 시각)로, global 좌표계를 장소별 ENU로
 
 온라인 캘리브레이션 작업 중 `/novatel/oem7/odom` 위치가 1초씩 멈춰 있는 것을 발견해 ego pose 소스를 바꿨다.

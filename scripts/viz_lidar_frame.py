@@ -1,7 +1,7 @@
 """Visualize one lidar sweep from a converted dataset (BEV + side view).
 
 Usage:
-    python scripts/viz_lidar_frame.py /data/tcar_nuscenes --out viz_lidar
+    python scripts/viz_lidar_frame.py /data/parsed/tcar_nuscenes --out viz_lidar
     python scripts/viz_lidar_frame.py <dataroot> --frame mid|first|last|<index>
 """
 import argparse
@@ -14,7 +14,7 @@ import matplotlib.pyplot as plt
 def main():
     p = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     p.add_argument("dataroot", type=Path,
-                   help="NuScenes dataroot, e.g. /data/tcar_nuscenes")
+                   help="NuScenes dataroot, e.g. /data/parsed/tcar_nuscenes")
     p.add_argument("--out", type=Path, default=Path("viz_lidar"),
                    help="Output dir (default: viz_lidar/).")
     p.add_argument("--frame", default="mid",

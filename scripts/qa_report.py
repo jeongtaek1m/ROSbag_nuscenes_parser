@@ -8,7 +8,7 @@ Sections:
   5. Per-scene stats (samples, span, ego trajectory length, lidar point counts)
 
 Usage:
-    python scripts/qa_report.py /data/tcar_nuscenes [--bag /path/to.bag]
+    python scripts/qa_report.py /data/parsed/tcar_nuscenes [--bag /path/to.bag]
 """
 from __future__ import annotations
 
@@ -173,7 +173,7 @@ def per_scene_stats(nusc: NuScenes, dataroot: Path) -> None:
 
 def main():
     p = argparse.ArgumentParser(description=__doc__.split("\n")[0])
-    p.add_argument("dataroot", type=Path, help="NuScenes dataroot, e.g. /data/tcar_nuscenes")
+    p.add_argument("dataroot", type=Path, help="NuScenes dataroot, e.g. /data/parsed/tcar_nuscenes")
     p.add_argument("--bag", type=Path, default=None,
                    help="Source .bag, for the raw-timestamp sections [1] and [2]. "
                         "Those are skipped when it is not given.")

@@ -123,15 +123,19 @@ class Profile:
     description: str
 
 
+# Datasets go to <data root>/parsed/ unless --out says otherwise — the layout gui.py
+# keeps (raw/, parsed/, logs/). Override the data root with $TCAR_DATA_ROOT.
+DATA_ROOT = Path(os.environ.get("TCAR_DATA_ROOT", "/data")).expanduser()
+
 STANDARD = Profile(
     name="standard", cameras=tuple(NUSCENES_CAMS), extra_lidars={}, radars={},
-    point_time=False, sidecars=False, default_out=Path("/data/tcar_nuscenes"),
+    point_time=False, sidecars=False, default_out=DATA_ROOT / "parsed" / "tcar_nuscenes",
     description="LIDAR_TOP + six standard cameras (rectified) + GNSS/INS as CAN bus",
 )
 FULL = Profile(
     name="full", cameras=tuple(NUSCENES_CAMS + EXTRA_CAMS),
     extra_lidars=dict(EXTRA_LIDAR_TOPIC_TO_CHANNEL), radars=dict(RADAR_TOPIC_TO_CHANNEL),
-    point_time=True, sidecars=True, default_out=Path("/data/tcar_nuscenes_full"),
+    point_time=True, sidecars=True, default_out=DATA_ROOT / "parsed" / "tcar_nuscenes_full",
     description="standard + CAM_TRAFFIC, bottom LiDARs, front radar, per-point LiDAR "
                 "time and every other topic as per-scene JSON",
 )

@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Convert a ROS1 rosbag into a standard NuScenes v1.0-trainval dataset.
 
-    python bag2nuscenes.py /path/to.bag --out /data/tcar_nuscenes --calib /path/to/calib
-    python bag2nuscenes.py /path/to/bags/ --out /data/tcar_nuscenes   # every *.bag under it
+    python bag2nuscenes.py /path/to.bag --out /data/parsed/tcar_nuscenes --calib /path/to/calib
+    python bag2nuscenes.py /path/to/bags/ --out /data/parsed/tcar_nuscenes   # every *.bag under it
 
 Shaped like the real nuScenes so the devkit and nuScenes-based training code
 work unchanged:

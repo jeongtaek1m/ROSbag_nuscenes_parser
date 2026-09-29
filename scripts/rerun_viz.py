@@ -11,9 +11,9 @@ Lidar is logged in TWO variants which can be toggled in the entity tree:
 
 Usage:
     pip install rerun-sdk
-    python scripts/rerun_viz.py /data/tcar_nuscenes
-    python scripts/rerun_viz.py /data/tcar_nuscenes --scene scene-0010
-    python scripts/rerun_viz.py /data/tcar_nuscenes --scene 0 --max-samples 5 \
+    python scripts/rerun_viz.py /data/parsed/tcar_nuscenes
+    python scripts/rerun_viz.py /data/parsed/tcar_nuscenes --scene scene-0010
+    python scripts/rerun_viz.py /data/parsed/tcar_nuscenes --scene 0 --max-samples 5 \
         --save /tmp/preview.rrd
 """
 from __future__ import annotations

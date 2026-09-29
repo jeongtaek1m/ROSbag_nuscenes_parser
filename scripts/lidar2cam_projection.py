@@ -11,7 +11,7 @@ translation = ego origin expressed in the sensor frame. If projections look
 flipped/rotated, the convention may be inverse — try --invert-extrinsic.
 
 Usage:
-    python scripts/lidar2cam_projection.py /data/tcar_nuscenes --calib calib/2025_8_19
+    python scripts/lidar2cam_projection.py /data/parsed/tcar_nuscenes --calib calib/2025_8_19
     python scripts/lidar2cam_projection.py <int> --frame mid --max-depth 80
 """
 from __future__ import annotations
@@ -50,7 +50,7 @@ def project_to_image(P_cam, K, dist, model):
 def main():
     p = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     p.add_argument("dataroot", type=Path,
-                   help="NuScenes dataroot, e.g. /data/tcar_nuscenes")
+                   help="NuScenes dataroot, e.g. /data/parsed/tcar_nuscenes")
     p.add_argument("--version", default="v1.0-trainval",
                    help="NuScenes version subdirectory (default: v1.0-trainval).")
     p.add_argument("--calib", type=Path, required=True,

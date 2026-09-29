@@ -81,6 +81,7 @@ from nuscenes_writer import (
     new_token,
     official_scene_names,
     partition_scenes,
+    deskew_points,
     plan_frames,
     required_streams,
     validate_with_devkit,
@@ -400,7 +401,7 @@ class BagContents:
 
 def read_bag(bag_path: Path, staging: Path, profile: Profile, channels: list[str],
              calib: dict, packet_msg_dir: Path, balance: float, jpeg_quality: int,
-             workers: int) -> BagContents:
+             workers: int, deskew: bool = True, max_seconds: float = 0.0) -> BagContents:
     """Single pass over the bag: stage sensor payloads, collect timestamps.
 
     Camera JPEGs (rectified), LiDAR frames and raw radar frames land in
@@ -447,11 +448,13 @@ def read_bag(bag_path: Path, staging: Path, profile: Profile, channels: list[str
     payload_topics = (set(TOPIC_TO_CAM_CHANNEL) | set(EXTRA_LIDAR_TOPIC_TO_CHANNEL)
                       | set(RADAR_TOPIC_TO_CHANNEL) | {LIDAR_POINTS_TOPIC})
 
+    want_time = profile.point_time or deskew          # per-point times: kept, or for deskewing
+
     def stage_lidar(ch: str, ts_ns: int, pts: np.ndarray, times) -> None:
         if not len(pts):
             return
         writer.submit(staging / ch / f"{ts_ns}{STAGE_EXT['lidar']}", pts)
-        if profile.point_time and times is not None:
+        if want_time and times is not None:
             writer.submit(staging / ch / f"{ts_ns}{POINT_TIME_EXT}", times)
         frames[ch].append(ts_ns)
 
@@ -476,8 +479,9 @@ def read_bag(bag_path: Path, staging: Path, profile: Profile, channels: list[str
             for t in sorted(expected - present):
                 print(f"    [missing] {t}")
 
+            stop = int(reader.start_time + max_seconds * 1e9) if max_seconds else None
             for connection, bag_ns, rawdata in tqdm(
-                reader.messages(connections=conns),
+                reader.messages(connections=conns, stop=stop),
                 total=sum(c.msgcount for c in conns), unit="msg",
             ):
                 topic = connection.topic
@@ -524,7 +528,7 @@ def read_bag(bag_path: Path, staging: Path, profile: Profile, channels: list[str
                     lidar_topics_seen.add(topic)
                     ts_ns = stamp_to_ns(msg.header.stamp)
                     pts, times = pointcloud2_to_pcdbin(
-                        msg, ts_ns if profile.point_time else None)
+                        msg, ts_ns if want_time else None)
                     stage_lidar("LIDAR_TOP", ts_ns, pts, times)
 
                 elif topic == LIDAR_PACKETS_TOPIC:
@@ -545,13 +549,13 @@ def read_bag(bag_path: Path, staging: Path, profile: Profile, channels: list[str
                     ):
                         ts_ns = int(frame_ts * 1e9)
                         pts, times = lidar_points_to_pcdbin(
-                            points, ts_ns if profile.point_time else None)
+                            points, ts_ns if want_time else None)
                         stage_lidar("LIDAR_TOP", ts_ns, pts, times)
 
                 elif ch is not None and modality[ch] == "lidar":
                     ts_ns = stamp_to_ns(msg.header.stamp)
                     pts, times = pointcloud2_to_pcdbin(
-                        msg, ts_ns if profile.point_time else None)
+                        msg, ts_ns if want_time else None)
                     stage_lidar(ch, ts_ns, pts, times)
 
                 elif ch is not None and modality[ch] == "radar":
@@ -578,10 +582,10 @@ def read_bag(bag_path: Path, staging: Path, profile: Profile, channels: list[str
                 for points, frame_ts in decoder.flush():
                     ts_ns = int(frame_ts * 1e9)
                     pts, times = lidar_points_to_pcdbin(
-                        points, ts_ns if profile.point_time else None)
+                        points, ts_ns if want_time else None)
                     stage_lidar("LIDAR_TOP", ts_ns, pts, times)
 
-            bag_start_ns, bag_end_ns = int(reader.start_time), int(reader.end_time)
+            bag_start_ns, bag_end_ns = int(reader.start_time), int(stop or reader.end_time)
     finally:
         for f in sidecar_files.values():
             f.close()
@@ -636,15 +640,16 @@ def _radar_sensor_velocity(ins: InsData, calib: dict, t_ns: int) -> np.ndarray:
 
 
 def materialize(plan: list[tuple[int, str, str]], contents: BagContents,
-                staging: Path, out_root: Path) -> dict:
-    """Move each staged frame to its NuScenes path (radar: convert to PCD).
+                staging: Path, out_root: Path, deskew: bool = True, keep_time: bool = False) -> dict:
+    """Move each staged frame to its NuScenes path (radar: convert to PCD; LiDAR:
+    motion-compensated to the frame time with the ego poses, see deskew_points).
 
     A rename, not a copy: staging lives inside out_root so this is the same
     filesystem, and the data is never written twice.
     """
     _ensure_placeholder_map(out_root)
     modality = contents.data.modality
-    n_moved = n_missing = n_time = 0
+    n_moved = n_missing = n_time = n_deskewed = 0
     for ts_ns, channel, rel_target in plan:
         target = out_root / rel_target
         if target.exists():
@@ -661,18 +666,30 @@ def materialize(plan: list[tuple[int, str, str]], contents: BagContents,
             target.write_bytes(radar_to_pcd(det, v_s))
             src.unlink()
         else:
-            src.rename(target)
-            if mod == "lidar":
-                t_src = staging / channel / f"{ts_ns}{POINT_TIME_EXT}"
-                if t_src.exists():
+            t_src = staging / channel / f"{ts_ns}{POINT_TIME_EXT}"
+            if mod == "lidar" and deskew and t_src.exists():
+                pts = np.fromfile(src, dtype=np.float32).reshape(-1, 5)
+                rel = np.fromfile(t_src, dtype=np.float32)
+                target.write_bytes(deskew_points(pts, rel, ts_ns, contents.data,
+                                                 contents.data.calib[channel]).astype(np.float32).tobytes())
+                src.unlink()
+                n_deskewed += 1
+            else:
+                src.rename(target)
+            if mod == "lidar" and t_src.exists():
+                if keep_time:
                     t_src.rename(target.with_name(
                         target.name.removesuffix(STAGE_EXT["lidar"]) + POINT_TIME_EXT))
                     n_time += 1
+                else:
+                    t_src.unlink()
         n_moved += 1
     print(f"  moved {n_moved} files into place"
+          + (f", {n_deskewed} LiDAR sweeps deskewed" if n_deskewed else "")
           + (f" (+{n_time} per-point time files)" if n_time else "")
           + (f"   [!] {n_missing} staged files missing" if n_missing else ""))
-    return {"n_files": n_moved, "n_point_time_files": n_time, "n_missing": n_missing}
+    return {"n_files": n_moved, "n_point_time_files": n_time, "n_missing": n_missing,
+            "n_lidar_deskewed": n_deskewed}
 
 
 def export_sidecars(staging: Path, out_root: Path, spans: list[tuple[str, int, int]],
@@ -757,6 +774,11 @@ def _parser(profile: Profile, doc: str) -> argparse.ArgumentParser:
                    help="Threads for rectification and file writes.")
     p.add_argument("--packet-msg-dir", type=Path,
                    default=here / "packet_decoder" / "src" / "rslidar_msg" / "msg")
+    p.add_argument("--max-seconds", type=float, default=0.0,
+                   help="Read only the first N seconds of each bag (for tests).")
+    p.add_argument("--no-deskew", action="store_true",
+                   help="Store LiDAR sweeps as measured. By default every point is moved with "
+                        "the ego motion to the sweep's timestamp (its start), as nuScenes does.")
     p.add_argument("--no-validate", action="store_true",
                    help="Skip the NuScenes(...) / NuScenesCanBus load check at the end.")
     p.add_argument("--keep-staging", action="store_true",
@@ -896,7 +918,7 @@ def _convert(profile: Profile, args: argparse.Namespace, bag: Path) -> list[str]
         print(f"[1/5] Reading {bag.name} ({profile.name}: {profile.description}) ...")
         contents = read_bag(bag, staging, profile, channels, calib,
                             args.packet_msg_dir, args.rectify_balance,
-                            args.jpeg_quality, args.workers)
+                            args.jpeg_quality, args.workers, not args.no_deskew, args.max_seconds)
         data, stats = contents.data, contents.stats
         for ch in channels:
             print(f"  {ch:20} {len(data.frames[ch]):>7} frames")
@@ -984,7 +1006,8 @@ def _convert(profile: Profile, args: argparse.Namespace, bag: Path) -> list[str]
             print(f"  {ch}: in {n}/{n_samples} samples")
 
         print(f"\n[5/5] Writing under {args.out} ...")
-        mat_stats = materialize(file_plan, contents, staging, args.out)
+        mat_stats = materialize(file_plan, contents, staging, args.out,
+                                deskew=not args.no_deskew, keep_time=profile.point_time)
         spans = [(s["name"], s["keyframes"][0]["lidar_ts"], s["keyframes"][-1]["lidar_ts"])
                  for s in scenes]
         for name, a, b in spans:
@@ -1013,6 +1036,8 @@ def _convert(profile: Profile, args: argparse.Namespace, bag: Path) -> list[str]
             "rectification": {ch: r.describe() for ch, r in contents.rectifiers.items()},
             "calib": calib,
             "files": mat_stats,
+            "lidar_deskew": ("each point moved with the ego motion to the sweep timestamp"
+                             if not args.no_deskew else None),
             "sidecar_topics": contents.sidecar_topics if profile.sidecars else {},
             **stats,
         }

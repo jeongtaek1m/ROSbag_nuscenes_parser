@@ -410,7 +410,7 @@ Driving data from the T-Car test vehicle (six cameras, a roof LiDAR, RTK INS) in
 **{tot['scenes']} scenes** of 20 s ({hours:.2f} h) from **{tot['logs']} recordings** · {tot['samples']:,} key-frame samples ·
 {tot['sample_data']:,} sensor frames · {tot['bytes'] / 1e9:.0f} GB to download in {len(shards)} sensor tars + 1 table tar
 ({tot.get('raw_bytes', tot['bytes']) / 1e9:.0f} GB unpacked).
-Every scene was curated and locked (see [Curation](#curation)). {('No 3D box annotations (`sample_annotation` is empty).' if not tot.get('annotations') else '')}
+{('No 3D box annotations (`sample_annotation` is empty).' if not tot.get('annotations') else '')}
 
 ## Download and use
 
@@ -479,22 +479,6 @@ Key frames (`samples/`) are 2 Hz, synchronised across the seven sensors as in nu
 is a sweep (`sweeps/`). LiDAR files hold five float32 per point (x, y, z, intensity, ring), as in nuScenes.
 `calibrated_sensor` holds the intrinsics and extrinsics, one set per recording.
 
-## Curation
-
-Recordings are cut into 20 s scenes, then filtered in a fixed order; a scene a filter catches is only a
-candidate, and a person confirmed every deletion:
-
-1. **Same-place stops** — scenes standing still (≥ 80 % of the time) at the same place in a recording: the one
-   with the most motion around it (LiDAR change) stays.
-2. **Few road users** — fewer than 3 nearby road users per sample (cars, buses, trucks, people, bicycles,
-   motorcycles; box height ≥ 50 px over the six cameras; YOLO).
-3. **Same road** — the same path driven the same way as a scene already kept (≥ 60 % of the path within
-   10 m / 30°), across recordings.
-
-A curation round ends by deleting the confirmed scenes and **locking** the rest; locked scenes are never
-removed later, which is what lets releases only grow. `curation/deleted.txt` lists the scenes taken out,
-`curation/keep.txt` the scenes kept and why, `curation/locked.json` the rounds.
-
 {FRAMES}
 ## Recordings
 
@@ -544,6 +528,7 @@ def main():
     ap.add_argument('--to-dir', default=None, help='write the repo into this directory instead of Hugging Face')
     ap.add_argument('--skip-check', action='store_true', help='skip the dataset check (tables, devkit, CAN bus)')
     ap.add_argument('--readme-out', default=None, help='with the plan: write the README this release would get here')
+    ap.add_argument('--card-only', action='store_true', help='rewrite only README.md of the published release (from its manifest)')
     args = ap.parse_args()
     root = os.path.realpath(args.dataroot)
 
@@ -554,6 +539,14 @@ def main():
             sys.exit(f'no hf_ token in {args.token_file}')
         token = m.group(0)
     remote = DirRemote(args.to_dir, args.branch) if args.to_dir else HfRemote(args.repo, args.branch, token or os.environ.get('HF_TOKEN'))
+
+    if args.card_only:                            # the card text changed: nothing else is touched
+        man = remote.read_json('manifest.json')
+        if not man:
+            sys.exit(f'{args.branch} has no manifest.json')
+        remote.commit({'README.md': readme(man, args.repo)}, [], f'{args.branch}: README')
+        log(f'README.md of {args.branch} rewritten')
+        return
 
     # 1. the dataset: finalized and whole
     lock = apply_selection.locked_tokens(os.path.join(root, 'selection'))

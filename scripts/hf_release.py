@@ -10,9 +10,9 @@ How the data is kept as it grows:
     (selection/locked.json). Locked scenes are never deleted or changed again, so a sensor tar, once
     published, never changes either. New recordings only ever add tars.
   - Sensor files (samples/, sweeps/) are packed per recording (log), split at scene boundaries into
-    tars of at most --part-gb: sensors/<log>/<log>.partNN.tar. A release uploads only the parts that
+    tars of at most --part-gb: sensors/<log>/<log>.partNN.tar.gz. A release uploads only the parts that
     are not in the repo yet.
-  - The tables, CAN bus, maps, import records and the curation lists are one tar, meta/TCar_meta.tar,
+  - The tables, CAN bus, maps, import records and the curation lists are one tar, meta/TCar_meta.tar.gz,
     replaced by every release (the only file that changes; scene names follow the tables).
   - manifest.json lists every part (log, scene tokens, files, bytes, sha256, release) and the release
     history with the parser commit that produced the data; README.md is written from it; assemble.py
@@ -47,7 +47,8 @@ sys.path.insert(0, str(REPO_DIR / 'curation'))
 import apply_selection  # noqa: E402
 
 VERSION = 'v1.0-trainval'
-META_PATH = 'meta/TCar_meta.tar'
+META_PATH = 'meta/TCar_meta.tar.gz'
+GZ_LEVEL = 3                                      # LiDAR shrinks ~37 %, JPEG not at all; pigz keeps up with the HDD
 CURATION_FILES = ('locked.json', 'keep.txt', 'drop.txt', 'deleted.txt', 'filters.json', 'result.json')
 LAYOUT = 1
 
@@ -126,9 +127,9 @@ def plan_parts(ds, sizes, published, part_bytes):
         groups = _split(todo, [sizes[s['token']] for s in todo], part_bytes)
         k = 0
         for g in groups:
-            while f'sensors/{lg}/{lg}.part{k:02d}.tar' in used:
+            while f'sensors/{lg}/{lg}.part{k:02d}.tar.gz' in used:
                 k += 1
-            path = f'sensors/{lg}/{lg}.part{k:02d}.tar'
+            path = f'sensors/{lg}/{lg}.part{k:02d}.tar.gz'
             used.add(path)
             parts.append({'path': path, 'log': lg, 'scenes': [s['name'] for s in g], 'scene_tokens': [s['token'] for s in g],
                           'bytes_est': sum(sizes[s['token']] for s in g)})
@@ -161,8 +162,43 @@ def _inodes(root, names):
     return ino
 
 
+class _Gz:
+    """A gzip file written through pigz (all cores) when there is one, else zlib: `with _Gz(dest) as out` gives a
+    writable stream of the uncompressed tar; afterwards .raw (uncompressed bytes), .bytes and .sha256 of the file.
+    pigz -n leaves out the name and time, so the same tar always gives the same file."""
+    def __init__(self, dest):
+        self.dest = str(dest)
+
+    def __enter__(self):
+        self.raw = 0
+        if shutil.which('pigz'):
+            self.fh = open(self.dest, 'wb')
+            self.proc = subprocess.Popen(['pigz', f'-{GZ_LEVEL}', '-n', '-c'], stdin=subprocess.PIPE, stdout=self.fh)
+            self.sink = self.proc.stdin
+        else:
+            import gzip
+            self.proc, self.fh = None, None
+            self.sink = gzip.GzipFile(self.dest, 'wb', compresslevel=GZ_LEVEL, mtime=0)
+        return self
+
+    def write(self, b):
+        self.raw += len(b)
+        return self.sink.write(b)
+
+    def tell(self):
+        return self.raw
+
+    def __exit__(self, *exc):
+        self.sink.close()
+        if self.proc:
+            if self.proc.wait() != 0:
+                raise RuntimeError(f'pigz failed on {self.dest}')
+            self.fh.close()
+        self.bytes, self.sha256 = os.path.getsize(self.dest), apply_selection_sha(self.dest)
+
+
 def write_tar(root, members, dest, workers=16, window=96):
-    """members: relative paths under root (files). Deterministic headers; returns (bytes, sha256, files).
+    """members: relative paths under root (files), into a .tar.gz. Deterministic; returns (bytes, sha256, files, raw).
     Files are read `workers` at a time, up to `window` ahead, so the HDD can order the seeks (one reader
     gets ~35 MB/s from the scattered token-named files); they are written in order."""
     ino = _inodes(root, [m for m in members if '/' in m])
@@ -172,9 +208,8 @@ def write_tar(root, members, dest, workers=16, window=96):
         p = os.path.join(root, m)
         with open(p, 'rb') as f:
             return os.fstat(f.fileno()), f.read()
-    with open(dest, 'wb') as raw, ThreadPoolExecutor(workers) as pool:
-        hw = _HashWriter(raw)
-        with tarfile.open(fileobj=hw, mode='w', format=tarfile.GNU_FORMAT) as tf:
+    with _Gz(dest) as gz, ThreadPoolExecutor(workers) as pool:
+        with tarfile.open(fileobj=gz, mode='w', format=tarfile.GNU_FORMAT) as tf:
             futs = [pool.submit(read, m) for m in members[:window]]
             for i, m in enumerate(members):
                 st, data = futs[i].result()
@@ -186,7 +221,7 @@ def write_tar(root, members, dest, workers=16, window=96):
                 ti.uid = ti.gid = 0
                 ti.uname = ti.gname = ''
                 tf.addfile(ti, io.BytesIO(data))
-    return hw.n, hw.h.hexdigest(), len(members)
+    return gz.bytes, gz.sha256, len(members), gz.raw
 
 
 def meta_members(root):
@@ -205,9 +240,8 @@ def meta_members(root):
 
 
 def write_meta(root, dest):
-    with open(dest, 'wb') as raw:
-        hw = _HashWriter(raw)
-        with tarfile.open(fileobj=hw, mode='w', format=tarfile.GNU_FORMAT) as tf:
+    with _Gz(dest) as gz:
+        with tarfile.open(fileobj=gz, mode='w', format=tarfile.GNU_FORMAT) as tf:
             tf.copybufsize = 4 << 20
             for arc, p in meta_members(root):
                 st = os.stat(p)
@@ -215,7 +249,7 @@ def write_meta(root, dest):
                 ti.size, ti.mtime, ti.mode, ti.uid, ti.gid, ti.uname, ti.gname = st.st_size, int(st.st_mtime), 0o644, 0, 0, '', ''
                 with open(p, 'rb') as f:
                     tf.addfile(ti, f)
-    return hw.n, hw.h.hexdigest()
+    return gz.bytes, gz.sha256
 
 
 # ---------------------------------------------------------------- where it goes
@@ -274,7 +308,7 @@ class DirRemote:
         for p in d.rglob('*') if d.is_dir() else []:
             if p.is_file():
                 rel = p.relative_to(d).as_posix()
-                out[rel] = apply_selection_sha(p) if p.suffix == '.tar' else None
+                out[rel] = apply_selection_sha(p) if rel.endswith(('.tar', '.tar.gz')) else None
         return out
 
     def read_json(self, path, rev=None):
@@ -374,7 +408,8 @@ Driving data from the T-Car test vehicle (six cameras, a roof LiDAR, RTK INS) in
 [nuScenes](https://www.nuscenes.org/) `v1.0-trainval` format: load it with the `nuscenes-devkit` as is.
 
 **{tot['scenes']} scenes** of 20 s ({hours:.2f} h) from **{tot['logs']} recordings** · {tot['samples']:,} key-frame samples ·
-{tot['sample_data']:,} sensor frames · {tot['bytes'] / 1e9:.0f} GB in {len(shards)} sensor tars + 1 table tar.
+{tot['sample_data']:,} sensor frames · {tot['bytes'] / 1e9:.0f} GB to download in {len(shards)} sensor tars + 1 table tar
+({tot.get('raw_bytes', tot['bytes']) / 1e9:.0f} GB unpacked).
 Every scene was curated and locked (see [Curation](#curation)). {('No 3D box annotations (`sample_annotation` is empty).' if not tot.get('annotations') else '')}
 
 ## Download and use
@@ -414,10 +449,10 @@ the tables are replaced. Add `--delete-tars` to `assemble.py` to remove each tar
 Each release is a branch of this repository (`--revision <name>`), a complete dataset on its own; a release
 is never changed after it is published. Later releases only **add** data:
 
-- `sensors/<recording>/<recording>.partNN.tar` — the sensor files (`samples/`, `sweeps/`) of a group of whole
-  scenes of one recording, at most 10 GB. Once published, a tar never changes and is carried into every
+- `sensors/<recording>/<recording>.partNN.tar.gz` — the sensor files (`samples/`, `sweeps/`) of a group of whole
+  scenes of one recording, at most 10 GB unpacked (gzip: the LiDAR files shrink by about a third, the JPEGs not). Once published, a tar never changes and is carried into every
   later release (stored once).
-- `meta/TCar_meta.tar` — the tables (`v1.0-trainval/`), `can_bus/`, `maps/`, the per-recording `*.import.json`
+- `meta/TCar_meta.tar.gz` — the tables (`v1.0-trainval/`), `can_bus/`, `maps/`, the per-recording `*.import.json`
   (how each recording was converted) and `curation/`. The only file that changes between releases.
 - `manifest.json` — every tar with its recording, scene tokens, files, bytes and sha256, and the release history.
 - Scene tokens never change. Scene names (`scene-0001`, …) are the nuScenes train split names in recording
@@ -570,7 +605,8 @@ def main():
                 'scenes': len(ds['scenes']), 'parser_commit': commit, 'parser_dirty': dirty}]
             man = {'release': args.branch, 'releases': rels, 'shards': shards, 'channels': ds['channels'], 'logs': ds['log_info'],
                    'totals': {'scenes': len(ds['scenes']), 'logs': len(ds['by_log']), 'samples': ds['samples'],
-                              'sample_data': ds['sample_data'], 'bytes': sum(x['bytes'] for x in shards),
+                              'sample_data': ds['sample_data'], 'bytes': round(sum(x['bytes'] for x in shards) * 0.86),
+                              'raw_bytes': sum(x['bytes'] for x in shards),
                               'seconds': ds['seconds'], 'annotations': ds['annotations']}}
             Path(args.readme_out).write_text(readme(man, args.repo), encoding='utf-8')
             log(f'README preview: {args.readme_out}')
@@ -591,26 +627,27 @@ def main():
     lock_ = threading.Lock()
 
     def build(p):
-        dest = os.path.join(args.stage, os.path.basename(p['path']))
+        dest = Path(args.stage) / os.path.basename(p['path'])
         members = [f for t in p['scene_tokens'] for f in ds['files'].get(t, [])]
         t0 = time.time()
-        n, sha, k = write_tar(root, members, dest)
-        log(f"built {p['path']}: {n / 1e9:.2f} GB, {k} files in {time.time() - t0:.0f} s ({n / 1e6 / max(time.time() - t0, 1e-6):.0f} MB/s)")
-        return dest, n, sha, k
+        n, sha, k, raw = write_tar(root, members, dest)
+        dt = max(time.time() - t0, 1e-6)
+        log(f"built {p['path']}: {raw / 1e9:.2f} GB -> {n / 1e9:.2f} GB gz, {k} files in {dt:.0f} s ({raw / 1e6 / dt:.0f} MB/s)")
+        return dest, n, sha, k, raw
 
     todo = [p for p in parts if not (p['path'] in state['shards'] and have.get(p['path']) == state['shards'][p['path']]['sha256'])]
     log(f'{len(parts) - len(todo)} of {len(parts)} tars are up already; {len(todo)} to go')
     with ThreadPoolExecutor(1) as pool:                # build the next tar while this one uploads
         fut = pool.submit(build, todo[0]) if todo else None
         for i, p in enumerate(todo):
-            dest, n, sha, k = fut.result()
+            dest, n, sha, k, raw = fut.result()
             fut = pool.submit(build, todo[i + 1]) if i + 1 < len(todo) else None
             t0 = time.time()
             remote.put(dest, p['path'], f"{args.branch}: {p['path']} ({len(p['scenes'])} scenes)")
             log(f"uploaded [{i + 1}/{len(todo)}] {p['path']} in {time.time() - t0:.0f} s ({n / 1e6 / max(time.time() - t0, 1e-6):.0f} MB/s)")
             with lock_:
                 state['shards'][p['path']] = {k_: v for k_, v in p.items() if k_ != 'bytes_est'} | {
-                    'bytes': n, 'sha256': sha, 'files': k, 'release': args.branch}
+                    'bytes': n, 'raw_bytes': raw, 'sha256': sha, 'files': k, 'release': args.branch}
                 with open(state_path + '.tmp', 'w') as f:
                     json.dump(state, f, indent=1)
                 os.replace(state_path + '.tmp', state_path)
@@ -636,7 +673,8 @@ def main():
         'lock_rounds': [r['stamp'] for r in apply_selection.lock_rounds(os.path.join(root, 'selection'))]}]
     man = {'dataset': 'T-Car nuScenes', 'version': VERSION, 'layout': LAYOUT, 'release': args.branch,
            'totals': {'scenes': len(ds['scenes']), 'logs': len(ds['by_log']), 'samples': ds['samples'],
-                      'sample_data': ds['sample_data'], 'bytes': sum(s['bytes'] for s in shards), 'seconds': round(ds['seconds'], 1),
+                      'sample_data': ds['sample_data'], 'bytes': sum(s['bytes'] for s in shards),
+                      'raw_bytes': sum(s.get('raw_bytes', s['bytes']) for s in shards), 'seconds': round(ds['seconds'], 1),
                       'annotations': ds['annotations']},
            'channels': ds['channels'], 'logs': ds['log_info'],
            'meta': {'path': META_PATH, 'bytes': mn, 'sha256': msha}, 'releases': rels, 'shards': shards}

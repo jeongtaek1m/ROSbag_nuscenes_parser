@@ -68,14 +68,22 @@ def load_dataset(root):
         a, b = span.get(smp['scene_token'], (smp['timestamp'], smp['timestamp']))
         span[smp['scene_token']] = (min(a, smp['timestamp']), max(b, smp['timestamp']))
     seconds = sum((b - a) / 1e6 + 0.5 for a, b in span.values())     # key frames every 0.5 s
-    files = {}                                    # scene token -> [sensor file names]
+    files, chans = {}, {}                         # scene token -> [sensor file names]; channel -> [frames, w, h, key]
     for sd in rd('sample_data'):
         files.setdefault(scene_of[sd['sample_token']], []).append(sd['filename'])
+        c = chans.setdefault(sd['filename'].split('/')[1], [0, sd['width'], sd['height'], 0])
+        c[0] += 1
+        c[3] += sd['is_key_frame']
     by_log = {}
     for s in sorted(scenes, key=lambda s: s['name']):
         by_log.setdefault(logfile[s['log_token']], []).append(s)
+    hz = {ch: round(c[0] / seconds, 1) for ch, c in chans.items()}
     return {'scenes': scenes, 'by_log': by_log, 'files': files, 'samples': len(samples), 'seconds': seconds,
-            'sample_data': sum(len(v) for v in files.values())}
+            'sample_data': sum(len(v) for v in files.values()),
+            'channels': {ch: {'frames': c[0], 'hz': hz[ch], 'width': c[1], 'height': c[2], 'key_frames': c[3]}
+                         for ch, c in sorted(chans.items())},
+            'log_info': {l['logfile']: {'date': l.get('date_captured', ''), 'location': l.get('location', '')} for l in logs},
+            'annotations': len(rd('sample_annotation'))}
 
 
 def scene_bytes(root, ds):
@@ -315,24 +323,64 @@ the NovAtel INSPVA solution (100 Hz, RTK), placed at the receiver's GPS measurem
 """
 
 
+def _course(log):
+    return log.split('-', 1)[0] if '-' in log else log
+
+
+def _short(log):
+    return log.split('_', 1)[0]                   # A-1_2026-09-28-14-40-58 -> A-1
+
+
+def _order(log):
+    m = re.match(r'([A-Za-z]+)-(\d+)', log)
+    return (m.group(1), int(m.group(2)), log) if m else (log, 0, log)
+
+
 def readme(man, repo):
+    """The dataset card (README.md), written from the manifest every release."""
     rel, tot = man['release'], man['totals']
     hours = tot['seconds'] / 3600
-    rows = '\n'.join(f"| `{r['name']}` | {r['created'][:10]} | {len(r['new_logs'])} | {r['new_scenes']} | {r['scenes']} | "
-                     f"{r['parser_commit'][:7]}{' (dirty)' if r.get('parser_dirty') else ''} |" for r in man['releases'])
-    logs = {}
-    for s in man['shards']:
-        logs.setdefault(s['log'], []).append(s)
-    log_rows = '\n'.join(f"| {lg} | {sum(len(s['scene_tokens']) for s in ss)} | {len(ss)} | {sum(s['bytes'] for s in ss) / 1e9:.1f} | "
-                         f"`{ss[0]['release']}` |" for lg, ss in sorted(logs.items()))
-    return f"""# T-Car nuScenes (v1.0-trainval layout) — release `{rel}`
+    shards = man['shards']
+    by_log = {}
+    for sh in shards:
+        by_log.setdefault(sh['log'], []).append(sh)
+    info = man.get('logs', {})
+    courses = {}
+    for lg, ss in by_log.items():
+        c = courses.setdefault(_course(lg), {'logs': 0, 'scenes': 0, 'gb': 0.0, 'dates': set()})
+        c['logs'] += 1
+        c['scenes'] += sum(len(x['scene_tokens']) for x in ss)
+        c['gb'] += sum(x['bytes'] for x in ss) / 1e9
+        c['dates'].add((info.get(lg) or {}).get('date') or lg.split('_')[-1][:10])
+    course_rows = '\n'.join(f"| {k} | {', '.join(sorted(v['dates']))} | {v['logs']} | {v['scenes']} | {v['scenes'] * 20 / 60:.0f} min | {v['gb']:.0f} |"
+                            for k, v in sorted(courses.items()))
+    ch = man.get('channels', {})
+    ch_rows = '\n'.join(f"| `{k}` | {'camera' if k.startswith('CAM') else 'lidar'} | "
+                        f"{f'{v['width']}×{v['height']} JPEG' if v['width'] else 'point cloud (.pcd.bin)'} | "
+                        f"{v['hz']:.0f} Hz | {v['frames']:,} |" for k, v in ch.items())
+    rel_rows = '\n'.join(f"| `{r['name']}` | {r['created'][:10]} | {', '.join(_short(x) for x in sorted(r['new_logs'], key=_order)) or '—'} | {r['new_scenes']} | {r['scenes']} | "
+                         f"`{r['parser_commit'][:7]}`{' (+local changes)' if r.get('parser_dirty') else ''} |" for r in man['releases'])
+    log_rows = '\n'.join(f"| {lg} | {(info.get(lg) or {}).get('date', '')} | {sum(len(x['scene_tokens']) for x in ss)} | {len(ss)} | "
+                         f"{sum(x['bytes'] for x in ss) / 1e9:.1f} | `{ss[0]['release']}` |" for lg, ss in sorted(by_log.items(), key=lambda kv: _order(kv[0])))
+    first = next((r['name'] for r in man['releases']), rel)
+    prev = man['releases'][-2]['name'] if len(man['releases']) > 1 else None
+    update_note = (f"Coming from `{prev}`: run the two commands above in the same directories — only the tars new in "
+                   f"`{rel}` are downloaded and extracted." if prev else
+                   "when a newer release is out, run the same two commands with its name as `--revision`, in the same "
+                   "directories: only the new tars are downloaded and extracted.")
+    return f"""# T-Car nuScenes — release `{rel}`
 
-{tot['scenes']} scenes ({hours:.2f} h, 20 s each) from {tot['logs']} recordings · {tot['samples']:,} samples ·
-{tot['sample_data']:,} sample_data · {tot['bytes'] / 1e9:.0f} GB in {len(man['shards'])} sensor tars + 1 table tar.
-Six cameras, LIDAR_TOP, INSPVA ego pose and CAN bus. Curated: every scene here was reviewed and locked
-(see *Curation*).
+Driving data from the T-Car test vehicle (six cameras, a roof LiDAR, RTK INS) in the
+[nuScenes](https://www.nuscenes.org/) `v1.0-trainval` format: load it with the `nuscenes-devkit` as is.
 
-## Download
+**{tot['scenes']} scenes** of 20 s ({hours:.2f} h) from **{tot['logs']} recordings** · {tot['samples']:,} key-frame samples ·
+{tot['sample_data']:,} sensor frames · {tot['bytes'] / 1e9:.0f} GB in {len(shards)} sensor tars + 1 table tar.
+Every scene was curated and locked (see [Curation](#curation)). {('No 3D box annotations (`sample_annotation` is empty).' if not tot.get('annotations') else '')}
+
+## Download and use
+
+1. Request access on this page (the dataset is gated), and log in: `hf auth login`.
+2. Download this release and put it together (`assemble.py` checks every tar's sha256 and extracts it):
 
 ```bash
 pip install -U huggingface_hub
@@ -342,43 +390,98 @@ python tcar_tars/assemble.py --tars tcar_tars --out tcar_nuscenes
 
 ```python
 from nuscenes.nuscenes import NuScenes
+from nuscenes.can_bus.can_bus_api import NuScenesCanBus
 nusc = NuScenes(version="v1.0-trainval", dataroot="tcar_nuscenes")
+can = NuScenesCanBus(dataroot="tcar_nuscenes")      # pose, ms_imu, meta per scene
 ```
 
-**Updating to a newer release**: run the same two commands with the new `--revision`. `hf download`
-fetches only the tars you do not have; `assemble.py` extracts only the new sensor tars and replaces
-the tables. Nothing you already extracted changes.
+**Some recordings only**: download the tables and the recordings you want, and let `assemble.py` skip the rest
+(the tables still list every scene; the files of the others are just absent):
 
-## Layout and how releases grow
+```bash
+hf download {repo} --repo-type dataset --revision {rel} --local-dir tcar_tars \\
+    --include "manifest.json" --include "assemble.py" --include "meta/*" \\
+    --include "sensors/A-1_*/*" --include "sensors/B-2_*/*"
+python tcar_tars/assemble.py --tars tcar_tars --out tcar_nuscenes --allow-missing
+```
 
-- `sensors/<recording>/<recording>.partNN.tar` — the sensor files (`samples/`, `sweeps/`) of a group of
-  scenes of one recording. Published once, never changed: curated scenes are locked, so later releases
-  only add tars for new recordings.
-- `meta/TCar_meta.tar` — `v1.0-trainval/` tables, `can_bus/`, `maps/`, the per-recording `*.import.json`
-  and `curation/` (decision lists). Replaced by every release.
-- `manifest.json` — every tar with its recording, scene tokens, size and sha256, and the release history.
-- `assemble.py` — builds / updates the dataset directory from the tars (Python, standard library).
+**Updating**: {update_note} Nothing already extracted is changed;
+the tables are replaced. Add `--delete-tars` to `assemble.py` to remove each tar after extracting it (then
+`hf download` fetches it again next time).
 
-Each release is its own branch (`--revision <name>`); earlier releases stay as they were.
+## Releases and versioning
 
-| release | date | new recordings | new scenes | scenes in total | parser |
+Each release is a branch of this repository (`--revision <name>`), a complete dataset on its own; a release
+is never changed after it is published. Later releases only **add** data:
+
+- `sensors/<recording>/<recording>.partNN.tar` — the sensor files (`samples/`, `sweeps/`) of a group of whole
+  scenes of one recording, at most 10 GB. Once published, a tar never changes and is carried into every
+  later release (stored once).
+- `meta/TCar_meta.tar` — the tables (`v1.0-trainval/`), `can_bus/`, `maps/`, the per-recording `*.import.json`
+  (how each recording was converted) and `curation/`. The only file that changes between releases.
+- `manifest.json` — every tar with its recording, scene tokens, files, bytes and sha256, and the release history.
+- Scene tokens never change. Scene names (`scene-0001`, …) are the nuScenes train split names in recording
+  order; the names of released scenes do not change either. All scenes are in the `train` split.
+
+| release | date | recordings added | scenes added | scenes in total | parser commit |
 |---|---|---|---|---|---|
-{rows}
+{rel_rows}
+
+The `main` branch holds an earlier upload (2026-09-23 recordings, one tar per channel, its own scene
+numbering), not part of this series.
+
+## Contents
+
+| course | dates | recordings | scenes | time | GB |
+|---|---|---|---|---|---|
+{course_rows}
+
+| channel | sensor | data | rate | frames |
+|---|---|---|---|---|
+{ch_rows}
+
+Key frames (`samples/`) are 2 Hz, synchronised across the seven sensors as in nuScenes; every other frame
+is a sweep (`sweeps/`). LiDAR files hold five float32 per point (x, y, z, intensity, ring), as in nuScenes.
+`calibrated_sensor` holds the intrinsics and extrinsics, one set per recording.
 
 ## Curation
 
-Scenes are filtered in a fixed order — (1) same-place stops, keeping the one with the most surrounding
-motion, (2) few road users nearby (< 3 per sample, 6 cameras, YOLO), (3) the same road driven the same
-way (≥ 60 % of the path) — and a filter only proposes; a person confirmed every deletion. A release
-contains locked scenes only. `curation/deleted.txt` lists the scenes taken out, `curation/keep.txt` the
-ones kept and why.
+Recordings are cut into 20 s scenes, then filtered in a fixed order; a scene a filter catches is only a
+candidate, and a person confirmed every deletion:
+
+1. **Same-place stops** — scenes standing still (≥ 80 % of the time) at the same place in a recording: the one
+   with the most motion around it (LiDAR change) stays.
+2. **Few road users** — fewer than 3 nearby road users per sample (cars, buses, trucks, people, bicycles,
+   motorcycles; box height ≥ 50 px over the six cameras; YOLO).
+3. **Same road** — the same path driven the same way as a scene already kept (≥ 60 % of the path within
+   10 m / 30°), across recordings.
+
+A curation round ends by deleting the confirmed scenes and **locking** the rest; locked scenes are never
+removed later, which is what lets releases only grow. `curation/deleted.txt` lists the scenes taken out,
+`curation/keep.txt` the scenes kept and why, `curation/locked.json` the rounds.
 
 {FRAMES}
 ## Recordings
 
-| recording | scenes | tars | GB | first release |
-|---|---|---|---|---|
+| recording | date | scenes | tars | GB | first release |
+|---|---|---|---|---|---|
 {log_rows}
+
+## Maintainers: making the next release
+
+Releases are made with `scripts/hf_release.py` of the parser repository (`ROSbag_nuscenes_parser`, branch
+`tcar-gui`; the commit of each release is in the table above):
+
+```bash
+# new recordings: parse them, curate them in the TCAR Parser app, press 최종 확정, then
+python scripts/hf_release.py --branch <new> --from {rel} --token-file <hf token file>            # plan
+python scripts/hf_release.py --branch <new> --from {rel} --token-file <hf token file> --upload   # build + upload
+```
+
+It refuses to publish unless every scene is locked and the dataset passes the checks (table references,
+devkit, CAN bus), and unless every tar already published still matches the dataset. Only the new recordings'
+tars are built and uploaded (one commit each, resumable); the tables, manifest, this card and `assemble.py`
+go last. First release of this series: `{first}`.
 """
 
 
@@ -405,6 +508,7 @@ def main():
     ap.add_argument('--token-file', default=None, help='text file with the hf_ token (default: $HF_TOKEN / hf login)')
     ap.add_argument('--to-dir', default=None, help='write the repo into this directory instead of Hugging Face')
     ap.add_argument('--skip-check', action='store_true', help='skip the dataset check (tables, devkit, CAN bus)')
+    ap.add_argument('--readme-out', default=None, help='with the plan: write the README this release would get here')
     args = ap.parse_args()
     root = os.path.realpath(args.dataroot)
 
@@ -456,6 +560,20 @@ def main():
         log(f"the base has no manifest (an older upload): its {len(legacy)} files are removed from this branch "
             f"(they stay on {args.base}): {legacy[:6]}{' …' if len(legacy) > 6 else ''}")
     if not args.upload:
+        if args.readme_out:                      # the card as it would be (sizes estimated, no sha256 yet)
+            commit, dirty = git_state()
+            shards = published + [dict(p, bytes=p['bytes_est'], release=args.branch) for p in parts]
+            mine = [x for x in shards if x['release'] == args.branch]
+            rels = [r for r in prev.get('releases', []) if r['name'] != args.branch] + [{
+                'name': args.branch, 'created': datetime.datetime.now().astimezone().isoformat(timespec='seconds'),
+                'new_logs': sorted({x['log'] for x in mine}), 'new_scenes': sum(len(x['scene_tokens']) for x in mine),
+                'scenes': len(ds['scenes']), 'parser_commit': commit, 'parser_dirty': dirty}]
+            man = {'release': args.branch, 'releases': rels, 'shards': shards, 'channels': ds['channels'], 'logs': ds['log_info'],
+                   'totals': {'scenes': len(ds['scenes']), 'logs': len(ds['by_log']), 'samples': ds['samples'],
+                              'sample_data': ds['sample_data'], 'bytes': sum(x['bytes'] for x in shards),
+                              'seconds': ds['seconds'], 'annotations': ds['annotations']}}
+            Path(args.readme_out).write_text(readme(man, args.repo), encoding='utf-8')
+            log(f'README preview: {args.readme_out}')
         log('plan only: add --upload to build and upload')
         return
 
@@ -518,7 +636,9 @@ def main():
         'lock_rounds': [r['stamp'] for r in apply_selection.lock_rounds(os.path.join(root, 'selection'))]}]
     man = {'dataset': 'T-Car nuScenes', 'version': VERSION, 'layout': LAYOUT, 'release': args.branch,
            'totals': {'scenes': len(ds['scenes']), 'logs': len(ds['by_log']), 'samples': ds['samples'],
-                      'sample_data': ds['sample_data'], 'bytes': sum(s['bytes'] for s in shards), 'seconds': round(ds['seconds'], 1)},
+                      'sample_data': ds['sample_data'], 'bytes': sum(s['bytes'] for s in shards), 'seconds': round(ds['seconds'], 1),
+                      'annotations': ds['annotations']},
+           'channels': ds['channels'], 'logs': ds['log_info'],
            'meta': {'path': META_PATH, 'bytes': mn, 'sha256': msha}, 'releases': rels, 'shards': shards}
     remote.commit({META_PATH: meta_dest, 'manifest.json': json.dumps(man, ensure_ascii=False, indent=1),
                    'README.md': readme(man, args.repo), 'assemble.py': (HERE / 'hf_assemble.py').read_text(encoding='utf-8')},

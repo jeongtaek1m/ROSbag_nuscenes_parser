@@ -47,6 +47,8 @@ def main():
     ap.add_argument('--tars', required=True, help='the downloaded repository (manifest.json, meta/, sensors/)')
     ap.add_argument('--out', required=True, help='the dataset directory to build or update (nuScenes dataroot)')
     ap.add_argument('--no-verify', action='store_true', help='skip the sha256 check of each tar before extracting')
+    ap.add_argument('--allow-missing', action='store_true', help='skip the sensor tars that were not downloaded '
+                    '(hf download --include ... for some recordings only); their scenes have no files')
     ap.add_argument('--delete-tars', action='store_true', help='delete each tar once extracted (saves space; '
                     'hf download then fetches it again next time, so keep them if you will update)')
     args = ap.parse_args()
@@ -66,7 +68,11 @@ def main():
     for k, s in enumerate(todo, 1):
         path = os.path.join(args.tars, s['path'])
         if not os.path.isfile(path):
-            sys.exit(f'missing {s["path"]}: download the release again (hf download ... --local-dir {args.tars})')
+            if args.allow_missing:
+                print(f"  [{k}/{len(todo)}] {s['path']}: not downloaded, skipped")
+                continue
+            sys.exit(f'missing {s["path"]}: download the release again (hf download ... --local-dir {args.tars}), '
+                     'or --allow-missing for some recordings only')
         if not args.no_verify and sha256(path) != s['sha256']:
             sys.exit(f'{s["path"]}: sha256 does not match the manifest (incomplete download?)')
         print(f"  [{k}/{len(todo)}] {s['path']}  ({s['bytes'] / 1e9:.1f} GB, {s['files']} files)", flush=True)

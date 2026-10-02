@@ -1,30 +1,43 @@
 #!/usr/bin/env python3
-"""Korean desktop workflow for T-Car ROS 1 bags → nuScenes.
+"""Korean desktop workflow for T-Car ROS 1 bags → nuScenes, and the dataset's curation.
 
 Run: python gui.py [--data <data root>]   (default /data)
 Data layout: raw/<course>/<bag>, raw/_excluded/<course>/<bag>, parsed/tcar_nuscenes, logs/.
 A course is the letter of a bag's name (A-1_2026-09-28-14-40-58.bag → A); every course
-feeds the one dataset. Conversion remains in the existing subprocess CLIs.
+feeds the one dataset. Curation (curation/: detect, rule, review, apply) works on that
+dataset; its review viewer runs inside the window. Conversion and curation remain in
+the existing subprocess CLIs.
 """
 from __future__ import annotations
 
 import argparse
 import codecs
 import json
+import math
+import os
 import re
 import shutil
+import socket
 import struct
+import subprocess
 import sys
 import time
 from datetime import datetime
 from pathlib import Path
 
 try:
-    from PySide6 import QtCore, QtGui, QtWidgets
+    from PySide6 import QtCore, QtGui, QtNetwork, QtWidgets
     Signal = QtCore.Signal
 except ImportError:
-    from PyQt5 import QtCore, QtGui, QtWidgets
+    from PyQt5 import QtCore, QtGui, QtNetwork, QtWidgets
     Signal = QtCore.pyqtSignal
+try:                            # the review viewer inside the window; without it, a browser tab
+    if QtCore.__name__.startswith("PySide6"):
+        from PySide6.QtWebEngineWidgets import QWebEngineView
+    else:
+        from PyQt5.QtWebEngineWidgets import QWebEngineView
+except ImportError:
+    QWebEngineView = None
 
 HERE = Path(__file__).resolve().parent
 Qt = QtCore.Qt
@@ -36,6 +49,7 @@ DATASET = "tcar_nuscenes"                           # parsed/<DATASET>: every co
 VERSION = "v1.0-trainval"
 DEFAULT_ROOT = Path("/data")
 ASSETS = HERE / "assets"
+CURATION = HERE / "curation"
 FONT = "Pretendard"
 C = {
     "bg": "#0c0c0e", "side": "#111113", "surface": "#161618", "hover": "#1c1c1f",
@@ -67,6 +81,7 @@ QPushButton#primary:hover { background: #ffffff; }
 QPushButton#primary:disabled { background: %(hover)s; color: %(faint)s; }
 QPushButton#danger { color: %(bad)s; }
 QPushButton#danger:hover { background: rgba(240, 112, 104, 20); border-color: rgba(240, 112, 104, 90); }
+QPushButton#danger:disabled { color: %(faint)s; background: transparent; border-color: %(line)s; }
 QPushButton#quiet { background: transparent; border: none; color: %(sub)s; padding: 6px 8px; }
 QPushButton#quiet:hover { color: %(text)s; background: %(hover)s; }
 QPushButton#quiet:disabled { color: %(faint)s; }
@@ -97,6 +112,11 @@ QCheckBox::indicator:hover { border-color: %(sub)s; }
 QCheckBox::indicator:checked { background: %(text)s; border-color: %(text)s; image: url(%(check)s); }
 QCheckBox::indicator:disabled { border-color: %(line)s; }
 QFrame#jobBar { background: %(side)s; border-top: 1px solid %(line)s; }
+QFrame#segment { background: %(surface)s; border: 1px solid %(line2)s; border-radius: 8px; }
+QPushButton#seg { background: transparent; border: none; border-radius: 6px; padding: 6px 10px; color: %(sub)s; }
+QPushButton#seg:hover { color: %(text)s; }
+QPushButton#seg:checked { background: %(line2)s; color: %(text)s; font-weight: 600; }
+QPushButton#seg:disabled { color: %(faint)s; }
 QProgressBar { background: transparent; border: none; }
 QProgressBar::chunk { background: %(accent)s; }
 QPlainTextEdit { background: %(bg)s; border: 1px solid %(line)s; border-radius: 8px; padding: 8px;
@@ -223,7 +243,8 @@ def recording_info(p: Path) -> dict:
 
 def parsed_status(dataroot: Path) -> dict:
     version = dataroot / VERSION
-    empty = {"logs": {}, "samples_by_log": {}, "scenes": 0, "samples": 0, "error": ""}
+    empty = {"logs": {}, "samples_by_log": {}, "scenes": 0, "samples": 0, "names": [], "names_by_log": {},
+             "imported": set(), "error": ""}
     if not version.exists():
         return empty
     try:
@@ -232,13 +253,18 @@ def parsed_status(dataroot: Path) -> dict:
         by_token = {row["token"]: row["logfile"] for row in logs}
         per = {row["logfile"]: 0 for row in logs}
         per_samples = {row["logfile"]: 0 for row in logs}
+        names_by_log = {row["logfile"]: [] for row in logs}
         samples = 0
         for scene in scenes:
             per[by_token[scene["log_token"]]] += 1
             per_samples[by_token[scene["log_token"]]] += scene["nbr_samples"]
+            names_by_log[by_token[scene["log_token"]]].append(scene["name"])
             samples += scene["nbr_samples"]
-        return {"logs": per, "samples_by_log": per_samples, "scenes": len(scenes),
-                "samples": samples, "error": ""}
+        # parsed logs curation took every scene out of: gone from log.json, import record kept
+        imported = set(per) | {f.name[:-len(".import.json")] for f in dataroot.glob("*.import.json")}
+        return {"logs": per, "samples_by_log": per_samples, "scenes": len(scenes), "samples": samples,
+                "names": sorted(sc["name"] for sc in scenes), "names_by_log": names_by_log,
+                "imported": imported, "error": ""}
     except (OSError, ValueError, KeyError, TypeError):
         return dict(empty, error="데이터셋 목록을 읽을 수 없습니다. 검증 로그를 확인하세요.")
 
@@ -248,7 +274,63 @@ def course_status(status: dict, course: str) -> dict:
     logs = {n: k for n, k in status["logs"].items() if detect_route(Path(n)) == course}
     return {"logs": logs, "scenes": sum(logs.values()),
             "samples": sum(status["samples_by_log"].get(n, 0) for n in logs),
+            "imported": {n for n in status["imported"] if detect_route(Path(n)) == course},
             "error": status["error"]}
+
+
+_IMPORT_CACHE: dict[tuple, dict | None] = {}
+
+
+def import_stats(dataroot: Path, name: str) -> dict | None:
+    """What a parsed log's <log>.import.json says about its time: the recording's span,
+    the seconds that became scenes at parse time, and where the rest went."""
+    path = dataroot / f"{name}.import.json"
+    try:
+        key = (str(path), path.stat().st_mtime_ns)
+    except OSError:
+        return None
+    if key not in _IMPORT_CACHE:
+        out = None
+        try:
+            data = json.loads(path.read_text())
+            cw, plan, part = data["coverage_window"], data["frame_plan"], data["scene_partition"]
+            lidar = cw["streams"]["LIDAR_TOP"]
+            period = (lidar["last_ns"] - lidar["first_ns"]) / 1e9 / max(data["n_frames"]["LIDAR_TOP"] - 1, 1)
+            orig = (cw["latest_ns"] - cw["earliest_ns"]) / 1e9
+            used = part["frames_in_scenes"] * period
+            short = part["frames_unused"] * period
+            camera = plan["n_no_camera_set"] * period
+            out = {"orig_s": orig, "parsed_s": used, "short_s": short, "camera_s": camera,
+                   "other_s": max(orig - used - short - camera, 0.0),
+                   "n_scenes": part["n_scenes"], "scene_s": part["frames_per_scene"] * period,
+                   "lidar_gaps": plan.get("n_lidar_gaps", 0), "source": data.get("source_bag") or ""}
+        except (OSError, ValueError, KeyError, TypeError, AttributeError):
+            out = None
+        _IMPORT_CACHE[key] = out
+    return _IMPORT_CACHE[key]
+
+
+def log_time(dataroot: Path, name: str, scenes_now: int) -> dict | None:
+    """import_stats with the dataset as it is now: scenes curation took out count as lost."""
+    st = import_stats(dataroot, name)
+    if not st:
+        return None
+    curated = max(st["n_scenes"] - scenes_now, 0)
+    return dict(st, used_s=scenes_now * st["scene_s"], curated_n=curated, curated_s=curated * st["scene_s"])
+
+
+def loss_text(st: dict) -> str:
+    """One recording's time, from the original span down to the dataset."""
+    parts = [f"원본 {st['orig_s']:.1f}초 중 데이터셋 {st['used_s']:.1f}초 ({100 * st['used_s'] / st['orig_s']:.1f}%)"]
+    if st.get("curated_n"):
+        parts.append(f"큐레이션으로 뺀 씬 {st['curated_n']}개 {st['curated_s']:.1f}초")
+    for key, name in (("short_s", "20초 미만 자투리"), ("camera_s", "카메라 누락·동기 벗어남"),
+                      ("other_s", "센서 시작·종료 구간")):
+        if st[key] >= 0.05:
+            parts.append(f"{name} {st[key]:.1f}초")
+    if st["lidar_gaps"]:
+        parts.append(f"LiDAR 프레임 끊김 {st['lidar_gaps']}회")
+    return "\n".join(parts)
 
 
 def dataset_only_info(dataroot: Path, name: str) -> dict:
@@ -258,15 +340,143 @@ def dataset_only_info(dataroot: Path, name: str) -> dict:
     m, when = BAG_RE.match(name), _bag_time(name)
     if m:
         rec.update(label=f"{m['course']}-{m['num']}", date=f"{when:%Y-%m-%d}", when=f"{when:%Y-%m-%d %H:%M}")
-    try:
-        data = json.loads((dataroot / f"{name}.import.json").read_text())
-        cw = data.get("coverage_window", {})
-        if cw.get("latest_ns") and cw.get("earliest_ns"):
-            rec["duration"] = (cw["latest_ns"] - cw["earliest_ns"]) / 1e9
-        rec["path"] = data.get("source_bag", "") or ""
-    except (OSError, ValueError, AttributeError, TypeError):
-        pass
+    st = import_stats(dataroot, name)
+    if st:
+        rec["duration"], rec["path"] = st["orig_s"], st["source"]
     return rec
+
+
+def _mtime(p: Path) -> float:
+    try:
+        return p.stat().st_mtime
+    except OSError:
+        return 0.0
+
+
+def decisions_dir() -> str:
+    """Where the confirmed lists (human_decisions.json, keep.txt, drop.txt, deleted.txt) are copied besides the
+    dataset's selection/: the saved choice, else this checkout's curation/ when it is writable (not in the
+    AppImage). The review server and the jobs get it as $TCAR_DECISIONS_DIR."""
+    saved = str(SETTINGS.value("decisions_dir", ""))
+    if not saved and os.access(CURATION, os.W_OK):
+        saved = str(CURATION)
+        SETTINGS.setValue("decisions_dir", saved)
+    return saved
+
+
+def curation_data(dataroot: Path) -> dict:
+    """curation/'s state for the whole dataset. A scene a filter caught is a candidate (후보, per filter: 객체 부족,
+    정지 중복); the rest passed the filters (필터 통과). A person confirms in the review (남기기 확정 / 버리기 확정,
+    human_decisions.json); the final deletion takes the confirmed 버리기 scenes out (삭제 완료, _removed/<stamp>/)."""
+    sel = dataroot / "selection"
+
+    def read(name):
+        try:
+            data = json.loads((sel / name).read_text())
+            return data if isinstance(data, dict) else {}
+        except (OSError, ValueError):
+            return {}
+    decisions = read("human_decisions.json").get("decisions") or {}
+    result = read("result.json")
+    rule = result.get("scenes") or {}
+    counts = read("object_counts.json")
+    backups, deleted, deleted_logs = [], 0, []
+    for m in sorted((dataroot / "_removed").glob("*/manifest.json")):
+        if (m.parent / "UNDONE").exists():
+            continue
+        backups.append(m.parent)
+        try:
+            man = json.loads(m.read_text())
+        except (OSError, ValueError):
+            continue
+        if man.get("done"):
+            deleted += len(man.get("deleted") or [])
+            deleted_logs += [x.get("log") for x in man.get("scenes") or []]   # for their time (older backups: none)
+    return {"detected": set(counts.get("scenes") or {}), "ruled": set(rule),
+            # locked by an earlier round's 최종 확정 (apply_selection.py --finalize): never deleted, never candidates
+            "locked": {n for n, v in rule.items() if (v or {}).get("locked")},
+            "rounds": read("locked.json").get("rounds") or [],
+            # the filters' evidence: per-scene near road users, the rule's parameters, same-place stop groups
+            "objects": {n: ((v.get("near") or {}).get("all") or {}).get("mean") for n, v in (counts.get("scenes") or {}).items()},
+            "detector": {k: counts.get(k) for k in ("model", "conf", "near_px")},
+            "params": result.get("params") or {},
+            "stopped": sum((v or {}).get("stop_frac") is not None and v["stop_frac"] >= 0.8 for v in rule.values()),
+            "stop_groups": [g for r in result.get("routes") or [] for g in r.get("stage1_groups") or []],
+            "path_cover": [v["path_cover"] for v in rule.values() if (v or {}).get("path_cover") is not None],
+            "filters": read("filters.json"),        # the app's settings: skipped filters, the overlap share
+            "candidates": {n: FILTER_KEY.get((v or {}).get("kind"), "other") for n, v in rule.items()
+                           if (v or {}).get("status") == "remove"},
+            "human": {n: d["decision"] for n, d in decisions.items() if (d or {}).get("decision") in ("keep", "drop")},
+            "backups": backups, "deleted": deleted, "deleted_logs": deleted_logs}
+
+
+FILTER_KEY = {"정지 중복": "stops", "객체 부족": "objects", "경로 겹침": "overlap"}   # result.json `kind` -> state
+CANDIDATES = ("stops", "objects", "overlap", "other")     # the filters' fixed order (curate.py); other kinds: "other"
+
+
+def scene_state(data: dict, name: str) -> str:
+    """keep / drop (confirmed by a person), objects / stops / other (a filter's candidate, not confirmed yet),
+    pass (no filter caught it; also a scene the rule has not seen)."""
+    if name in data["locked"]:
+        return "locked"
+    return data["human"].get(name) or data["candidates"].get(name) or "pass"
+
+
+def curation_counts(data: dict, names: list[str]) -> dict:
+    """Counts over some scenes (a course, a route): detected, judged by the rule, per state, and `cand` (all
+    unconfirmed candidates)."""
+    c = {"n": len(names), "detected": sum(n in data["detected"] for n in names),
+         "ruled": sum(n in data["ruled"] for n in names), "keep": 0, "drop": 0, "pass": 0, "locked": 0,
+         **dict.fromkeys(CANDIDATES, 0)}
+    for n in names:
+        c[scene_state(data, n)] += 1
+    c["cand"] = sum(c[k] for k in CANDIDATES)
+    return c
+
+
+def curation_action(c: dict) -> str:
+    """What to suggest next for a course; every action stays available regardless. The final deletion is
+    for the whole dataset, on the page above the courses."""
+    if not c["n"]:
+        return "empty"
+    if c["detected"] < c["n"]:
+        return "detect"
+    if c["ruled"] < c["n"]:
+        return "rule"
+    if c["cand"]:
+        return "review"
+    return "done"
+
+
+def detector_candidates() -> list[str]:
+    """Pythons that might have torch + ultralytics (the detector needs a GPU environment;
+    the GUI's own Python, or the AppImage's, does not carry torch)."""
+    home = Path.home()
+    out = [str(SETTINGS.value("detect_python", "")), sys.executable]
+    for base in (home / "anaconda3", home / "miniconda3", home / "miniforge3", home / "mambaforge",
+                 Path("/opt/conda")):
+        out += [str(p) for p in sorted((base / "envs").glob("*/bin/python"))] + [str(base / "bin" / "python")]
+    out.append("/usr/bin/python3")
+    seen, found = set(), []
+    for p in out:
+        if p and p not in seen and os.access(p, os.X_OK):
+            seen.add(p)
+            found.append(p)
+    return found
+
+
+def has_detector(python: str) -> bool:
+    try:
+        return subprocess.run([python, "-c", "import torch, ultralytics"], capture_output=True,
+                              timeout=180).returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
+def free_port() -> int:
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
 
 
 def scan_source(root: Path, max_depth: int = 4) -> list[Path]:
@@ -292,12 +502,34 @@ def scan_source(root: Path, max_depth: int = 4) -> list[Path]:
 
 
 def dataset_stamp(dataroot: Path) -> tuple:
-    """Session-only validation evidence; table changes invalidate a successful check."""
+    """Validation evidence: every table's name, mtime and size. Any table change (a parse,
+    an exclusion) invalidates a successful check; a copy that keeps mtimes does not."""
     try:
-        return tuple((str(p), p.stat().st_mtime_ns, p.stat().st_size)
+        return tuple((p.name, p.stat().st_mtime_ns, p.stat().st_size)
                      for p in sorted((dataroot / VERSION).glob("*.json")))
     except OSError:
         return ()
+
+
+def load_validation(data_root: Path) -> tuple:
+    """The stamp of the last passed validation, kept in logs/validation.json across runs."""
+    try:
+        data = json.loads((data_root / "logs" / "validation.json").read_text())
+        if data.get("dataset") == f"parsed/{DATASET}":
+            return tuple(tuple(x) for x in data["stamp"])
+    except (OSError, ValueError, KeyError, TypeError, AttributeError):
+        pass
+    return ()
+
+
+def save_validation(data_root: Path, stamp: tuple, log: Path | None) -> None:
+    try:
+        (data_root / "logs").mkdir(parents=True, exist_ok=True)
+        (data_root / "logs" / "validation.json").write_text(json.dumps({
+            "dataset": f"parsed/{DATASET}", "validated_at": datetime.now().isoformat(timespec="seconds"),
+            "log": str(log) if log else "", "stamp": [list(x) for x in stamp]}, indent=1))
+    except OSError:
+        pass                                    # the check still holds for this session
 
 
 class Job(QtCore.QObject):
@@ -383,6 +615,7 @@ class Job(QtCore.QObject):
             if bag:
                 self._bag = int(bag.group(1)), int(bag.group(2))
         matches = re.findall(r"(\d{1,3})%\|", "\n".join(parts) + self._buf)
+        counted = re.findall(r"\((\d+)/(\d+)\)", "\n".join(parts))      # scene_detect: "scene-0001 (3/186)"
         if matches:
             frac = min(100, int(matches[-1])) / 100
             if self._bag:                       # several bags in one run: bar per bag
@@ -390,6 +623,9 @@ class Job(QtCore.QObject):
                 self._status((k - 1 + frac) / n, f"bag {k}/{n}")
             else:
                 self._status(frac)
+        elif counted:
+            k, n = map(int, counted[-1])
+            self._status(k / max(n, 1), f"{k}/{n}")
 
     def _proc_error(self, error):
         if error == QtCore.QProcess.ProcessError.FailedToStart:
@@ -485,6 +721,8 @@ def button(text, callback, name=""):
 
 
 ACTION_COLOR = {"done": C["ok"], "import": C["faint"]}
+# jobs that change the tables or selection/, after which the review viewer must reload
+DATASET_WRITERS = ("parse", "exclude", "restore", "detect", "curate", "apply", "undo")
 SUB_ROLE = Qt.ItemDataRole.UserRole + 1         # second, dimmer line of a cell
 DOT_ROLE = Qt.ItemDataRole.UserRole + 2         # colour of a status dot before the text
 
@@ -599,6 +837,425 @@ class Stepper(QtWidgets.QWidget):
                 p.setPen(QtGui.QPen(QtGui.QColor(C["ok"] if i < self.done else C["line2"]), 1.2))
                 p.drawLine(QtCore.QPointF(x, cy), QtCore.QPointF(x + line_len, cy))
                 x += line_len + gap
+
+
+class RatioBar(QtWidgets.QWidget):
+    """One long bar: (seconds, colour) segments over the whole recorded time."""
+    def __init__(self, height=8):
+        super().__init__()
+        self.parts, self.total = [], 0.0
+        self.setFixedHeight(height)
+        self.setSizePolicy(QtWidgets.QSizePolicy.Policy.Expanding, QtWidgets.QSizePolicy.Policy.Fixed)
+
+    def set_parts(self, parts, total):
+        self.parts, self.total = parts, total
+        self.update()
+
+    def paintEvent(self, _):
+        p = QtGui.QPainter(self)
+        p.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing)
+        r = QtCore.QRectF(self.rect())
+        clip = QtGui.QPainterPath()
+        clip.addRoundedRect(r, r.height() / 2, r.height() / 2)
+        p.setClipPath(clip)
+        p.fillRect(r, QtGui.QColor(C["line2"]))
+        x = r.left()
+        for value, colour in self.parts:
+            if self.total > 0 and value > 0:
+                w = r.width() * value / self.total
+                p.fillRect(QtCore.QRectF(x, r.top(), w + 0.5, r.height()), QtGui.QColor(colour))
+                x += w
+
+
+BAR_ROLE = Qt.ItemDataRole.UserRole + 4
+
+
+class BarDelegate(CellDelegate):
+    """A recording's time as one long bar of segments; every row on the same time scale, so a longer
+    recording has a longer bar."""
+    def paint(self, painter, option, index):
+        parts, total, longest = index.data(BAR_ROLE) or ([], 0.0, 0.0)
+        opt = QtWidgets.QStyleOptionViewItem(option)
+        self.initStyleOption(opt, index)
+        opt.text = ""
+        opt.state &= ~QtWidgets.QStyle.StateFlag.State_HasFocus
+        style = option.widget.style() if option.widget else QtWidgets.QApplication.style()
+        style.drawControl(QtWidgets.QStyle.ControlElement.CE_ItemViewItem, opt, painter, option.widget)
+        if total <= 0 or longest <= 0:
+            return
+        r = QtCore.QRectF(option.rect.adjusted(12, 0, -12, 0))
+        r.setTop(r.center().y() - 4)
+        r.setHeight(8)
+        r.setWidth(max(r.width() * total / longest, 4))
+        painter.save()
+        painter.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing)
+        clip = QtGui.QPainterPath()
+        clip.addRoundedRect(r, 4, 4)
+        painter.setClipPath(clip)
+        painter.fillRect(r, QtGui.QColor(C["line2"]))
+        x = r.left()
+        for value, colour in parts:
+            if value > 0:
+                w = r.width() * value / total
+                painter.fillRect(QtCore.QRectF(x, r.top(), w + 0.5, r.height()), QtGui.QColor(colour))
+                x += w
+        painter.restore()
+
+
+# the dataset overview's segments (parser page)
+OV_PARSER = (("used", "데이터셋", C["accent"]), ("curated", "큐레이션으로 뺌", "#8c4a46"),
+             ("lost", "파싱 때 버림", "#46464f"), ("waiting", "파싱 대기", "#6b6b75"))
+# curation: a scene's state over the whole dataset (confirmed, candidates, deleted)
+CUR_STATES = (("locked", "잠김 (이전 라운드 확정)", "#4f6f8f"),
+              ("keep", "남기기 확정 (사람)", C["ok"]), ("pass", "남기기 확정 (필터 통과)", "#3f7a5c"),
+              ("drop", "버리기 확정", C["bad"]),
+              ("stops", "후보 · 정지 중복", "#c792ea"), ("objects", "후보 · 객체 부족", C["warn"]),
+              ("overlap", "후보 · 경로 겹침", "#5ec8e5"), ("other", "후보 · 기타", "#d4a373"),
+              ("deleted", "삭제 완료", "#8c4a46"))
+ROUTE_COLORS = ("#8b95ff", "#4cc38a", "#e8a94f", "#f07068", "#5ec8e5", "#c792ea", "#f2d06b", "#7fd1b9",
+                "#ff9e64", "#a3be8c", "#e06c9f", "#6cb6ff", "#d4a373", "#9ccfd8", "#eb6f92", "#b4f9f8",
+                "#ffd580", "#9aa5ce", "#73daca", "#f7768e", "#bb9af7", "#e0af68")
+
+
+def mercator(lat, lon):
+    """Web Mercator in [0, 1] x [0, 1]: the OSM tile grid at zoom 0."""
+    s = math.sin(math.radians(max(min(lat, 85.0), -85.0)))
+    return (lon + 180.0) / 360.0, 0.5 - math.log((1 + s) / (1 - s)) / (4 * math.pi)
+
+
+def _seg_dist(px, py, ax, ay, bx, by):
+    dx, dy = bx - ax, by - ay
+    t = 0.0 if dx == dy == 0 else max(0.0, min(1.0, ((px - ax) * dx + (py - ay) * dy) / (dx * dx + dy * dy)))
+    return math.hypot(px - ax - t * dx, py - ay - t * dy)
+
+
+class MiniHist(QtWidgets.QWidget):
+    """A small bar chart: bars of (value, colour, tip), an optional marker line before bar `marker` with its text,
+    and a caption under each end. Heights on a square-root scale, so a small bar next to a tall one still shows
+    (the tips give the counts)."""
+    def __init__(self, width=280, height=74):
+        super().__init__()
+        self.setFixedSize(width, height)
+        self.bars, self.marker, self.marker_text, self.left, self.right = [], None, "", "", ""
+
+    def set_bars(self, bars, marker=None, marker_text="", left="", right=""):
+        self.bars, self.marker, self.marker_text, self.left, self.right = bars, marker, marker_text, left, right
+        self.setToolTip("\n".join(tip for _, _, tip in bars if tip))
+        self.update()
+
+    def paintEvent(self, _):
+        if not self.bars:
+            return
+        p = QtGui.QPainter(self)
+        p.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing)
+        font = p.font()
+        font.setPixelSize(10)
+        p.setFont(font)
+        w, h, top, bottom = self.width(), self.height(), 14, 16
+        top_v = math.sqrt(max(v for v, _, _ in self.bars) or 1)
+        step = w / len(self.bars)
+        for i, (v, colour, _) in enumerate(self.bars):
+            bh = (h - top - bottom) * math.sqrt(v) / top_v
+            p.fillRect(QtCore.QRectF(i * step + 1, h - bottom - bh, step - 2, bh), QtGui.QColor(colour))
+        p.fillRect(QtCore.QRectF(0, h - bottom, w, 1), QtGui.QColor(C["line2"]))
+        p.setPen(QtGui.QColor(C["faint"]))
+        p.drawText(QtCore.QRectF(0, h - bottom + 2, w, bottom), int(Qt.AlignmentFlag.AlignLeft), self.left)
+        p.drawText(QtCore.QRectF(0, h - bottom + 2, w, bottom), int(Qt.AlignmentFlag.AlignRight), self.right)
+        if self.marker is not None:
+            x = self.marker * step
+            pen = QtGui.QPen(QtGui.QColor(C["text"]), 1, Qt.PenStyle.DashLine)
+            p.setPen(pen)
+            p.drawLine(QtCore.QPointF(x, top - 2), QtCore.QPointF(x, h - bottom))
+            p.setPen(QtGui.QColor(C["text"]))
+            p.drawText(QtCore.QRectF(x + 4, 0, w - x, top), int(Qt.AlignmentFlag.AlignLeft), self.marker_text)
+
+
+FREQ_COLOUR, FREQ_ALPHA = (94, 200, 229), 0.28    # the frequency view: every kept path this colour, see-through
+
+
+def freq_swatch(k, bg=(16, 16, 19)):
+    """The colour k overlapping paths add up to on the map's background."""
+    a = 1 - (1 - FREQ_ALPHA) ** k
+    return "#%02x%02x%02x" % tuple(round(b_ * (1 - a) + c * a) for b_, c in zip(bg, FREQ_COLOUR))
+
+
+class CurationMap(QtWidgets.QWidget):
+    """Every scene's GNSS track on OpenStreetMap, coloured by route or by curation state. Tiles come through the
+    review server's /tile/ proxy (cached on disk), darkened like the review's own map. Wheel = zoom,
+    drag = pan, click a track = pick its route, double-click = review that scene."""
+    routePicked = Signal(str)
+    sceneOpened = Signal(str, str)
+
+    def __init__(self):
+        super().__init__()
+        self.setMinimumHeight(400)
+        self.setMouseTracking(True)
+        self.setCursor(Qt.CursorShape.OpenHandCursor)
+        self.net = QtNetwork.QNetworkAccessManager(self)
+        self.base = None                        # the review server, for /tile/
+        self.tiles, self.pending, self.failed = {}, {}, {}   # pending: key -> reply (held, or PyQt drops the slot)
+        self.tracks = []                        # (scene, log, [(x, y), ...] Web Mercator, bounding box)
+        self.colors, self.dim, self.tips, self.legend, self.rank, self.points, self.hidden = {}, set(), {}, [], {}, {}, set()
+        self.z, self.cx, self.cy, self.moved = 3.0, 0.5, 0.5, False
+        self.roi, self.zmin = None, 2.0             # our region: zoom out and pan stop at it
+        self._press, self.hover = None, None
+        self.message = "지도를 준비하는 중… 검토 서버가 데이터셋의 GNSS 경로를 읽습니다"
+
+    def set_base(self, url):
+        if url != self.base:
+            self.base, self.failed = url, {}
+            self.update()
+
+    def set_tracks(self, scenes):
+        self.tracks = []
+        for s in scenes:
+            pts = [mercator(a, o) for a, o in s.get("pts") or []]
+            if pts:
+                xs, ys = [q[0] for q in pts], [q[1] for q in pts]
+                self.tracks.append((s["name"], s["log"], pts, (min(xs), min(ys), max(xs), max(ys))))
+        self.message = "" if self.tracks else "GNSS 경로가 있는 씬이 없습니다"
+        self.roi = None
+        if self.tracks:                             # our region: every track, 8 % around (always, moved or not)
+            x0, y0 = min(t[3][0] for t in self.tracks), min(t[3][1] for t in self.tracks)
+            x1, y1 = max(t[3][2] for t in self.tracks), max(t[3][3] for t in self.tracks)
+            mx, my = (x1 - x0) * 0.08 + 1e-7, (y1 - y0) * 0.08 + 1e-7
+            self.roi = (x0 - mx, y0 - my, x1 + mx, y1 + my)
+        if not self.moved:
+            self.fit()
+        else:
+            self._clamp()
+        self.update()
+
+    def set_style(self, colors, dim, tips, legend, rank=None, points=None, hidden=None):
+        """colors: scene -> colour; dim: scenes drawn faint (outside the picked course / routes); tips: scene ->
+        hover text; legend: rows of (text, colour) runs; rank: scene -> drawing order (higher on top);
+        points: scene -> a colour per point (the segment after it), instead of one colour."""
+        self.colors, self.dim, self.tips, self.legend = colors, dim, tips, legend
+        self.rank, self.points, self.hidden = rank or {}, points or {}, hidden or set()
+        self.update()
+
+    def _fit_zoom(self):
+        """The zoom at which our region just fills the map at its current size."""
+        x0, y0, x1, y1 = self.roi
+        w, h = max(self.width(), 100), max(self.height(), 100)
+        return max(2.0, min(17.0, math.log2(min(w / max(x1 - x0, 1e-9), h / max(y1 - y0, 1e-9)) / 256)))
+
+    def fit(self):
+        """The whole region in view; zooming out stops here."""
+        self.moved = False
+        if self.roi:
+            x0, y0, x1, y1 = self.roi
+            self.z = self.zmin = self._fit_zoom()
+            self.cx, self.cy = (x0 + x1) / 2, (y0 + y1) / 2
+        self.update()
+
+    def _clamp(self):
+        """Keep the view on our region: no wider than it, the center only as far as its edge reaches the view's."""
+        if not self.roi:
+            return
+        self.zmin = self._fit_zoom()                # the map may have been resized
+        self.z = max(self.z, self.zmin)
+        s, (x0, y0, x1, y1) = self._scale(), self.roi
+        hw, hh = self.width() / 2 / s, self.height() / 2 / s
+        self.cx = (x0 + x1) / 2 if x1 - x0 <= 2 * hw else min(max(self.cx, x0 + hw), x1 - hw)
+        self.cy = (y0 + y1) / 2 if y1 - y0 <= 2 * hh else min(max(self.cy, y0 + hh), y1 - hh)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        if not self.moved:
+            self.fit()
+        else:
+            self._clamp()
+
+    def _scale(self):
+        return 256.0 * 2 ** self.z
+
+    def _screen(self, x, y):
+        s = self._scale()
+        return (x - self.cx) * s + self.width() / 2, (y - self.cy) * s + self.height() / 2
+
+    def _request(self, key):
+        if key in self.pending or self.failed.get(key, 0) > time.monotonic() or len(self.pending) >= 12:
+            return
+        reply = self.net.get(QtNetwork.QNetworkRequest(QtCore.QUrl(f"{self.base}/tile/{key[0]}/{key[1]}/{key[2]}.png")))
+        self.pending[key] = reply
+        reply.finished.connect(lambda k=key: self._tile(k))
+
+    def _tile(self, key):
+        reply = self.pending.pop(key, None)
+        if reply is None:
+            return
+        image = QtGui.QImage.fromData(bytes(reply.readAll()))
+        reply.deleteLater()
+        if image.isNull():                      # offline, or the server went away: try again later
+            self.failed[key] = time.monotonic() + 30
+            return
+        image = image.convertToFormat(QtGui.QImage.Format.Format_Grayscale8)
+        image.invertPixels()                    # OSM is light; the app is dark
+        self.tiles[key] = QtGui.QPixmap.fromImage(image)
+        while len(self.tiles) > 800:
+            self.tiles.pop(next(iter(self.tiles)))
+        self.update()
+
+    def paintEvent(self, _):
+        p = QtGui.QPainter(self)
+        p.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing)
+        w, h, s = self.width(), self.height(), self._scale()
+        clip = QtGui.QPainterPath()
+        clip.addRoundedRect(QtCore.QRectF(self.rect()), 8, 8)
+        p.setClipPath(clip)
+        p.fillRect(self.rect(), QtGui.QColor("#101013"))
+        zi = int(max(0, min(19, round(self.z))))
+        n, left, top = 2 ** zi, self.cx - w / 2 / s, self.cy - h / 2 / s
+        p.save()
+        p.setOpacity(0.5)
+        for tx in range(math.floor(left * n), math.floor((left + w / s) * n) + 1):
+            for ty in range(max(0, math.floor(top * n)), min(n - 1, math.floor((top + h / s) * n)) + 1):
+                key = (zi, tx % n, ty)
+                pm = self.tiles.get(key)
+                if pm is None:
+                    if self.base:
+                        self._request(key)
+                    continue
+                x, y = (tx / n - self.cx) * s + w / 2, (ty / n - self.cy) * s + h / 2
+                p.drawPixmap(QtCore.QRectF(x, y, s / n + 0.6, s / n + 0.6), pm, QtCore.QRectF(pm.rect()))
+        p.restore()
+        # faint tracks under, the picked course over them, the hovered one on top
+        for name, _log, pts, _box in sorted(self.tracks, key=lambda t: (t[0] not in self.dim, self.rank.get(t[0], 0),
+                                                                         t[0] == self.hover)):
+            if name in self.hidden:
+                continue
+            colour = QtGui.QColor(self.colors.get(name, C["sub"]))
+            faint = name in self.dim
+            if faint:
+                colour.setAlphaF(0.3)
+            pen = QtGui.QPen(colour, 5.0 if name == self.hover else 1.5 if faint else 2.6)
+            pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+            pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+            p.setPen(pen)
+            per = self.points.get(name)
+            if per:                             # overlap: every segment its own colour
+                sp = [QtCore.QPointF(*self._screen(*q)) for q in pts]
+                for i in range(max(len(sp) - 1, 1)):
+                    c = QtGui.QColor(per[min(i, len(per) - 1)])
+                    if faint:
+                        c.setAlphaF(0.3)
+                    pen.setColor(c)
+                    p.setPen(pen)
+                    p.drawLine(sp[i], sp[min(i + 1, len(sp) - 1)])
+                continue
+            path = QtGui.QPainterPath()
+            path.moveTo(*self._screen(*pts[0]))
+            for q in pts[1:]:
+                path.lineTo(*self._screen(*q))
+            p.drawPath(path)
+        font = p.font()
+        if self.legend:
+            font.setPixelSize(12)
+            p.setFont(font)
+            fm = QtGui.QFontMetrics(font)
+            line = fm.height() + 5
+            width = max(sum(fm.horizontalAdvance(t) for t, _ in row) for row in self.legend) + 22
+            box = QtCore.QRectF(10, 10, width, line * len(self.legend) + 12)
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(QtGui.QColor(12, 12, 14, 215))
+            p.drawRoundedRect(box, 7, 7)
+            p.setBrush(Qt.BrushStyle.NoBrush)
+            y = box.top() + 6
+            for row in self.legend:
+                x = box.left() + 11
+                for text, colour in row:
+                    p.setPen(QtGui.QColor(colour or C["text"]))
+                    p.drawText(QtCore.QPointF(x, y + fm.ascent() + 2), text)
+                    x += fm.horizontalAdvance(text)
+                y += line
+        font.setPixelSize(10)
+        p.setFont(font)
+        p.setPen(QtGui.QColor(C["faint"]))
+        p.drawText(QtCore.QRectF(0, 0, w - 8, h - 5), int(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignBottom),
+                   "© OpenStreetMap")
+        if self.message:
+            font.setPixelSize(13)
+            p.setFont(font)
+            p.setPen(QtGui.QColor(C["sub"]))
+            p.drawText(QtCore.QRectF(self.rect()), int(Qt.AlignmentFlag.AlignCenter), self.message)
+
+    def _nearest(self, pos):
+        """(scene, log) of the track under the cursor (within 8 px), the picked course's first."""
+        s, px, py = self._scale(), pos.x(), pos.y()
+        mx, my = self.cx + (px - self.width() / 2) / s, self.cy + (py - self.height() / 2) / s
+        pad, best, dist = 10 / s, None, 8.0
+        for name, log, pts, (x0, y0, x1, y1) in self.tracks:
+            if name in self.hidden or not (x0 - pad <= mx <= x1 + pad and y0 - pad <= my <= y1 + pad):
+                continue
+            sp = [self._screen(*q) for q in pts] or []
+            extra = 3.0 if name in self.dim else 0.0
+            for a, b in zip(sp, sp[1:] or sp):
+                d = _seg_dist(px, py, *a, *b) + extra
+                if d < dist:
+                    best, dist = (name, log), d
+        return best
+
+    def mousePressEvent(self, e):
+        if e.button() == Qt.MouseButton.LeftButton:
+            self._press = (e.pos(), self.cx, self.cy, False)
+            self.setCursor(Qt.CursorShape.ClosedHandCursor)
+
+    def mouseMoveEvent(self, e):
+        if self._press:
+            p0, cx, cy, _ = self._press
+            d = e.pos() - p0
+            if abs(d.x()) + abs(d.y()) > 3:
+                s = self._scale()
+                self.cx, self.cy, self.moved = cx - d.x() / s, cy - d.y() / s, True
+                self._press = (p0, cx, cy, True)
+                self._clamp()
+                self.update()
+            return
+        hit = self._nearest(e.pos())
+        name = hit[0] if hit else None
+        if name != self.hover:
+            self.hover = name
+            self.update()
+        where = e.globalPosition().toPoint() if hasattr(e, "globalPosition") else e.globalPos()
+        if hit:
+            QtWidgets.QToolTip.showText(where, self.tips.get(name, name), self)
+        else:
+            QtWidgets.QToolTip.hideText()
+        self.setCursor(Qt.CursorShape.PointingHandCursor if hit else Qt.CursorShape.OpenHandCursor)
+
+    def mouseReleaseEvent(self, e):
+        press, self._press = self._press, None
+        self.setCursor(Qt.CursorShape.OpenHandCursor)
+        if press and not press[3]:
+            hit = self._nearest(e.pos())
+            if hit:
+                self.routePicked.emit(hit[1])
+
+    def mouseDoubleClickEvent(self, e):
+        hit = self._nearest(e.pos())
+        if hit:
+            self.sceneOpened.emit(*hit)
+
+    def wheelEvent(self, e):
+        e.accept()                                  # the map's, not the page's: the page must not scroll too
+        steps = e.angleDelta().y() / 120
+        if not steps:
+            return
+        pos = e.position() if hasattr(e, "position") else e.posF()
+        s = self._scale()
+        mx, my = self.cx + (pos.x() - self.width() / 2) / s, self.cy + (pos.y() - self.height() / 2) / s
+        self.z = max(self.zmin, min(18.0, self.z + 0.5 * steps))   # not wider than our region
+        s = self._scale()
+        self.cx, self.cy = mx - (pos.x() - self.width() / 2) / s, my - (pos.y() - self.height() / 2) / s
+        self.moved = True
+        self._clamp()
+        self.update()
+
+    def leaveEvent(self, _):
+        if self.hover:
+            self.hover = None
+            self.update()
 
 
 def setup_table(table, headers):
@@ -1008,6 +1665,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.setMinimumSize(1000, 760)
         self.setAcceptDrops(True)
         self.data_root = data_root.resolve() if data_root and data_root.is_dir() else None
+        if decisions_dir():
+            os.environ["TCAR_DECISIONS_DIR"] = decisions_dir()     # inherited by the review server and the jobs
         self.job = None
         self.recs, self.active_recs = [], []
         self.status = {"logs": {}, "scenes": 0, "samples": 0, "error": ""}
@@ -1017,6 +1676,15 @@ class MainWindow(QtWidgets.QMainWindow):
         self._job_kind, self._job_route = "", None
         self._close_when_done = False
         self._last_log = None
+        self.mode = "parser"                    # parser | curation: two pages over the same courses
+        self.reviewing = False                  # the review viewer fills the window
+        self.cdata = curation_data(Path("/nonexistent"))
+        self.cur_counts, self.cur_action, self.cur_logs = curation_counts(self.cdata, []), "empty", []
+        self.viewer, self.viewer_url, self._viewer_buf, self._viewer_ready = None, None, "", False
+        self._review_logs, self._review_scene = [], None
+        self._cur_sig = None                    # the curation files' state, polled while the curation page shows
+        self._map_color = "state" if str(SETTINGS.value("map_color", "freq")) == "state" else "freq"
+        self._map_reply = None
         root = QtWidgets.QWidget()
         root.setObjectName("root")
         self.setCentralWidget(root)
@@ -1026,20 +1694,37 @@ class MainWindow(QtWidgets.QMainWindow):
         body = QtWidgets.QHBoxLayout()
         body.setSpacing(0)
         body.addWidget(self._sidebar())
-        scroll = QtWidgets.QScrollArea()
-        scroll.setWidgetResizable(True)
-        scroll.setWidget(self._main())
-        body.addWidget(scroll, 1)
+        self.pages = QtWidgets.QStackedWidget()
+        for k, page in enumerate((self._main(), self._curation_page())):
+            scroll = QtWidgets.QScrollArea()
+            scroll.setWidgetResizable(True)
+            scroll.setWidget(page)
+            if k == 1:                                   # curation: the header (전체 검토) stays while the page scrolls
+                holder = QtWidgets.QWidget()
+                holder.setObjectName("content")
+                col = QtWidgets.QVBoxLayout(holder)
+                col.setContentsMargins(0, 0, 0, 0)
+                col.setSpacing(0)
+                col.addWidget(self._curation_header())
+                col.addWidget(scroll, 1)
+                scroll = holder
+            self.pages.addWidget(scroll)
+        self.pages.addWidget(self._review_page())
+        body.addWidget(self.pages, 1)
         outer.addLayout(body, 1)
         outer.addWidget(self._jobbar())
         self.refresh()
+        self._live = QtCore.QTimer(self)        # decisions made in a review show up here as they are made
+        self._live.setInterval(1500)
+        self._live.timeout.connect(self._poll_curation)
+        self._live.start()
 
     @property
     def dataset(self) -> Path:
         return self.data_root / "parsed" / DATASET
 
     def _sidebar(self):
-        widget = QtWidgets.QWidget()
+        widget = self.sidebar = QtWidgets.QWidget()
         widget.setObjectName("sidebar")
         widget.setFixedWidth(248)
         layout = QtWidgets.QVBoxLayout(widget)
@@ -1053,7 +1738,21 @@ class MainWindow(QtWidgets.QMainWindow):
         brand.addWidget(label("TCAR Parser", "brand"))
         brand.addStretch()
         layout.addLayout(brand)
-        layout.addSpacing(20)
+        layout.addSpacing(16)
+        segment = QtWidgets.QFrame()
+        segment.setObjectName("segment")
+        seg_layout = QtWidgets.QHBoxLayout(segment)
+        seg_layout.setContentsMargins(3, 3, 3, 3)
+        seg_layout.setSpacing(2)
+        self.mode_btns = {}
+        for mode, text in (("parser", "파서"), ("curation", "큐레이션")):
+            b = button(text, lambda _=False, m=mode: self._set_mode(m), "seg")
+            b.setCheckable(True)
+            b.setChecked(mode == self.mode)
+            seg_layout.addWidget(b, 1)
+            self.mode_btns[mode] = b
+        layout.addWidget(segment)
+        layout.addSpacing(18)
         layout.addWidget(label("데이터 폴더", "section"))
         self.root_label = label("", "path", True)
         self.root_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
@@ -1063,7 +1762,8 @@ class MainWindow(QtWidgets.QMainWindow):
         layout.addWidget(self.change_btn, alignment=Qt.AlignmentFlag.AlignLeft)
         layout.addSpacing(14)
         row = QtWidgets.QHBoxLayout()
-        row.addWidget(label("코스", "section"))
+        course_label = label("코스", "section")
+        row.addWidget(course_label)
         row.addStretch()
         self.refresh_btn = button("새로고침", self.refresh, "quiet")
         row.addWidget(self.refresh_btn)
@@ -1072,8 +1772,32 @@ class MainWindow(QtWidgets.QMainWindow):
         self.route_list.setAccessibleName("코스와 다음 작업")
         self.route_list.setItemDelegate(CellDelegate(self.route_list, pad=12))
         self.route_list.setMouseTracking(True)
-        self.route_list.currentItemChanged.connect(self._show_route)
-        layout.addWidget(self.route_list, 1)
+        self.route_list.currentItemChanged.connect(self._select_route)
+        self.route_list.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        layout.addWidget(self.route_list)
+        layout.addSpacing(18)
+        self.ov = QtWidgets.QWidget()
+        ov = QtWidgets.QVBoxLayout(self.ov)
+        ov.setContentsMargins(0, 0, 0, 0)
+        ov.setSpacing(7)
+        ov.addWidget(label("데이터셋 시간", "section"))
+        self.ov_text = label("", "sub", True)
+        ov.addWidget(self.ov_text)
+        self.ov_bar = RatioBar(10)
+        ov.addWidget(self.ov_bar)
+        self.ov_legend = QtWidgets.QLabel()
+        self.ov_legend.setTextFormat(Qt.TextFormat.RichText)
+        self.ov_legend.setWordWrap(True)
+        self.ov_legend.setObjectName("faint")
+        ov.addWidget(self.ov_legend)
+        ov.addSpacing(6)
+        self.ov_rows = QtWidgets.QGridLayout()
+        self.ov_rows.setHorizontalSpacing(8)
+        self.ov_rows.setVerticalSpacing(8)
+        self.ov_rows.setColumnStretch(1, 1)
+        ov.addLayout(self.ov_rows)
+        layout.addWidget(self.ov)
+        layout.addStretch(1)
         self.sidebar_hint = label("가져온 녹화가 코스별로 여기에 표시됩니다.", "faint", True)
         layout.addWidget(self.sidebar_hint)
         self.import_btn = button("＋  녹화 가져오기", self._import)
@@ -1084,6 +1808,18 @@ class MainWindow(QtWidgets.QMainWindow):
         hint = label("원본 폴더를 창에 끌어다 놓아도 됩니다.", "faint", True)
         hint.setAlignment(Qt.AlignmentFlag.AlignHCenter)
         layout.addWidget(hint)
+        self.parser_only = (self.import_btn, self.yield_folder_btn, hint, course_label, self.refresh_btn, self.route_list)
+        self.cur_detector = label("", "faint", True)
+        self.cur_detector_btn = button("검출 환경…", self._pick_detector, "quiet")
+        self.cur_detector_btn.setToolTip("torch·ultralytics가 설치된 Python (예: conda 환경의 bin/python)")
+        self.cur_undo_btn = button("마지막 최종 확정 되돌리기…", self._undo_apply, "quiet")
+        self.cur_undo_btn.setToolTip("_removed/의 가장 최근 백업으로 데이터셋을 되돌립니다")
+        layout.addWidget(self.cur_undo_btn)
+        layout.addWidget(self.cur_detector)
+        layout.addWidget(self.cur_detector_btn, alignment=Qt.AlignmentFlag.AlignLeft)
+        self.curation_only = (self.cur_undo_btn, self.cur_detector, self.cur_detector_btn)
+        for w in self.curation_only:
+            w.hide()
         return widget
 
     def _main(self):
@@ -1109,6 +1845,23 @@ class MainWindow(QtWidgets.QMainWindow):
         self.val_btn = button("다시 검증", self._validate, "quiet")
         heading.addWidget(self.val_btn, alignment=Qt.AlignmentFlag.AlignTop)
         layout.addLayout(heading)
+        # original recording time vs what made it into the dataset, for the parsed bags
+        self.stats = QtWidgets.QWidget()
+        stats_row = QtWidgets.QHBoxLayout(self.stats)
+        stats_row.setContentsMargins(0, 18, 0, 0)
+        stats_row.setSpacing(32)
+        self.stat_values = {}
+        for key, text in (("orig", "원본 녹화 시간"), ("used", "데이터셋 시간"), ("rate", "사용률"), ("scenes", "씬")):
+            box = QtWidgets.QVBoxLayout()
+            box.setSpacing(1)
+            value = label("—", "actionTitle")
+            box.addWidget(value)
+            box.addWidget(label(text, "faint"))
+            stats_row.addLayout(box)
+            self.stat_values[key] = value
+        self.stats_note = label("", "faint", True)
+        stats_row.addWidget(self.stats_note, 1, Qt.AlignmentFlag.AlignBottom)
+        layout.addWidget(self.stats)
         layout.addSpacing(24)
         self.stepper = Stepper()
         layout.addWidget(self.stepper)
@@ -1141,12 +1894,13 @@ class MainWindow(QtWidgets.QMainWindow):
         layout.addLayout(table_bar)
         layout.addSpacing(6)
         self.recording_stack = QtWidgets.QStackedWidget()
-        self.table = QtWidgets.QTableWidget(0, 4)
-        setup_table(self.table, ["녹화", "길이", "크기", "상태"])
+        self.table = QtWidgets.QTableWidget(0, 5)
+        setup_table(self.table, ["녹화", "시간  (데이터셋 · 큐레이션으로 뺌 · 파싱 때 버림 · 파싱 대기)", "원본", "데이터셋", "사용률", "상태"])
+        self.table.setItemDelegateForColumn(1, BarDelegate(self.table))
         self.table.setMinimumHeight(180)
         header = self.table.horizontalHeader()
-        header.setSectionResizeMode(0, QtWidgets.QHeaderView.ResizeMode.Stretch)
-        for column, width in ((1, 84), (2, 96), (3, 210)):
+        header.setSectionResizeMode(1, QtWidgets.QHeaderView.ResizeMode.Stretch)
+        for column, width in ((0, 290), (2, 72), (3, 80), (4, 72), (5, 200)):
             header.setSectionResizeMode(column, QtWidgets.QHeaderView.ResizeMode.Fixed)
             self.table.setColumnWidth(column, width)
         self.table.itemSelectionChanged.connect(self._update_buttons)
@@ -1175,8 +1929,256 @@ class MainWindow(QtWidgets.QMainWindow):
         layout.addLayout(footer)
         return widget
 
+    def _curation_header(self):
+        """Pinned above the scrolling curation page: the title and 전체 검토, always the whole dataset."""
+        widget = QtWidgets.QWidget()
+        widget.setObjectName("content")
+        heading = QtWidgets.QHBoxLayout(widget)
+        heading.setContentsMargins(36, 22, 36, 14)
+        titles = QtWidgets.QVBoxLayout()
+        titles.setSpacing(4)
+        titles.addWidget(label("큐레이션", "title"))
+        self.cur_subtitle = label("", "sub", True)
+        titles.addWidget(self.cur_subtitle)
+        heading.addLayout(titles, 1)
+        self.cur_review_btn = button("전체 검토", self._review_all, "primary")
+        self.cur_review_btn.setToolTip("데이터셋의 모든 씬을 한 목록으로 검토합니다 (카메라 6대·LiDAR·지도, 남기기 / 버리기 확정). "
+                                       "루트만 보려면 표에서 루트를 고르고 ‘고른 루트 검토’")
+        heading.addWidget(self.cur_review_btn, alignment=Qt.AlignmentFlag.AlignTop)
+        heading.addSpacing(6)
+        self.cur_rule_btn = button("규칙 다시 실행", self._curate, "quiet")
+        self.cur_rule_btn.setToolTip("데이터셋 전체에 필터(① 정지 중복 → ② 객체 부족 → ③ 경로 겹침)를 다시 돌립니다 (사람이 확정한 결정은 그대로)")
+        heading.addWidget(self.cur_rule_btn, alignment=Qt.AlignmentFlag.AlignTop)
+        return widget
+
+    def _review_all(self):
+        logs = sorted(self.status_all["names_by_log"], key=route_key)
+        self._open_review(logs, None, f"데이터셋 전체 · 씬 {self.status_all['scenes']:,}개")
+
+    def _curation_page(self):
+        widget = QtWidgets.QWidget()
+        widget.setObjectName("content")
+        layout = QtWidgets.QVBoxLayout(widget)
+        layout.setContentsMargins(36, 6, 36, 16)
+        layout.setSpacing(0)
+        # the whole dataset: confirmed, candidates, deleted (only here; not per course or route)
+        whole = QtWidgets.QFrame()
+        whole.setObjectName("actionCard")
+        whole_layout = QtWidgets.QVBoxLayout(whole)
+        whole_layout.setContentsMargins(20, 16, 16, 16)
+        whole_layout.setSpacing(10)
+        top = QtWidgets.QHBoxLayout()
+        top.setSpacing(30)
+        self.cur_values = {}
+        for key, text in (("total", "전체"), ("drop", "삭제 예정 (버리기 확정)"), ("after", "삭제 후 예상"),
+                          ("candidates", "후보 (필터에 걸림)"), ("deleted", "삭제 완료")):
+            box = QtWidgets.QVBoxLayout()
+            box.setSpacing(2)
+            value, sub = label("—", "actionTitle"), label("", "faint")
+            box.addWidget(label(text, "eyebrow"))
+            box.addWidget(value)
+            box.addWidget(sub)
+            top.addLayout(box)
+            self.cur_values[key] = (value, sub)
+        top.addStretch()
+        final = QtWidgets.QVBoxLayout()
+        final.setSpacing(6)
+        self.cur_final_btn = button("", self._final_delete, "danger")
+        self.cur_final_btn.setToolTip("이번 라운드를 끝냅니다: 버리기 확정 씬을 빼고(_removed/로 옮김), 남는 씬을 모두 잠급니다. "
+                                      "잠긴 씬은 이후 새 데이터가 들어와도 절대 삭제되지 않습니다")
+        final.addWidget(self.cur_final_btn, alignment=Qt.AlignmentFlag.AlignRight)
+        self.cur_final_note = label("", "faint")
+        final.addWidget(self.cur_final_note, alignment=Qt.AlignmentFlag.AlignRight)
+        top.addLayout(final)
+        whole_layout.addLayout(top)
+        self.cur_bar = RatioBar(12)
+        whole_layout.addWidget(self.cur_bar)
+        self.cur_legend = QtWidgets.QLabel()
+        self.cur_legend.setTextFormat(Qt.TextFormat.RichText)
+        self.cur_legend.setWordWrap(True)
+        self.cur_legend.setObjectName("faint")
+        whole_layout.addWidget(self.cur_legend)
+        self.cur_kept = label("", "faint", True)
+        whole_layout.addWidget(self.cur_kept)
+        layout.addWidget(whole)
+        layout.addSpacing(16)
+        # every scene's GNSS track on OSM
+        map_card = QtWidgets.QFrame()
+        map_card.setObjectName("actionCard")
+        map_layout = QtWidgets.QVBoxLayout(map_card)
+        map_layout.setContentsMargins(16, 12, 16, 16)
+        map_layout.setSpacing(10)
+        head = QtWidgets.QHBoxLayout()
+        head.addWidget(label("지도", "section"))
+        head.addSpacing(10)
+        head.addWidget(label("휠 = 확대 · 드래그 = 이동 · 경로를 누르면 그 루트를 고르고, 두 번 누르면 그 씬을 검토합니다",
+                             "faint", True), 1)
+        segment = QtWidgets.QFrame()
+        segment.setObjectName("segment")
+        seg_layout = QtWidgets.QHBoxLayout(segment)
+        seg_layout.setContentsMargins(3, 3, 3, 3)
+        seg_layout.setSpacing(2)
+        self.map_color_btns = {}
+        for key, text in (("freq", "빈도"), ("state", "상태별")):
+            b = button(text, lambda _=False, k=key: self._set_map_color(k), "seg")
+            b.setCheckable(True)
+            b.setChecked(key == self._map_color)
+            seg_layout.addWidget(b)
+            self.map_color_btns[key] = b
+        head.addWidget(segment)
+        head.addWidget(button("전체 보기", lambda: self.cur_map.fit(), "quiet"))
+        map_layout.addLayout(head)
+        self.cur_map = CurationMap()
+        self.cur_map.routePicked.connect(self._map_pick_route)
+        self.cur_map.sceneOpened.connect(self._map_open_scene)
+        map_layout.addWidget(self.cur_map)
+        layout.addWidget(map_card)
+        layout.addSpacing(26)
+        # the picked course: its next step and its routes
+        self.cur_heading = label("", "section")
+        layout.addWidget(self.cur_heading)
+        layout.addSpacing(8)
+        card = QtWidgets.QFrame()
+        card.setObjectName("actionCard")
+        card_layout = QtWidgets.QVBoxLayout(card)
+        card_layout.setContentsMargins(20, 16, 16, 16)
+        card_layout.setSpacing(12)
+        top = QtWidgets.QHBoxLayout()
+        top.setSpacing(16)
+        text = QtWidgets.QVBoxLayout()
+        text.setSpacing(3)
+        self.cur_kicker = label("다음 할 일", "eyebrow")
+        self.cur_title = label("", "actionTitle", True)
+        self.cur_desc = label("", "sub", True)
+        for w in (self.cur_kicker, self.cur_title, self.cur_desc):
+            text.addWidget(w)
+        top.addLayout(text, 1)
+        self.cur_primary = button("", self._curation_primary, "primary")
+        top.addWidget(self.cur_primary, alignment=Qt.AlignmentFlag.AlignVCenter)
+        card_layout.addLayout(top)
+        acts = QtWidgets.QHBoxLayout()
+        acts.setSpacing(8)
+        self.cur_pick_btn = button("", lambda: self._open_review())
+        self.cur_pick_btn.setToolTip("표에서 고른 루트의 씬만 검토합니다 (두 번 눌러도 됩니다)")
+        acts.addWidget(self.cur_pick_btn)
+        self.cur_detect_btn = button("", self._detect)
+        acts.addWidget(self.cur_detect_btn)
+        acts.addStretch()
+        self.cur_scope = label("", "faint", True)
+        acts.addWidget(self.cur_scope)
+        card_layout.addLayout(acts)
+        layout.addWidget(card)
+        layout.addSpacing(20)
+        bar = QtWidgets.QHBoxLayout()
+        self.cur_table_heading = label("루트", "section")
+        bar.addWidget(self.cur_table_heading)
+        bar.addStretch()
+        self.cur_clear_btn = button("선택 해제 (코스 전체)", self._clear_scope, "quiet")
+        bar.addWidget(self.cur_clear_btn)
+        layout.addLayout(bar)
+        layout.addSpacing(6)
+        self.cur_table = QtWidgets.QTableWidget(0, 8)
+        setup_table(self.cur_table, ["루트", "씬", "검출", "① 정지 중복", "② 객체 부족", "③ 경로 겹침", "남기기 확정", "버리기 확정"])
+        self.cur_table.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.ExtendedSelection)
+        self.cur_table.setMinimumHeight(240)
+        header = self.cur_table.horizontalHeader()
+        header.setSectionResizeMode(0, QtWidgets.QHeaderView.ResizeMode.Stretch)
+        for column, width in ((1, 56), (2, 80), (3, 96), (4, 96), (5, 96), (6, 92), (7, 92)):
+            header.setSectionResizeMode(column, QtWidgets.QHeaderView.ResizeMode.Fixed)
+            self.cur_table.setColumnWidth(column, width)
+        self.cur_table.itemSelectionChanged.connect(self._scope_changed)
+        self.cur_table.itemDoubleClicked.connect(lambda *_: self._open_review())
+        layout.addWidget(self.cur_table, 1)
+        layout.addSpacing(10)
+        self.cur_paths = label("", "faint", True)
+        self.cur_paths.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        layout.addWidget(self.cur_paths)
+        layout.addSpacing(24)
+        # last: the filters, what each one looks at, its numbers, why, and the data behind it
+        filters = QtWidgets.QFrame()
+        filters.setObjectName("actionCard")
+        filters_layout = QtWidgets.QVBoxLayout(filters)
+        filters_layout.setContentsMargins(20, 14, 16, 16)
+        filters_layout.setSpacing(12)
+        head = QtWidgets.QHBoxLayout()
+        head.addWidget(label("필터", "section"))
+        head.addSpacing(10)
+        head.addWidget(label("① → ② → ③ 순서로 걸러, 앞에서 걸린 씬은 뒤에서 다시 보지 않습니다. 걸린 씬이 후보가 되고, "
+                             "사람이 확정하기 전까지 데이터셋에 그대로 있습니다. 건너뛴 필터는 후보를 만들지 않습니다.", "faint", True), 1)
+        filters_layout.addLayout(head)
+        self.filter_rows = {}
+        self.filter_skip = {}
+        for i, (key, title, colour) in enumerate((("stops", "① 정지 중복", "#c792ea"), ("objects", "② 객체 부족", "#e8a94f"),
+                                                  ("overlap", "③ 경로 겹침", "#5ec8e5"))):
+            if i:
+                sep = QtWidgets.QFrame()
+                sep.setFixedHeight(1)
+                sep.setStyleSheet(f"background: {C['line']};")
+                filters_layout.addWidget(sep)
+            row = QtWidgets.QHBoxLayout()
+            row.setSpacing(24)
+            text = QtWidgets.QVBoxLayout()
+            text.setSpacing(4)
+            top = QtWidgets.QHBoxLayout()
+            top.setSpacing(8)
+            dot = QtWidgets.QLabel(f"<span style='color:{colour}'>●</span>")
+            dot.setTextFormat(Qt.TextFormat.RichText)
+            top.addWidget(dot)
+            top.addWidget(label(title, "actionTitle"))
+            count = label("", "sub")
+            top.addWidget(count)
+            top.addStretch()
+            if key == "overlap":
+                top.addWidget(button("지도에서 보기", lambda: self._set_map_color("freq"), "quiet"))
+            skip = button("건너뛰기", lambda on=False, k=key: self._skip_filter(k, on), "quiet")
+            skip.setCheckable(True)
+            skip.setToolTip("이 필터를 건너뛰고(후보를 만들지 않고) 규칙을 다시 돌립니다. 다시 누르면 되돌립니다")
+            top.addWidget(skip)
+            self.filter_skip[key] = skip
+            text.addLayout(top)
+            rule, basis, why = label("", "", True), label("", "sub", True), label("", "faint", True)
+            for w in (rule, basis, why):
+                w.setSizePolicy(QtWidgets.QSizePolicy.Policy.Ignored, QtWidgets.QSizePolicy.Policy.Preferred)
+                text.addWidget(w)
+            row.addLayout(text, 1)
+            chart = MiniHist()
+            row.addWidget(chart, alignment=Qt.AlignmentFlag.AlignTop)
+            filters_layout.addLayout(row)
+            self.filter_rows[key] = (count, rule, basis, why, chart)
+        layout.addWidget(filters)
+        return widget
+
+    def _review_page(self):
+        widget = QtWidgets.QWidget()
+        widget.setObjectName("content")
+        layout = QtWidgets.QVBoxLayout(widget)
+        layout.setContentsMargins(20, 12, 20, 12)
+        layout.setSpacing(8)
+        bar = QtWidgets.QHBoxLayout()
+        bar.addWidget(button("←  큐레이션", lambda: self._close_review(), "quiet"))   # (clicked's bool must not land in `refresh`)
+        bar.addSpacing(8)
+        self.review_title = label("검토", "actionTitle")
+        bar.addWidget(self.review_title)
+        bar.addSpacing(12)
+        self.review_status = label("", "sub", True)
+        bar.addWidget(self.review_status, 1)
+        self.review_final_btn = button("", self._final_from_review, "danger")
+        self.review_final_btn.setToolTip("검토를 닫고 버리기 확정 씬을 데이터셋에서 뺍니다 (계획을 보여 주고 한 번 더 묻습니다)")
+        bar.addWidget(self.review_final_btn)
+        bar.addSpacing(8)
+        bar.addWidget(button("새로고침", self._reload_review, "quiet"))
+        bar.addWidget(button("브라우저로 열기", self._review_in_browser, "quiet"))
+        layout.addLayout(bar)
+        if QWebEngineView is not None:
+            self.web = QWebEngineView()
+            layout.addWidget(self.web, 1)
+        else:
+            self.web = None
+            layout.addWidget(label("이 환경에는 Qt WebEngine이 없어 검토 화면을 브라우저로 엽니다.", "sub", True), 1)
+        return widget
+
     def _jobbar(self):
-        frame = QtWidgets.QFrame()
+        frame = self.jobbar = QtWidgets.QFrame()
         frame.setObjectName("jobBar")
         outer = QtWidgets.QVBoxLayout(frame)
         outer.setContentsMargins(0, 0, 0, 0)
@@ -1222,7 +2224,7 @@ class MainWindow(QtWidgets.QMainWindow):
     def route_dirs(self) -> list[str]:
         if not self.data_root:
             return []
-        names = {detect_route(Path(n)) for n in self.status_all["logs"]} - {None}
+        names = {detect_route(Path(n)) for n in self.status_all["imported"]} - {None}
         for base in (self.data_root / "raw", self.data_root / "raw" / "_excluded"):
             if base.is_dir():
                 names.update(p.name for p in base.iterdir() if p.is_dir() and not p.name.startswith(("_", ".")))
@@ -1242,15 +2244,18 @@ class MainWindow(QtWidgets.QMainWindow):
         have = {r["name"] for r in recs}
         # parsed before this data folder held its bag (or the bag was deleted): still listed
         recs.extend(dict(dataset_only_info(self.dataset, name), excluded=False)
-                    for name in status["logs"] if name not in have)
+                    for name in status["imported"] if name not in have)
         recs.sort(key=lambda r: route_key(r["name"]))
+        for r in recs:
+            r["stats"] = (log_time(self.dataset, r["name"], status["logs"].get(r["name"], 0))
+                          if r["name"] in status["imported"] else None)
         return recs, status
 
     def _route_action(self, route, recs, status):
         active = [r for r in recs if not r["excluded"] and r["raw"]]
         if status["error"]:
             return "validate", "데이터셋 확인 필요"
-        pending = sum(r["name"] not in status["logs"] for r in active)
+        pending = sum(r["name"] not in status["imported"] for r in active)
         if pending:
             return "parse", f"{pending}개 파싱 대기"
         if status["logs"]:
@@ -1266,20 +2271,32 @@ class MainWindow(QtWidgets.QMainWindow):
         self.root_label.setText(str(self.data_root) if self.data_root else "아직 선택하지 않았습니다")
         self.root_label.setToolTip(str(self.data_root or ""))
         self.change_btn.setText("폴더 변경…" if self.data_root else "폴더 선택…")
-        keep = self.current_route()
+        keep = self.current_route() or getattr(self, "_last_route", None)
         self.route_list.blockSignals(True)
         self.route_list.clear()
         self._route_cache = {}
         try:
             self.status_all = parsed_status(self.dataset) if self.data_root else parsed_status(Path("/nonexistent"))
+            self.cdata = curation_data(self.dataset) if self.data_root else curation_data(Path("/nonexistent"))
+            if self.data_root and DATASET not in self.validated:
+                saved = load_validation(self.data_root)     # a check from an earlier run
+                if saved:
+                    self.validated[DATASET] = saved
             for route in self.route_dirs():
                 recs, status = self._read_route(route)
                 self._route_cache[route] = recs, status
-                action, next_text = self._route_action(route, recs, status)
+                if self.mode == "parser":
+                    action, next_text = self._route_action(route, recs, status)
+                    dot = ACTION_COLOR.get(action, C["accent"])
+                else:
+                    c = curation_counts(self.cdata, self._course_scenes(route))
+                    action = curation_action(c)
+                    next_text = self._curation_copy(c)[action][3]
+                    dot = self._cur_dot(action)
                 item = QtWidgets.QListWidgetItem(f"코스 {route}")
                 item.setData(Qt.ItemDataRole.UserRole, route)
                 item.setData(SUB_ROLE, next_text)
-                item.setData(DOT_ROLE, ACTION_COLOR.get(action, C["accent"]))
+                item.setData(DOT_ROLE, dot)
                 item.setSizeHint(QtCore.QSize(0, 52))
                 item.setToolTip(f"코스 {route}\n{next_text}")
                 self.route_list.addItem(item)
@@ -1290,9 +2307,708 @@ class MainWindow(QtWidgets.QMainWindow):
         finally:
             self.route_list.blockSignals(False)
         if self.route_list.currentItem() is None and self.route_list.count():
+            self.route_list.blockSignals(True)
             self.route_list.setCurrentRow(0)
+            self.route_list.blockSignals(False)
         self.sidebar_hint.setVisible(self.route_list.count() == 0)
-        self._show_route()
+        self.route_list.setFixedHeight(min(max(self.route_list.count(), 1), 7) * 54 + 6)
+        self._show_overview()
+        saved = str(SETTINGS.value("detect_python", ""))
+        self.cur_detector.setText(f"검출 환경: {Path(saved).parent.parent.name or saved}" if saved else
+                                  "검출 환경: 처음 검출할 때 찾아 기억합니다")
+        self.cur_detector.setToolTip(saved)
+        if self.mode == "parser":
+            self._show_route()
+        else:
+            self._show_curation()
+        self._cur_sig = self._curation_signature() if self.data_root else None
+
+    def _overview(self) -> dict:
+        """Seconds per course: recorded, in the dataset, taken out by curation, lost at parse time, waiting to
+        be parsed."""
+        out = {}
+        for route, (recs, status) in self._route_cache.items():
+            c = dict.fromkeys(("orig", "used", "curated", "lost", "waiting"), 0.0)
+            for r in recs:
+                if r["excluded"]:
+                    continue
+                st = r.get("stats")
+                if st:
+                    c["orig"] += st["orig_s"]
+                    c["used"] += st["used_s"]
+                    c["curated"] += st["curated_s"]
+                    c["lost"] += max(st["orig_s"] - st["parsed_s"], 0.0)
+                elif r["raw"] and r["duration"]:
+                    c["waiting"] += r["duration"]
+            c["total"] = c["orig"] + c["waiting"]
+            out[route] = c
+        return out
+
+    def _show_overview(self):
+        """The sidebar's recorded-time bars (parser page; the curation page has its own, for the whole dataset)."""
+        per = self._overview()
+        keys = OV_PARSER
+        tot = {k: sum(c[k] for c in per.values()) for k in ("orig", "used", "curated", "lost", "waiting", "total")}
+        self.ov.setVisible(tot["total"] > 0 and self.mode == "parser")
+        if not tot["total"] or self.mode != "parser":
+            return
+        mins = lambda v: f"{v / 60:.1f}분"
+        self.ov_text.setText(f"원본 {mins(tot['total'])} 중 데이터셋 {mins(tot['used'])} ({100 * tot['used'] / tot['total']:.1f}%)")
+        self.ov_bar.set_parts([(tot[k], col) for k, _, col in keys], tot["total"])
+        self.ov_legend.setText("<br>".join(
+            f"<span style='color:{col}'>●</span>&nbsp;{name} <span style='color:{C['sub']}'>{mins(tot[k])}</span>"
+            for k, name, col in keys if tot[k] >= 1))
+        while self.ov_rows.count():
+            w = self.ov_rows.takeAt(0).widget()
+            if w:
+                w.deleteLater()
+        for row, (route, c) in enumerate(sorted(per.items())):
+            if not c["total"]:
+                continue
+            bar = RatioBar(6)
+            bar.set_parts([(c[k], col) for k, _, col in keys], c["total"])
+            share = c["used"]
+            bar.setToolTip(f"코스 {route}\n" + "\n".join(f"{name} {mins(c[k])}" for k, name, _ in keys if c[k] >= 1))
+            self.ov_rows.addWidget(label(route, "section"), row, 0)
+            self.ov_rows.addWidget(bar, row, 1)
+            pct = label(f"{100 * share / c['total']:.0f}%", "faint")
+            pct.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+            pct.setMinimumWidth(34)
+            self.ov_rows.addWidget(pct, row, 2)
+
+    def _set_mode(self, mode):
+        if self.job or mode == self.mode:
+            self.mode_btns[self.mode].setChecked(True)
+            self.mode_btns[mode].setChecked(mode == self.mode)
+            return
+        if self.reviewing:
+            self._close_review(refresh=False)
+        self.mode = mode
+        for m, b in self.mode_btns.items():
+            b.setChecked(m == mode)
+        for w in self.parser_only:
+            w.setVisible(mode == "parser")
+        for w in self.curation_only:
+            w.setVisible(mode == "curation")
+        self.pages.setCurrentIndex(0 if mode == "parser" else 1)
+        self.refresh()
+        self._warm_viewer()
+
+    def _select_route(self, item, _previous=None):
+        if item is None:
+            return
+        self._last_route = item.data(Qt.ItemDataRole.UserRole)
+        if self.mode == "parser":
+            self._show_route()
+        else:
+            self.cur_table.clearSelection()
+            self._show_curation()
+
+    # ---- curation: per course, and per route inside it ----
+    def _course_logs(self, route) -> list[str]:
+        return sorted((n for n in self.status_all["names_by_log"] if detect_route(Path(n)) == route),
+                      key=route_key)
+
+    def _course_scenes(self, route) -> list[str]:
+        return [x for n in self._course_logs(route) for x in self.status_all["names_by_log"][n]]
+
+    def _scope(self) -> tuple[list[str], str]:
+        """The logs the curation actions work on: the selected routes, else the whole dataset."""
+        rows = sorted({i.row() for i in self.cur_table.selectionModel().selectedRows()})
+        logs = [self.cur_table.item(r, 0).data(Qt.ItemDataRole.UserRole) for r in rows]
+        if logs:
+            names = ", ".join(BAG_RE.match(n)["course"] + "-" + BAG_RE.match(n)["num"] if BAG_RE.match(n) else n
+                              for n in logs)
+            return logs, names
+        every = sorted(self.status_all["names_by_log"], key=route_key)
+        return (every, "데이터셋 전체") if every else ([], "")
+
+    def _curation_copy(self, c: dict) -> dict:
+        """action -> (card title, card text, primary button, sidebar line)."""
+        missing, dc, conf = c["n"] - c["detected"], c["cand"], c["keep"] + c["drop"]
+        per = " · ".join(f"{t.split(' · ')[1]} {c[k]}" for k, t, _ in CUR_STATES if k in CANDIDATES and c[k])
+        minutes = max(1, round(missing * 6 / 60))
+        return {
+            "empty": ("파싱된 씬이 없습니다", "파서에서 녹화를 파싱하면 여기서 큐레이션합니다.", "", "데이터셋 없음"),
+            "detect": (f"씬 {missing:,}개가 아직 객체 검출 전입니다",
+                       f"검출된 씬은 지금 바로 검토할 수 있습니다. 나머지는 GPU로 약 {minutes}분, 끝나면 규칙을 다시 돌립니다.",
+                       f"{missing:,}개 검출하기", f"검출 {c['detected']}/{c['n']}" + (f" · 후보 {dc}" if dc else "")),
+            "rule": (f"씬 {c['n'] - c['ruled']:,}개에 아직 규칙을 돌리지 않았습니다",
+                     "필터(① 정지 중복 → ② 객체 부족 → ③ 경로 겹침)에 걸린 씬을 후보로 만듭니다. 데이터셋은 바뀌지 않습니다.",
+                     "규칙 실행", "규칙 실행 대기"),
+            "review": (f"필터에 걸린 후보 {dc}개를 확인하세요 ({per})",
+                       "맨 위 ‘전체 검토’(또는 루트를 고르고 ‘고른 루트 검토’)에서 카메라·LiDAR·지도를 보고 남기기나 버리기를 누르면 확정되고 바로 저장됩니다 "
+                       "(keep.txt · drop.txt). 누르지 않은 씬은 후보로 남습니다.",
+                       "", f"후보 {dc}" + (f" · 확정 {conf}" if conf else "")),
+            "done": ("필터에 걸린 후보를 모두 확정했습니다",
+                     (f"버리기 확정 {c['drop']}개는 위의 ‘최종 확정’으로 데이터셋에서 빼고, 남는 씬은 잠급니다." if c["drop"] else
+                      "이 범위에는 버리기로 확정한 씬이 없습니다.") + " 다른 씬도 검토에서 언제든 확정할 수 있습니다.",
+                     "", f"확정 완료 · 버리기 {c['drop']}" if c["drop"] else "확정 완료"),
+        }
+
+    def _cur_dot(self, action):
+        return C["ok"] if action == "done" else C["faint"] if action == "empty" else C["accent"]
+
+    def _show_curation(self):
+        route = None                                     # curation: the whole dataset, not a course
+        routes = sorted(self.status_all["names_by_log"], key=route_key)
+        # the route table (kept while only the selection changes)
+        if getattr(self, "_cur_table_route", None) != (route, tuple(routes), id(self.cdata)):
+            same_course = (getattr(self, "_cur_table_route", None) or (None,))[0] == route
+            keep = {self.cur_table.item(i.row(), 0).data(Qt.ItemDataRole.UserRole)
+                    for i in self.cur_table.selectionModel().selectedRows()} if same_course else set()
+            self._cur_table_route = (route, tuple(routes), id(self.cdata))
+            self.cur_table.blockSignals(True)
+            self.cur_table.selectionModel().blockSignals(True)
+            self.cur_table.clearSelection()
+            self.cur_table.setRowCount(len(routes))
+            self.cur_table.setMinimumHeight(min(max(len(routes), 3) * 56 + 46, 760))   # every route without scrolling
+            for row, name in enumerate(routes):
+                rc = curation_counts(self.cdata, self.status_all["names_by_log"][name])
+                m, when = BAG_RE.match(name), _bag_time(name)
+                cells = (name, f"{rc['n']}", f"{rc['detected']} / {rc['n']}", f"{rc['stops']}", f"{rc['objects']}",
+                         f"{rc['overlap']}", f"{rc['keep']}", f"{rc['drop']}")
+                for column, text in enumerate(cells):
+                    item = QtWidgets.QTableWidgetItem(text)
+                    if column == 0:
+                        item.setData(Qt.ItemDataRole.UserRole, name)
+                        item.setData(SUB_ROLE, " · ".join(filter(None, [f"{m['course']}-{m['num']}" if m else "",
+                                                                        f"{when:%Y-%m-%d %H:%M}" if when else ""])))
+                    elif column == 2 and rc["detected"] < rc["n"]:
+                        item.setForeground(QtGui.QColor(C["warn"]))
+                    elif column >= 3 and rc[("stops", "objects", "overlap", "keep", "drop")[column - 3]]:
+                        item.setForeground(QtGui.QColor(("#c792ea", "#e8a94f", "#5ec8e5", C["ok"], C["bad"])[column - 3]))
+                    else:
+                        item.setForeground(QtGui.QColor(C["sub"] if column else C["text"]))
+                    self.cur_table.setItem(row, column, item)
+            flags = QtCore.QItemSelectionModel.SelectionFlag
+            for row, name in enumerate(routes):         # a refresh keeps the routes picked before it
+                if name in keep:
+                    self.cur_table.selectionModel().select(self.cur_table.model().index(row, 0),
+                                                           flags.Select | flags.Rows)
+            self.cur_table.selectionModel().blockSignals(False)
+            self.cur_table.blockSignals(False)
+        # the whole dataset: what goes (버리기 확정), what is open (후보), what went (삭제 완료); the rest stays
+        w = curation_counts(self.cdata, [x for names in self.status_all["names_by_log"].values() for x in names])
+        deleted = self.cdata["deleted"]
+        total = w["n"] + deleted
+        pc = lambda v: f"{100 * v / total:.1f}%" if total else "—"
+        cand, kept = w["cand"], w["keep"] + w["pass"] + w["locked"]   # passing every filter is a confirmed keep
+        # time: each route's scene length (its import record), the scenes already taken out by their route too
+        by_log = self.status_all["names_by_log"]
+        sec = {lg: (import_stats(self.dataset, lg) or {}).get("scene_s") or 20.0 for lg in set(by_log) | set(self.cdata["deleted_logs"])}
+        now_s = sum(sec[lg] * len(ns) for lg, ns in by_log.items())
+        drop_s = sum(sec[lg] for lg, ns in by_log.items() for n in ns if scene_state(self.cdata, n) == "drop")
+        del_s = sum(sec.get(lg, 20.0) for lg in self.cdata["deleted_logs"]) + 20.0 * (deleted - len(self.cdata["deleted_logs"]))
+        total_s, after, after_s = now_s + del_s, w["n"] - w["drop"], now_s - drop_s
+        mins = lambda v: f"{v / 60:.1f}분" if v < 3600 else f"{int(v // 3600)}시간 {round(v % 3600 / 60)}분"
+        for key, value, sub in (
+                ("total", f"{total:,}개  ·  {mins(total_s)}",
+                 (f"잠김 {w['locked']:,} · 새 데이터 {w['n'] - w['locked']:,}" if w["locked"] else f"지금 데이터셋 {w['n']:,}개")
+                 + (f" · 삭제 완료 {deleted:,}" if deleted else "")),
+                ("drop", f"{w['drop']:,}개  ·  {pc(w['drop'])}", f"{mins(drop_s)} · 최종 삭제 때 빠짐"),
+                ("after", f"{after:,}개  ·  {pc(after)}",
+                 f"{mins(after_s)}" + (f" · 후보 {cand}개 미확정" if cand else " · 후보 모두 확정")),
+                ("candidates", f"{cand:,}개  ·  {pc(cand)}",
+                 " · ".join(f"{t.split(' · ')[1]} {w[k]:,}" for k, t, _ in CUR_STATES if k in CANDIDATES and (w[k] or k != "other"))),
+                ("deleted", f"{deleted:,}개  ·  {pc(deleted)}",
+                 f"{mins(del_s)} · 최종 삭제 {len(self.cdata['backups'])}번 (되돌리기 가능)" if self.cdata["backups"] else "아직 없음")):
+            self.cur_values[key][0].setText(value)
+            self.cur_values[key][1].setText(sub)
+        seg = dict(w, deleted=deleted)
+        shown = [(k, t, col) for k, t, col in CUR_STATES if k not in ("keep", "pass", "locked")]   # 버리기, 후보, 삭제 완료
+        self.cur_bar.set_parts([(seg[k], col) for k, _, col in shown], total)
+        self.cur_bar.setToolTip("\n".join(f"{t} {seg[k]:,} ({pc(seg[k])})" for k, t, _ in shown)
+                                + f"\n남음 (회색) {kept:,} ({pc(kept)})")
+        self.cur_legend.setText("&nbsp;&nbsp;&nbsp;&nbsp;".join(
+            f"<span style='color:{col}'>●</span>&nbsp;{t}&nbsp;<span style='color:{C['sub']}'>{seg[k]:,} ({pc(seg[k])})</span>"
+            for k, t, col in shown if seg[k] or k != "other"))
+        self.cur_kept.setText(f"회색 = 남는 씬 {kept:,}개 ({pc(kept)}): " + (f"잠김(이전 라운드) {w['locked']:,} · " if w["locked"] else "")
+                              + f"필터 통과 {w['pass']:,} · 사람이 남기기로 확정 {w['keep']:,}"
+                              + ("  ·  잠긴 씬은 절대 삭제되지 않고, 새로 들어온 데이터만 후보·삭제 대상입니다" if w["locked"] else ""))
+        new = w["n"] - w["locked"]
+        self.cur_final_btn.setText(f"최종 확정 · 버리기 {w['drop']}개 삭제" if w["drop"] else "최종 확정 · 삭제 없음")
+        self._final_ready = bool(new) and not cand
+        self.cur_final_note.setText(
+            "새 데이터가 없습니다 · 모두 잠김" if not new else
+            f"후보 {cand}개를 먼저 확정하세요" if cand else
+            f"버리기 {w['drop']}개를 빼고 남는 새 씬 {new - w['drop']}개를 잠급니다 (이후 삭제 불가)")
+        self.cur_subtitle.setText(
+            (f"데이터셋 전체 씬 {total:,}개" + (f" (지금 {w['n']:,}개 + 삭제 완료 {deleted:,}개)" if deleted else "")
+             + "  ·  필터를 통과한 씬은 바로 남기고, 걸린 씬은 후보가 되어 사람이 검토에서 확정합니다") if total else
+            "아직 파싱된 씬이 없습니다.")
+        # the scope: the routes picked in the table, else the whole dataset
+        logs, scope_name = self._scope()
+        self.cur_logs = logs
+        self.cur_counts = c = curation_counts(self.cdata, [x for n in logs for x in self.status_all["names_by_log"].get(n, [])])
+        self.cur_action = curation_action(c)
+        self.cur_heading.setText(f"데이터셋 전체  ·  루트 {len(routes)}개  ·  씬 {w['n']:,}개" if routes else "데이터셋")
+        title, desc, primary, _ = self._curation_copy(c)[self.cur_action]
+        self.cur_kicker.setText("완료" if self.cur_action == "done" else "다음 할 일")
+        self.cur_kicker.setStyleSheet(f"color: {C['ok']};" if self.cur_action == "done" else "")
+        self.cur_title.setText(title)
+        self.cur_desc.setText(desc)
+        self.cur_primary.setText(primary)
+        self.cur_primary.setVisible(bool(primary))
+        missing = c["n"] - c["detected"]
+        self.cur_detect_btn.setText(f"미검출 {missing}개 검출" if missing else "검출 완료")
+        self.cur_scope.setText(f"범위: {scope_name}" if scope_name else "")
+        self.cur_review_btn.setText(f"전체 검토 · 씬 {w['n']:,}개")
+        picked = bool(self.cur_table.selectionModel().selectedRows())
+        self.cur_pick_btn.setVisible(picked)
+        self.cur_pick_btn.setText("고른 루트 검토 · " + (scope_name if len(logs) <= 3 else f"루트 {len(logs)}개"))
+        self.cur_table_heading.setText(f"루트  {len(routes)}" if routes else "루트")
+        if self.data_root:
+            sel = self.dataset / "selection"
+            copy = os.environ.get("TCAR_DECISIONS_DIR")
+            self.cur_paths.setText(f"확정: {sel / 'keep.txt'} · drop.txt   ·   삭제 완료: deleted.txt   ·   "
+                                   f"최종 삭제 백업: {self.dataset / '_removed'}\n"
+                                   + (f"같은 목록과 human_decisions.json을 {copy}에도 복사합니다.\n" if copy else "")
+                                   + "루트를 고르면(여러 개: Ctrl/Shift) 검토·검출이 그 루트에만, 고르지 않으면 데이터셋 전체에 "
+                                   "적용됩니다. 두 번 누르면 그 루트를 바로 검토합니다.")
+        self._show_filters()
+        self._style_map()
+        self._update_buttons()
+
+    def _scope_changed(self):
+        self._show_curation()
+
+    def _clear_scope(self):
+        self.cur_table.clearSelection()
+
+    def _curation_primary(self):
+        actions = {"detect": self._detect, "rule": self._curate, "review": self._open_review}
+        if not self.job and self.cur_action in actions:
+            actions[self.cur_action]()
+
+    def _detector_python(self) -> str | None:
+        saved = str(SETTINGS.value("detect_python", ""))
+        QtWidgets.QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        self.job_status.setText("검출용 GPU 환경(torch · ultralytics)을 확인하는 중…")
+        QtWidgets.QApplication.processEvents()
+        try:
+            if saved and has_detector(saved):
+                return saved
+            for python in detector_candidates():
+                QtWidgets.QApplication.processEvents()
+                if has_detector(python):
+                    SETTINGS.setValue("detect_python", python)
+                    return python
+        finally:
+            QtWidgets.QApplication.restoreOverrideCursor()
+            self.job_status.setText("대기 중")
+        self._message("검출 환경을 찾지 못했습니다",
+                      "torch와 ultralytics가 설치된 Python이 없습니다.\n‘검출 환경…’에서 conda 환경의 bin/python 같은 "
+                      "파일을 직접 고르세요.")
+        return None
+
+    def _pick_detector(self):
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(self, "검출용 Python (torch · ultralytics)",
+                                                        str(Path.home()))
+        if not path:
+            return
+        QtWidgets.QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        try:
+            ok = has_detector(path)
+        finally:
+            QtWidgets.QApplication.restoreOverrideCursor()
+        if not ok:
+            return self._message("검출 환경이 아닙니다", f"{path}\n이 Python에서 torch와 ultralytics를 불러올 수 없습니다.")
+        SETTINGS.setValue("detect_python", path)
+        self.refresh()
+
+    def _detect(self):
+        logs, scope_name = self._scope()
+        missing = self.cur_counts["n"] - self.cur_counts["detected"]
+        if self.job or not logs or not missing:
+            return
+        python = self._detector_python()
+        if python:
+            self.run(f"객체 검출 · {scope_name}", [
+                ("proc", f"key frame 객체 검출 (YOLO · GPU) · 씬 {missing}개",
+                 [python, "-u", CURATION / "scene_detect.py", "--dataroot", self.dataset, "--logs", ",".join(logs)]),
+                ("proc", "새 검출로 규칙 다시 실행", self._py("curation/curate.py", "--dataroot", self.dataset))],
+                kind="detect")
+
+    def _curate(self):
+        if self.job or not self.status_all["scenes"]:
+            return
+        self.run("규칙 제안", [("proc", "삭제 후보 규칙 실행 (데이터셋 전체)",
+                                self._py("curation/curate.py", "--dataroot", self.dataset))], kind="curate")
+
+    def _final_delete(self):
+        """최종 확정: the round ends. The confirmed 버리기 scenes go, every scene left is locked for good (a later round
+        with new recordings can only delete new scenes)."""
+        if self.job or not self.data_root:
+            return
+        sys.path.insert(0, str(CURATION))
+        try:
+            import apply_selection
+            plan = apply_selection.plan(str(self.dataset))
+        except (ValueError, OSError) as error:
+            return self._message("계획을 만들 수 없습니다", str(error))
+        finally:
+            sys.path.remove(str(CURATION))
+        if plan["candidates"]:
+            return self._message("후보를 먼저 확정하세요", f"아직 확정하지 않은 후보 {plan['candidates']}개가 있습니다. "
+                                 "잠그면 다시 볼 수 없으니, 검토에서 모두 확정한 뒤 최종 확정하세요.")
+        k, new = len(plan["deleted"]), plan["n_before"] - plan["n_locked"] - len(plan["deleted"])
+        text = (f"이번 라운드를 최종 확정합니다.\n\n· 버리기 확정 {k}개를 데이터셋에서 뺍니다"
+                + (f" (씬 {plan['n_before']}개 → {plan['n_after']}개, 이름 당김 {len(plan['rename'])}개, "
+                   f"옮길 파일 {plan['bytes_moved'] / 1e9:.1f} GB · _removed/로 옮기니 되돌릴 수 있음)" if k else "")
+                + f"\n· 남는 새 씬 {new}개를 잠급니다" + (f" (이미 잠긴 {plan['n_locked']}개와 함께)" if plan["n_locked"] else "")
+                + ".\n\n잠긴 씬은 앞으로 새 데이터가 들어와도 후보가 되지 않고 절대 삭제되지 않습니다. "
+                  "새로 파싱한 녹화의 씬만 필터·검토·삭제 대상이 됩니다."
+                + ("\n\n지우기 전에 표에만 먼저 적용해 모든 참조(scene · sample · sample_data · ego_pose · prev/next · log/map)와 "
+                   "devkit 불러오기를 확인하고, 문제가 있으면 아무것도 지우지 않습니다. 지운 뒤에도 devkit · CAN bus로 다시 확인합니다."
+                   if k else ""))
+        if not self._confirm("최종 확정할까요?", text, f"최종 확정 · {k}개 삭제" if k else "최종 확정", True):
+            return
+        tool = lambda *a: self._py("curation/apply_selection.py", "--dataroot", self.dataset, *a)
+        steps = ([("proc", "미리 검사: 표에만 삭제를 적용해 모든 참조와 devkit 불러오기 확인 (문제가 있으면 여기서 멈춤)",
+                   tool("--simulate"))] if k else [])
+        steps += [("proc", "버리기 확정 씬 옮기고 남은 씬 잠그기", tool("--finalize", "--no-precheck"))]
+        steps += ([("proc", "삭제 후 점검: 표 참조 · key frame 파일 · devkit · CAN bus", tool("--check"))] if k else [])
+        steps += [("proc", "필터 다시 실행 (잠긴 씬 제외)", self._py("curation/curate.py", "--dataroot", self.dataset))]
+        self.run(f"최종 확정 · 버리기 {k}개 삭제, 새 씬 {new}개 잠금", steps, kind="apply")
+
+    def _undo_apply(self):
+        """Take back the last 최종 확정 (its deletion and its lock), or an older plain deletion."""
+        if self.job:
+            return
+        rounds = self.cdata["rounds"]
+        last = rounds[-1] if rounds else None
+        backup = Path(last["backup"]) if last and last.get("backup") else (self.cdata["backups"][-1] if not last and self.cdata["backups"] else None)
+        if last is None and backup is None:
+            return
+        what = (f"{last['stamp']}의 최종 확정을 되돌립니다: " if last else f"{backup.name}의 삭제를 되돌립니다: ") + (
+            "옮긴 파일, 표, 이름, 확정 기록이 그때로 돌아가고 " if backup else "") + ("그때 잠근 씬이 다시 풀립니다." if last else "")
+        if not self._confirm("최종 확정 되돌리기", what, "되돌리기", True):
+            return
+        step = (["--undo", backup] if backup else ["--unlock-last"])
+        self.run("최종 확정 되돌리기", [
+            ("proc", f"되돌리기 · {last['stamp'] if last else backup.name}",
+             self._py("curation/apply_selection.py", "--dataroot", self.dataset, *step))]
+            + ([("proc", "되돌린 뒤 점검: 표 참조 · key frame 파일 · devkit · CAN bus",
+                 self._py("curation/apply_selection.py", "--dataroot", self.dataset, "--check"))] if backup else [])
+            + [("proc", "필터 다시 실행", self._py("curation/curate.py", "--dataroot", self.dataset))], kind="undo")
+
+    # ---- the dataset map, and the curation state as it changes ----
+    def _load_map(self):
+        if not self._viewer_ready:
+            return
+        self._map_reply = self.cur_map.net.get(QtNetwork.QNetworkRequest(QtCore.QUrl(f"{self.viewer_url}/api/map")))
+        self._map_reply.finished.connect(self._map_loaded)
+
+    def _map_loaded(self):
+        reply, self._map_reply = self._map_reply, None
+        if reply is None:
+            return
+        data = bytes(reply.readAll())
+        reply.deleteLater()
+        try:
+            scenes = json.loads(data)["scenes"]
+        except (ValueError, KeyError, TypeError):
+            return
+        self.cur_map.set_tracks(scenes)
+        self._style_map()
+        self._show_filters()
+
+    def _style_map(self):
+        """빈도: the scenes that stay (locked, passed, kept by a person), one see-through colour each, so a road driven
+        once is faint and one driven many times is strong; 상태별: every scene by its state. Picked routes bright."""
+        by_log = self.status_all["names_by_log"]
+        state_col, state_ko = {k: col for k, _, col in CUR_STATES}, {k: t for k, t, _ in CUR_STATES}
+        freq = self._map_color != "state"
+        short_of = lambda lg: f"{BAG_RE.match(lg)['course']}-{BAG_RE.match(lg)['num']}" if BAG_RE.match(lg) else lg
+        colors, tips, dim, hidden, count, rank = {}, {}, set(), set(), dict.fromkeys(state_col, 0), {}
+        scope = set(self.cur_logs)
+        blend = QtGui.QColor(*FREQ_COLOUR)
+        blend.setAlphaF(FREQ_ALPHA)
+        for lg, names in by_log.items():
+            for n in names:
+                st = scene_state(self.cdata, n)
+                count[st] += 1
+                tips[n] = f"{short_of(lg)} · {n} · {state_ko[st]}"
+                if freq:
+                    if st in ("keep", "pass", "locked"):
+                        colors[n] = blend.name(QtGui.QColor.NameFormat.HexArgb)
+                    else:
+                        hidden.add(n)                   # going or undecided: not part of what the dataset keeps
+                else:
+                    colors[n] = state_col[st]
+                    rank[n] = 0 if st in ("pass", "locked") else 2 if st in ("keep", "drop") else 1   # decisions on top
+                if scope and lg not in scope:
+                    dim.add(n)
+        if freq:
+            kept = sum(count[k] for k in ("keep", "pass", "locked"))
+            legend = [[(f"남는 씬 {kept:,}개 · 겹칠수록 진하게", None)],
+                      [(" ● ", freq_swatch(1)), ("1번  ", C["sub"]), ("● ", freq_swatch(2)), ("2번  ", C["sub"]),
+                       ("● ", freq_swatch(4)), ("4번  ", C["sub"]), ("● ", freq_swatch(8)), ("8번+", C["sub"])]]
+        else:
+            legend = [[("●  ", state_col[k]), (f"{state_ko[k]}  ", None), (f"{count[k]:,}", C["sub"])]
+                      for k, _, _ in CUR_STATES if k != "deleted" and (count[k] or k not in ("other", "locked"))]
+        self.cur_map.set_style(colors, dim, tips, legend, rank, None, hidden)
+
+    def _show_filters(self):
+        """The filter card, in the filters' order: each one's rule, how it counts, why, the data behind it (the rule's
+        own parameters and results), and whether it is skipped."""
+        d, P, det = self.cdata, self.cdata["params"], self.cdata["detector"]
+        skip = set((d["filters"] or {}).get("skip") or [])
+        caught = {k: sum(v == k for v in d["candidates"].values()) for k in CANDIDATES}
+        open_ = {k: sum(d["candidates"].get(n) == k and not d["human"].get(n) for n in d["candidates"]) for k in CANDIDATES}
+        place, head = P.get("place_m", 10), P.get("heading_deg", 30)
+        for key, b in self.filter_skip.items():
+            b.blockSignals(True)
+            b.setChecked(key in skip)
+            b.setText("건너뜀 · 되돌리기" if key in skip else "건너뛰기")
+            b.blockSignals(False)
+            b.setEnabled(self.job is None and bool(self.status_all["scenes"]))
+        counted = lambda k: ("건너뜀 · 이 필터는 후보를 만들지 않습니다" if k in skip else
+                             f"걸린 씬 {caught[k]} · 아직 후보 {open_[k]}")
+
+        count, rule, basis, why, chart = self.filter_rows["stops"]
+        groups = d["stop_groups"]
+        sizes = [len(g) for g in groups]
+        count.setText(counted("stops"))
+        rule.setText("같은 곳에 멈춘 씬끼리 묶어, 주변 움직임이 가장 큰 하나만 남기고 나머지를 후보로")
+        basis.setText(f"멈춤: 시간의 80% 이상 1 km/h 미만 · 같은 곳: 같은 루트에서 서로 경로의 80% 이상이 {place:g} m · {head:g}° 안, "
+                      f"속도 흐름 차 ≤ {P.get('ego_tau', 1):g} · 주변 움직임: LiDAR 0.5초 간격 프레임에서 바뀐 칸 수"
+                      + (f"\n근거: 멈춘 씬 {d['stopped']}개 → 같은 곳 그룹 {len(groups)}개 (그룹당 {min(sizes)}–{max(sizes)}개) → "
+                         f"대표 {len(groups)}개를 남기고 후보 {sum(sizes) - len(groups)}개" if groups else
+                         "\n근거: 같은 곳에 멈춘 씬 그룹이 없습니다"))
+        why.setText("왜: 신호 대기처럼 거의 같은 장면이 반복되면 대표 하나로 충분합니다. 가장 먼저 거르고, 그룹에 든 씬은 남긴 대표까지 "
+                    "②③에서 다시 보지 않습니다(대표가 뒤에서 걸려 그룹이 통째로 빠지지 않게). 그래프: 그룹 크기별 그룹 수")
+        top = max(sizes, default=2)
+        chart.set_bars([(sizes.count(k), "#c792ea", f"{k}개짜리 그룹 {sizes.count(k)}개") for k in range(2, top + 1)],
+                       left="2개", right=f"{top}개 (그룹 크기)")
+
+        count, rule, basis, why, chart = self.filter_rows["objects"]
+        mo = P.get("min_objects", 3.0)
+        vals = [v for v in d["objects"].values() if v is not None]
+        settled = {m for g in groups for m in g}          # ①'s groups, the kept scenes too, never reach ②
+        left = [v for n, v in d["objects"].items() if v is not None and n not in settled]
+        count.setText(counted("objects"))
+        rule.setText(f"①의 정지 그룹(대표 포함)을 뺀 씬 중, 가까운 도로 이용자가 샘플당 평균 {mo:g}개 미만인 씬")
+        basis.setText(f"셈: 차량 · 버스 · 트럭 · 보행자 · 자전거 · 오토바이, 박스 높이 {det.get('near_px') or 50}px 이상(멀리 있는 것 제외), "
+                      f"카메라 6대 합, 씬의 key frame 전부의 평균 · 검출 {det.get('model') or 'YOLO'} (신뢰도 ≥ {det.get('conf') or 0.4}), "
+                      "자차 차체와 이륜차 탑승자는 빼고 셈"
+                      + (f"\n근거: 검출된 씬 {len(vals)}개에서 ①의 정지 그룹 {len(settled)}개를 뺀 {len(left)}개 중 "
+                         f"{sum(v < mo for v in left)}개가 기준 미만"
+                         if vals else "\n근거: 아직 검출한 씬이 없습니다"))
+        why.setText("왜: 주변에 배울 대상이 거의 없는 장면은 학습에 주는 정보가 적습니다. 그래프: 씬별 샘플당 평균(전체), 점선 왼쪽이 기준 미만")
+        bins = [0] * 16
+        for v in vals:
+            bins[min(int(v), 15)] += 1
+        chart.set_bars([(c, "#e8a94f" if i < mo else "#46505e", f"샘플당 {i}{'개 이상' if i == 15 else f'–{i + 1}개'}: 씬 {c}개")
+                        for i, c in enumerate(bins)], marker=mo, marker_text=f"기준 {mo:g}", left="0", right="15+ 개/샘플")
+
+        count, rule, basis, why, chart = self.filter_rows["overlap"]
+        mv = P.get("min_overlap", (d["filters"] or {}).get("min_overlap", 0.6))
+        cov = d["path_cover"]
+        count.setText(counted("overlap"))
+        rule.setText(f"①②가 정하지 않은 달리는 씬 중, 먼저 남긴 씬이 이 씬 경로의 {mv:.0%} 이상을 같은 방향으로 지나간 씬")
+        basis.setText(f"같은 길: {place:g} m · {head:g}° 안 (정지 중복과 같은 기준), 0.5초 간격 경로, 모든 루트끼리 · 남길 씬은 가까운 "
+                      "도로 이용자가 많은 순으로 먼저 고름"
+                      + (f"\n근거: 달리는 씬 {len(cov)}개 중 다른 씬이 {mv:.0%} 이상 덮는 씬 {sum(c >= mv for c in cov)}개 "
+                         f"(80% 이상 {sum(c >= 0.8 for c in cov)}개)" if cov else "\n근거: 규칙을 다시 돌리면 계산합니다"))
+        why.setText("왜: 같은 길을 같은 방향으로 다시 달린 씬은 새로 보여 주는 것이 적습니다. 씬이 20초라 시작 지점이 어긋나 통째로 "
+                    "겹치는 일은 드뭅니다. 그래프: 씬마다 다른 씬이 덮는 비율(가장 많이), 점선 오른쪽이 기준 이상 · 지도의 ‘빈도’ 보기")
+        bins = [0] * 10
+        for c in cov:
+            bins[min(int(c * 10), 9)] += 1
+        chart.set_bars([(c, "#5ec8e5" if (i + 1) / 10 > mv else "#46505e", f"{i * 10}–{i * 10 + 10}% 덮임: 씬 {c}개")
+                        for i, c in enumerate(bins)], marker=mv * 10, marker_text=f"기준 {mv:.0%}", left="0%", right="100% 덮임")
+
+    def _skip_filter(self, key, on):
+        """Skip (or bring back) one filter: selection/filters.json, which curate.py reads, then the rule again."""
+        if self.job or not self.data_root:
+            return
+        conf = dict(self.cdata["filters"] or {})
+        skip = set(conf.get("skip") or [])
+        (skip.add if on else skip.discard)(key)
+        conf.update(skip=[k for k in ("stops", "objects", "overlap") if k in skip], min_overlap=conf.get("min_overlap", 0.6))
+        path = self.dataset / "selection" / "filters.json"
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(json.dumps(conf, ensure_ascii=False, indent=1))
+        except OSError as error:
+            return self._message("필터 설정을 저장할 수 없습니다", str(error))
+        self.cdata["filters"] = conf
+        self._show_filters()
+        self._curate()
+
+    def _set_map_color(self, key):
+        self._map_color = key
+        SETTINGS.setValue("map_color", key)
+        for k, b in self.map_color_btns.items():
+            b.setChecked(k == key)
+        self._style_map()
+
+    def _map_pick_route(self, log):
+        if self.job:
+            return
+        for row in range(self.cur_table.rowCount()):
+            if self.cur_table.item(row, 0).data(Qt.ItemDataRole.UserRole) == log:
+                self.cur_table.selectRow(row)
+                self.cur_table.scrollToItem(self.cur_table.item(row, 0))
+
+    def _map_open_scene(self, name, log):
+        m = BAG_RE.match(log)
+        self._open_review([log], name, f"{m['course']}-{m['num']} · {name}" if m else f"{log} · {name}")
+
+    def _curation_signature(self):
+        ds = self.dataset
+        sig = [_mtime(ds / "selection" / f) for f in ("human_decisions.json", "result.json", "object_counts.json")]
+        sig.append(_mtime(ds / VERSION / "scene.json"))
+        sig += [(m.parent.name, _mtime(m)) for m in sorted((ds / "_removed").glob("*/manifest.json"))]
+        sig += sorted(u.parent.name for u in (ds / "_removed").glob("*/UNDONE"))
+        return tuple(sig)
+
+    def _final_buttons(self):
+        """최종 삭제 on the curation page and in the review bar: the confirmed 버리기 scenes of the dataset."""
+        names = [n for ns in self.status_all["names_by_log"].values() for n in ns]
+        drop = sum(scene_state(self.cdata, n) == "drop" for n in names)
+        cand = sum(scene_state(self.cdata, n) in CANDIDATES for n in names)
+        new = sum(scene_state(self.cdata, n) != "locked" for n in names)
+        for b in (self.cur_final_btn, self.review_final_btn):
+            b.setText(f"최종 확정 · 버리기 {drop}개 삭제" if drop else "최종 확정 · 삭제 없음")
+            b.setEnabled(self.job is None and bool(new) and not cand)
+            b.setToolTip("새 데이터가 없습니다 (모두 잠김)" if not new else f"후보 {cand}개를 먼저 확정하세요" if cand else
+                         f"버리기 {drop}개를 빼고 남는 새 씬을 잠급니다")
+
+    def _final_from_review(self):
+        self._close_review()
+        self._final_delete()
+
+    def _poll_curation(self):
+        """Confirmations made in a review (in this window or a browser) show on the curation page as they happen;
+        while the review fills the window only the 최종 삭제 count follows (a light read, playback stays smooth)."""
+        if self.mode != "curation" or self.job or not self.data_root:
+            return
+        sig = self._curation_signature()
+        old, self._cur_sig = self._cur_sig, sig
+        if old is None or old == sig:
+            return
+        if self.reviewing:
+            self.cdata = curation_data(self.dataset)
+            self._final_buttons()               # closing the review refreshes everything else
+            return
+        if old[3] != sig[3]:                    # the tables changed (e.g. a final deletion from the command line)
+            return self.refresh()
+        self.cdata = curation_data(self.dataset)
+        for i in range(self.route_list.count()):
+            item = self.route_list.item(i)
+            route = item.data(Qt.ItemDataRole.UserRole)
+            c = curation_counts(self.cdata, self._course_scenes(route))
+            action = curation_action(c)
+            text = self._curation_copy(c)[action][3]
+            item.setData(SUB_ROLE, text)
+            item.setData(DOT_ROLE, self._cur_dot(action))
+            item.setToolTip(f"코스 {route}\n{text}")
+        self._show_curation()
+
+    # ---- review viewer: curation/sample_viewer.py, served by this app, shown in the window ----
+    def _start_viewer(self):
+        if self.viewer is not None:
+            return
+        port = free_port()
+        self.viewer_url, self._viewer_buf, self._viewer_ready = f"http://127.0.0.1:{port}", "", False
+        proc = QtCore.QProcess(self)
+        proc.setProcessChannelMode(QtCore.QProcess.ProcessChannelMode.MergedChannels)
+        env = QtCore.QProcessEnvironment.systemEnvironment()
+        env.insert("PYTHONUNBUFFERED", "1")
+        proc.setProcessEnvironment(env)
+        proc.readyReadStandardOutput.connect(self._viewer_output)
+        proc.finished.connect(self._viewer_finished)
+        self.viewer = proc
+        wait = max(10, round(self.status_all["scenes"] * 0.23 / 10) * 10)     # 334 scenes: 76 s from the /data HDD
+        self.review_status.setText(f"검토 화면을 준비하는 중… 데이터셋 표를 읽습니다 (씬 {self.status_all['scenes']}개, "
+                                   f"약 {wait}초). 한 번 띄우면 데이터셋이 바뀔 때까지 그대로 씁니다.")
+        proc.start(sys.executable, ["-u", str(CURATION / "sample_viewer.py"), "--dataroot", str(self.dataset),
+                                    "--port", str(port), "--no-browser", "--fill"])    # the cache fills while idle
+
+    def _warm_viewer(self):
+        """In curation mode the review server starts in the background, so opening a review is instant."""
+        if self.mode == "curation" and not self.job and self.data_root and self.status_all["scenes"]:
+            self._start_viewer()
+
+    def _review_url(self) -> str:
+        # one screen for every scope: all its scenes in the list (candidates and confirmed marked); app=1 hides
+        # the links that lead out of the review
+        query = f"?app=1&logs={','.join(self._review_logs)}" if self._review_logs else "?app=1"
+        where = f"#scene={self._review_scene}&view=all" if self._review_scene else "#view=all"
+        return f"{self.viewer_url}/review{query}{where}"
+
+    def _viewer_output(self):
+        if self.viewer is None:
+            return
+        self._viewer_buf = (self._viewer_buf + bytes(self.viewer.readAllStandardOutput()).decode(errors="replace"))[-20000:]
+        if not self._viewer_ready and "[viewer] serving" in self._viewer_buf:
+            self._viewer_ready = True
+            self.review_status.setText("")
+            self.cur_map.set_base(self.viewer_url)
+            self._load_map()
+            self.review_title.setToolTip(f"{self.dataset}\n{self.viewer_url}")
+            if self.reviewing and self.web is not None:
+                self.web.load(QtCore.QUrl(self._review_url()))
+            elif self.web is None:
+                QtGui.QDesktopServices.openUrl(QtCore.QUrl(self._review_url()))
+
+    def _viewer_finished(self, code, _status):
+        tail = "\n".join(self._viewer_buf.strip().splitlines()[-6:])
+        self.viewer, self._viewer_ready = None, False
+        self.cur_map.set_base(None)
+        if self.reviewing and code not in (0, 9, -9):
+            self.review_status.setText(f"검토 서버가 멈췄습니다 (종료 코드 {code})")
+            self.log_view.appendPlainText("[viewer]\n" + tail)
+            self.log_panel.show()
+
+    def _stop_viewer(self):
+        if self.viewer is not None:
+            proc, self.viewer = self.viewer, None
+            proc.finished.disconnect()
+            proc.kill()
+            proc.waitForFinished(3000)
+        self._viewer_ready = False
+        self.cur_map.set_base(None)
+        if self.web is not None:
+            self.web.setUrl(QtCore.QUrl("about:blank"))
+
+    def _open_review(self, logs=None, scene=None, scope_name=""):
+        if logs is None:
+            logs, scope_name = self._scope()
+        if self.job or not logs:
+            return
+        self._review_logs, self._review_scene = logs, scene
+        self.review_title.setText(f"검토 · {scope_name}")
+        self._start_viewer()
+        if self.web is None:
+            if self._viewer_ready:
+                QtGui.QDesktopServices.openUrl(QtCore.QUrl(self._review_url()))
+            return
+        self.reviewing = True
+        self.sidebar.hide()                 # the viewer wants the whole window
+        self.jobbar.hide()
+        self.pages.setCurrentIndex(2)
+        if self._viewer_ready:
+            self.web.load(QtCore.QUrl(self._review_url()))
+
+    def _close_review(self, refresh=True):
+        self.reviewing = False
+        self.sidebar.show()
+        self.jobbar.show()
+        self.pages.setCurrentIndex(0 if self.mode == "parser" else 1)
+        if refresh:
+            self.refresh()                  # decisions made in the viewer change the rule's final list
+
+    def _reload_review(self):
+        if self.web is not None and self._viewer_ready:
+            self.web.reload()
+
+    def _review_in_browser(self):
+        if self._viewer_ready:
+            QtGui.QDesktopServices.openUrl(QtCore.QUrl(self._review_url()))
 
     def _show_route(self, *_):
         route = self.current_route()
@@ -1308,39 +3024,57 @@ class MainWindow(QtWidgets.QMainWindow):
             self.title.setToolTip(route)
             dates = ", ".join(sorted({r["date"] for r in all_recs if r["date"]}))
             meta = [dates, f"녹화 {sum(not r['excluded'] for r in all_recs)}개"]
-            if self.status["scenes"]:
-                meta += [f"씬 {self.status['scenes']:,}개", f"샘플 {self.status['samples']:,}개"]
-            if self.status_all["scenes"] > self.status["scenes"]:
-                meta.append(f"데이터셋 전체 씬 {self.status_all['scenes']:,}개")
+            if self.status["samples"]:
+                meta.append(f"샘플 {self.status['samples']:,}개")
             self.subtitle.setText("  ·  ".join(filter(None, meta)))
+            self._show_stats(all_recs)
             excluded_count = sum(r["excluded"] for r in all_recs)
             self.show_excluded.setText(f"제외된 녹화 보기 ({excluded_count})")
             self.show_excluded.setVisible(bool(excluded_count) or self.show_excluded.isChecked())
             self.table.setRowCount(len(self.recs))
+            longest = max(((r["stats"] or {}).get("orig_s") or r["duration"] or 0.0 for r in self.recs), default=0.0)
             for row, rec in enumerate(self.recs):
-                detail = " · ".join(filter(None, [rec["label"], rec["when"]]))
+                st = rec["stats"]
+                size = human_size(rec["size"]) if rec["size"] is not None else ""
+                detail = " · ".join(filter(None, [rec["label"], rec["when"], size]))
                 if rec["excluded"]:
                     state, color = "제외됨", C["muted"]
                 elif self.status["error"]:
                     state, color = "데이터셋 확인 필요", C["warn"]
                 elif rec["name"] in self.status["logs"]:
                     state, color = f"데이터셋에 포함 ({self.status['logs'][rec['name']]}씬)", C["ok"]
+                elif rec["name"] in self.status["imported"]:
+                    state, color = "큐레이션으로 모두 제외", C["muted"]
                 else:
                     state, color = "파싱 대기", C["accent"]
                 if not rec["raw"]:
                     detail += " · 원본은 데이터 폴더에 없음"
-                duration = f"{rec['duration'] / 60:.1f}분" if rec["duration"] is not None else "—"
-                size = human_size(rec["size"]) if rec["size"] is not None else "—"
-                for column, text in enumerate((rec["name"], duration, size, state)):
+                orig = st["orig_s"] if st else rec["duration"]
+                rate = 100 * st["used_s"] / st["orig_s"] if st and st["orig_s"] else None
+                cells = (rec["name"], "", f"{orig / 60:.1f}분" if orig is not None else "—",
+                         f"{st['used_s'] / 60:.1f}분" if st else "—",
+                         f"{rate:.1f}%" if rate is not None else "—", state)
+                if st:
+                    seg = {"used": st["used_s"], "curated": st["curated_s"], "lost": max(st["orig_s"] - st["parsed_s"], 0.0),
+                           "waiting": 0.0}
+                else:
+                    seg = {"used": 0.0, "curated": 0.0, "lost": 0.0, "waiting": rec["duration"] or 0.0}
+                parts = [(seg[k], C["line2"] if rec["excluded"] else col) for k, _, col in OV_PARSER]
+                for column, text in enumerate(cells):
                     item = QtWidgets.QTableWidgetItem(text)
-                    item.setToolTip((rec["path"] or rec["name"]) if column == 0 else text)
+                    item.setToolTip((rec["path"] or rec["name"]) if column == 0 else
+                                    loss_text(st) if st and column in (1, 2, 3, 4) else text)
                     if column == 0:
                         item.setData(SUB_ROLE, detail)
-                    if column == 3:
+                    if column == 1:
+                        item.setData(BAR_ROLE, (parts, sum(seg.values()), longest))
+                    if column == 5:
                         item.setData(DOT_ROLE, color)
                     if rec["excluded"]:
                         item.setForeground(QtGui.QColor(C["faint"]))
-                    elif column in (1, 2):
+                    elif column == 4 and rate is not None and rate < 90:
+                        item.setForeground(QtGui.QColor(C["warn"]))
+                    elif column in (2, 3, 4):
                         item.setForeground(QtGui.QColor(C["sub"]))
                     self.table.setItem(row, column, item)
             if excluded_count and not self.recs:
@@ -1357,10 +3091,38 @@ class MainWindow(QtWidgets.QMainWindow):
             self.empty_desc.setText("녹화별로 파싱 대기, 데이터셋 포함 여부를 한눈에 확인할 수 있습니다.")
         if not route:
             self.show_excluded.setVisible(False)
+            self.stats.setVisible(False)
         self.recording_stack.setCurrentIndex(0 if self.recs else 1)
         self.recording_heading.setText(f"녹화  {len(self.recs)}" if route else "녹화")
         self._show_next_action()
         self._update_buttons()
+
+    def _show_stats(self, all_recs):
+        """Course totals over its parsed recordings, and the whole dataset's for scale."""
+        parsed = [r["stats"] for r in all_recs if not r["excluded"] and r["stats"]]
+        self.stats.setVisible(bool(parsed))
+        if not parsed:
+            return
+        orig, used = sum(s["orig_s"] for s in parsed), sum(s["used_s"] for s in parsed)
+        self.stat_values["orig"].setText(f"{orig / 60:.1f}분")
+        self.stat_values["used"].setText(f"{used / 60:.1f}분")
+        self.stat_values["rate"].setText(f"{100 * used / orig:.1f}%" if orig else "—")
+        self.stat_values["scenes"].setText(f"{self.status['scenes']:,}")
+        tip = {k: sum(s[k] for s in parsed) for k in ("short_s", "camera_s", "other_s", "curated_n", "curated_s")}
+        tip.update(orig_s=orig, used_s=used, lidar_gaps=sum(s["lidar_gaps"] for s in parsed))
+        for value in self.stat_values.values():
+            value.setToolTip(loss_text(tip))
+        notes = []
+        pending = sum(not r["excluded"] and r["raw"] and not r["stats"] for r in all_recs)
+        if pending:
+            notes.append(f"파싱 대기 {pending}개는 빼고 셌습니다")
+        every = [s for s in (log_time(self.dataset, n, self.status_all["logs"].get(n, 0))
+                             for n in self.status_all["imported"]) if s]
+        if len(every) > len(parsed):
+            o, u = sum(s["orig_s"] for s in every), sum(s["used_s"] for s in every)
+            notes.append(f"데이터셋 전체 {len(every)}개 녹화: 원본 {o / 60:.1f}분 중 {u / 60:.1f}분 "
+                         f"({100 * u / o:.1f}%), 씬 {self.status_all['scenes']:,}개")
+        self.stats_note.setText("\n".join(notes))
 
     def _calib_dir(self) -> Path | None:
         calib = self.data_root / "calib" if self.data_root else None
@@ -1422,6 +3184,20 @@ class MainWindow(QtWidgets.QMainWindow):
                                     "녹화를 선택하면 폴더 열기와 제외를 할 수 있습니다.")
         self.open_btn.setVisible(raw)
         self.excl_btn.setVisible(raw)
+        for b in self.mode_btns.values():
+            b.setEnabled(not busy)
+        c = self.cur_counts
+        self.cur_primary.setEnabled(not busy and self.cur_action not in ("done", "empty"))
+        self.cur_review_btn.setEnabled(not busy and bool(self.status_all["scenes"]))
+        self.cur_pick_btn.setEnabled(not busy and bool(c["n"]))
+        self.cur_detect_btn.setEnabled(not busy and c["detected"] < c["n"])
+        self._final_buttons()
+        self.cur_rule_btn.setEnabled(not busy and bool(self.status_all["scenes"]))
+        self.cur_clear_btn.setVisible(bool(self.cur_table.selectionModel().selectedRows()))
+        self.cur_table.setEnabled(not busy)
+        self.cur_undo_btn.setVisible(self.mode == "curation" and bool(self.cdata["backups"] or self.cdata["rounds"]))
+        self.cur_undo_btn.setEnabled(not busy)
+        self.cur_detector_btn.setEnabled(not busy)
 
     def _primary(self):
         actions = {"root": self._change_root, "import": self._import,
@@ -1442,8 +3218,10 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         self.job = job
         self._job_kind, self._job_route = kind, route
-        if kind in ("parse", "exclude", "restore"):
+        if kind in ("parse", "exclude", "restore", "apply", "undo"):
             self.validated.pop(DATASET, None)
+        if kind in DATASET_WRITERS:
+            self._stop_viewer()             # it serves the tables it read at start; restarted on the next review
         self._validation_stamp = dataset_stamp(self.dataset) if kind == "validate" else ()
         self._last_log = job.log_path
         job.progress.connect(self._on_progress)
@@ -1456,11 +3234,16 @@ class MainWindow(QtWidgets.QMainWindow):
         self.progress.setRange(0, 1000)
         self.progress.setValue(0)
         self.cancel_btn.setEnabled(True)
-        self.action_kicker.setText("작업 진행 중")
-        self.action_title.setText(title)
-        self.action_desc.setText("아래에서 진행 상황을 확인하세요. 작업이 끝나면 다음 할 일을 안내합니다.")
-        self.primary_btn.setText("진행 중…")
-        self.primary_btn.setVisible(True)
+        on_course = self.mode == "parser"
+        kicker, head, desc, primary = ((self.action_kicker, self.action_title, self.action_desc, self.primary_btn)
+                                       if on_course else
+                                       (self.cur_kicker, self.cur_title, self.cur_desc, self.cur_primary))
+        kicker.setText("작업 진행 중")
+        kicker.setStyleSheet("")
+        head.setText(title)
+        desc.setText("아래에서 진행 상황을 확인하세요. 작업이 끝나면 다음 할 일을 안내합니다.")
+        primary.setText("진행 중…")
+        primary.setVisible(True)
         self._update_buttons()
         job.start()
 
@@ -1477,6 +3260,7 @@ class MainWindow(QtWidgets.QMainWindow):
             stamp = dataset_stamp(self.dataset)
             if stamp and stamp == self._validation_stamp:
                 self.validated[DATASET] = stamp
+                save_validation(self.data_root, stamp, job.log_path)
         self.job = None
         self.cancel_btn.setEnabled(False)
         self.progress.setRange(0, 1000)
@@ -1484,6 +3268,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.job_status.setStyleSheet(f"color: {C['ok'] if ok else C['warn']};")
         self.job_status.setText(f"{job.title} · {message}")
         self.refresh()
+        self._warm_viewer()
         if not ok:
             self.log_panel.show()
             self.log_btn.setText("로그 닫기")
@@ -1539,7 +3324,7 @@ class MainWindow(QtWidgets.QMainWindow):
     def _import(self, _checked=False, source=None):
         if self.job or not self.data_root:
             return
-        dialog = ImportDialog(self, self.data_root, self.route_dirs(), set(self.status_all["logs"]), source=source)
+        dialog = ImportDialog(self, self.data_root, self.route_dirs(), set(self.status_all["imported"]), source=source)
         if (dialog.exec() if hasattr(dialog, "exec") else dialog.exec_()) != QtWidgets.QDialog.DialogCode.Accepted:
             return
         steps, copies = [], 0
@@ -1633,7 +3418,9 @@ class MainWindow(QtWidgets.QMainWindow):
         clash = next((dst for _, dst in moves if dst.exists()), None)
         if clash:
             return self._message("같은 이름의 녹화가 있습니다", f"덮어쓰지 않았습니다. 다음 위치를 확인하세요.\n{clash}")
-        included = rec["name"] in self.status["logs"]
+        # in the tables, or only its import record left after curation took every scene out
+        included = rec["name"] in self.status["imported"]
+        n_scenes = self.status["logs"].get(rec["name"], 0)
         steps = []
         if rec["excluded"]:
             title = f"{rec['name']} 복원"
@@ -1645,8 +3432,10 @@ class MainWindow(QtWidgets.QMainWindow):
             steps += [("move", f"사용할 녹화로 복원 · {src.name}", str(src), str(dst)) for src, dst in moves]
         else:
             message = f"{rec['name']}\n\nbag 사본과 기록 파일을 raw/_excluded/{route}/로 옮깁니다. 외부 원본은 변경하지 않습니다."
-            if included:
-                message += f"\n\n통합 데이터셋에 포함된 {self.status['logs'][rec['name']]}개 씬과 관련 파일도 삭제합니다. 복원 후 다시 파싱해야 데이터셋에 돌아옵니다."
+            if included and n_scenes:
+                message += f"\n\n통합 데이터셋에 포함된 {n_scenes}개 씬과 관련 파일도 삭제합니다. 복원 후 다시 파싱해야 데이터셋에 돌아옵니다."
+            elif included:
+                message += "\n\n큐레이션으로 씬이 모두 빠진 녹화입니다. 남은 파싱 기록을 지워, 복원하면 다시 파싱할 수 있게 합니다."
             else:
                 message += "\n나중에 ‘제외된 녹화 보기’에서 복원할 수 있습니다."
             if not self._confirm("이 녹화를 제외할까요?", message, "데이터셋에서 제거 후 제외" if included else "녹화 제외", True):
@@ -1687,6 +3476,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 self._close_when_done = True
                 self.job.cancel()
             return
+        self._stop_viewer()
         event.accept()
 
 
@@ -1694,6 +3484,8 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     parser.add_argument("--data", type=Path, help=f"data root (raw/, parsed/, logs/); default {DEFAULT_ROOT}")
     args, rest = parser.parse_known_args()
+    if QWebEngineView is not None:          # Qt WebEngine wants this set before the application exists
+        QtCore.QCoreApplication.setAttribute(Qt.ApplicationAttribute.AA_ShareOpenGLContexts)
     app = QtWidgets.QApplication(["tcar-parser", *rest])      # WM_CLASS matches tcar-parser.desktop
     app.setApplicationName("TCAR Parser")
     for font in sorted((ASSETS / "fonts").glob("*.otf")):

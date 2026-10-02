@@ -38,8 +38,14 @@ def main() -> None:
         t = {f.name: json.loads(f.read_text()) for f in jd.glob("*.json")}
         logs = {r["token"] for r in t["log.json"] if r["logfile"] in a.logs}
         missing = set(a.logs) - {r["logfile"] for r in t["log.json"] if r["token"] in logs}
-        if missing:
-            raise SystemExit(f"not in {jd}/log.json: {sorted(missing)}")
+        # curation (curation/apply_selection.py) may have taken every scene of a log out: only
+        # its import record is left, and removing that lets the bag be converted again
+        record_only = {n for n in missing if (a.dataroot / f"{n}.import.json").exists()}
+        if missing - record_only:
+            raise SystemExit(f"not in {jd}/log.json: {sorted(missing - record_only)}")
+        for n in sorted(record_only):
+            (a.dataroot / f"{n}.import.json").unlink()
+            print(f"{n}: no scenes left after curation; removed its import record")
         scenes = [s for s in t["scene.json"] if s["log_token"] in logs]
         sc_tok = {s["token"] for s in scenes}
         smp = {s["token"] for s in t["sample.json"] if s["scene_token"] in sc_tok}

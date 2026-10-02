@@ -1,0 +1,249 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>tcar 데이터 개요</title>
+<script>
+  // links with a #... (scene, review, view) or ?logs= belong to the review screen: the GUI and older bookmarks keep working
+  if (location.hash.length > 1 || location.search.length > 1) location.replace('/review' + location.search + location.hash);
+</script>
+<style>
+  @font-face { font-family: 'Pretendard'; font-weight: 400; src: url(/font/Pretendard-Regular.otf); }
+  @font-face { font-family: 'Pretendard'; font-weight: 500; src: url(/font/Pretendard-Medium.otf); }
+  @font-face { font-family: 'Pretendard'; font-weight: 600; src: url(/font/Pretendard-SemiBold.otf); }
+  @font-face { font-family: 'Pretendard'; font-weight: 700; src: url(/font/Pretendard-Bold.otf); }
+  /* the TCAR Parser app's palette (same as the review screen) */
+  :root { --bg: #0c0c0e; --side: #111113; --panel: #161618; --hover: #1c1c1f; --line: #232327; --line2: #303036;
+          --text: #ececef; --muted: #8e8e96; --faint: #5f5f67; --blue: #8b95ff; --rep: #4cc38a; --prop: #e8a94f;
+          --del: #f07068; --obj: #b9a4ff; --kept: #34343b; }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; background: var(--bg); color: var(--text);
+               font: 14px/1.55 'Pretendard', 'Noto Sans CJK KR', 'Malgun Gothic', system-ui, sans-serif; }
+  .mono, .num { font-family: 'JetBrains Mono', 'D2Coding', ui-monospace, Consolas, monospace; font-variant-numeric: tabular-nums; }
+  .muted { color: var(--muted); }
+  a { color: inherit; }
+  header { position: sticky; top: 0; z-index: 2; display: flex; flex-wrap: wrap; align-items: center; gap: 8px 16px;
+           padding: 12px 24px; background: var(--side); border-bottom: 1px solid var(--line); }
+  header h1 { margin: 0; font-size: 17px; font-weight: 600; }
+  header .path { color: var(--faint); font-size: 12px; }
+  header .sp { flex: 1; }
+  .btn { display: inline-block; padding: 6px 14px; border-radius: 7px; border: 1px solid var(--line2); background: var(--panel);
+         color: var(--text); text-decoration: none; font-weight: 500; font-size: 13px; }
+  .btn:hover { background: var(--hover); border-color: #3c3c43; }
+  .btn.primary { background: var(--text); color: var(--bg); border-color: transparent; font-weight: 600; }
+  .btn.primary:hover { background: #fff; }
+  main { max-width: 1280px; margin: 0 auto; padding: 24px 24px 64px; display: grid; gap: 20px; }
+  .kpis { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 12px; }
+  .kpi { padding: 14px 16px; border: 1px solid var(--line); border-radius: 10px; background: var(--panel); }
+  .kpi .k { color: var(--muted); font-size: 12px; }
+  .kpi .v { font-size: 24px; font-weight: 600; margin-top: 2px; }
+  .kpi .s { color: var(--faint); font-size: 12px; margin-top: 2px; }
+  section { border: 1px solid var(--line); border-radius: 12px; background: var(--panel); padding: 18px 20px; display: grid; gap: 14px; min-width: 0; }
+  section h2 { margin: 0; font-size: 15px; font-weight: 600; }
+  .head { display: flex; flex-wrap: wrap; align-items: baseline; justify-content: space-between; gap: 4px 16px; }
+  .note { color: var(--faint); font-size: 12px; }
+  .two { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 460px), 1fr)); gap: 20px; align-items: start; }
+  /* whole-dataset split */
+  .split { display: flex; height: 30px; border-radius: 7px; overflow: hidden; gap: 2px; background: var(--panel); }
+  .split i { display: flex; align-items: center; padding: 0 10px; font-style: normal; font-size: 12px; font-weight: 600;
+             color: #111; white-space: nowrap; overflow: hidden; min-width: 0; }
+  .split i.kept { background: var(--kept); color: var(--muted); }
+  .c-obj { background: var(--obj); } .c-stop { background: var(--prop); } .c-kept { background: var(--kept); }
+  .legend { display: flex; flex-wrap: wrap; gap: 4px 16px; color: var(--muted); font-size: 12px; }
+  .legend span { display: inline-flex; align-items: center; gap: 6px; }
+  .sw { width: 10px; height: 10px; border-radius: 2px; display: inline-block; }
+  /* tables */
+  .tw { overflow-x: auto; }
+  table { border-collapse: collapse; width: 100%; font-size: 13px; }
+  th, td { padding: 8px 10px; text-align: right; white-space: nowrap; border-bottom: 1px solid var(--line); }
+  th { color: var(--faint); font-weight: 500; font-size: 12px; }
+  th.l, td.l { text-align: left; }
+  td { font-family: 'JetBrains Mono', 'D2Coding', ui-monospace, Consolas, monospace; font-variant-numeric: tabular-nums; }
+  td.l, td.t { font-family: inherit; }
+  tbody tr.route { cursor: pointer; }
+  tbody tr.route:hover { background: var(--hover); }
+  tr.sub td { color: var(--muted); background: var(--side); font-weight: 600; }
+  tr.total td { font-weight: 600; border-top: 1px solid var(--line2); }
+  td .desc { display: block; color: var(--faint); font-size: 12px; white-space: normal; max-width: 44ch; }
+  .bar { display: flex; height: 10px; width: 160px; border-radius: 3px; overflow: hidden; background: var(--kept); gap: 1px; }
+  .bar i { display: block; height: 100%; }
+  .mini { display: inline-block; height: 8px; border-radius: 2px; background: var(--blue); vertical-align: middle; margin-right: 8px; }
+  .pct { color: var(--muted); }
+  .pill { font-size: 11px; padding: 0 7px; border-radius: 999px; border: 1px solid var(--line2); color: var(--muted); font-family: inherit; }
+  svg text { fill: var(--muted); font: 11px 'JetBrains Mono', ui-monospace, Consolas, monospace; }
+  svg .lbl { fill: var(--text); }
+  svg .grid { stroke: var(--line); }
+  .err { color: var(--del); }
+  @media (max-width: 640px) { header, main { padding-left: 16px; padding-right: 16px; } .kpi .v { font-size: 20px; } }
+</style>
+</head>
+<body>
+<header>
+  <h1>tcar 데이터 개요</h1><span class="path mono" id="path"></span><span class="sp"></span>
+  <a class="btn" href="/review#view=del" title="규칙이 삭제를 제안한 씬만">삭제 제안 보기</a>
+  <a class="btn" href="/review#view=obj" title="가까운 객체가 적은 씬부터">객체 적은 씬</a>
+  <a class="btn primary" href="/review#view=all">검토 화면 →</a>
+</header>
+<main>
+  <div class="kpis" id="kpis"></div>
+
+  <section>
+    <div class="head"><h2>로직별 삭제 후보</h2><span class="note" id="ruleNote"></span></div>
+    <div class="split" id="split"></div>
+    <div class="legend" id="splitLeg"></div>
+    <div class="tw"><table id="logic"></table></div>
+  </section>
+
+  <section>
+    <div class="head"><h2>route별</h2><span class="note">행을 누르면 그 route만 검토 화면에서 엽니다 · 가까운 객체 = 샘플당 평균(카메라 6대 합)의 route 평균</span></div>
+    <div class="legend"><span><i class="sw c-obj"></i>객체 부족</span><span><i class="sw c-stop"></i>정지 중복</span><span><i class="sw c-kept"></i>남김</span></div>
+    <div class="tw"><table id="routes"></table></div>
+  </section>
+
+  <div class="two">
+    <section>
+      <div class="head"><h2>씬별 가까운 객체 수</h2><span class="note" id="histNote"></span></div>
+      <div class="tw" id="hist"></div>
+    </section>
+    <section>
+      <div class="head"><h2>클래스별 박스 수</h2><span class="note" id="clsNote"></span></div>
+      <div class="tw" id="cls"></div>
+    </section>
+  </div>
+</main>
+
+<script>
+const $ = id => document.getElementById(id);
+const esc = s => String(s).replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+const routeOf = log => log.split('_')[0];
+const series = log => routeOf(log).split('-')[0];
+const gb = b => (b / 1e9).toFixed(1);
+const pct = (a, b) => b ? (100 * a / b).toFixed(1) + '%' : '-';
+const KINDS = [
+  { key: '객체 부족', cls: 'c-obj', desc: p => `가까운 도로 이용자(박스 높이 ≥ ${p.near}px, 카메라 6대 합)가 샘플당 평균 ${p.min}개 미만` },
+  { key: '정지 중복', cls: 'c-stop', desc: () => '같은 route 안 같은 장소에 멈춘 씬들 중 LiDAR diff가 가장 큰 것만 남김' },
+];
+const CLS = [['car', '승용차'], ['truck', '트럭'], ['bus', '버스'], ['person', '보행자'], ['bicycle', '자전거'], ['motorcycle', '오토바이']];
+async function getJSON(u) { const r = await fetch(u); if (!r.ok) throw new Error(r.status + ' ' + u); return r.json(); }
+const review = logs => '/review' + (logs ? '?logs=' + encodeURIComponent(logs.join(',')) : '') + '#view=all';
+
+async function init() {
+  const [info, sc, sel, dec, obj] = await Promise.all([getJSON('/api/info').catch(() => ({})), getJSON('/api/scenes'),
+    getJSON('/api/selection').catch(() => ({ missing: true })), getJSON('/api/decisions').catch(() => ({ decisions: {} })),
+    getJSON('/api/objects').catch(() => ({ missing: true }))]);
+  $('path').textContent = info.dataroot || '';
+  const scenes = sc.scenes, S = n => (!sel.missing && sel.scenes && sel.scenes[n]) || {};
+  const human = dec.decisions || {};
+  const kind = n => S(n).status === 'remove' ? (S(n).kind || '규칙') : null;
+  const finalDrop = n => ((human[n] || {}).decision || (kind(n) ? 'drop' : 'keep')) === 'drop';
+  const bytes = n => S(n).bytes || 0;
+  const objMean = n => { const o = S(n).objects_near || (!obj.missing && obj.scenes[n] && obj.scenes[n].near); return o ? o.all.mean : null; };
+  const P = { min: (sel.params || {}).min_objects || 0, near: ((sel.params || {}).obj_meta || {}).near_px || (obj.near_px || 50) };
+
+  // ---- summary figures
+  const logs = [...new Set(scenes.map(s => s.log))].sort((a, b) =>
+    series(a).localeCompare(series(b)) || (+routeOf(a).split('-')[1]) - (+routeOf(b).split('-')[1]));
+  const bySeries = {};
+  logs.forEach(l => { (bySeries[series(l)] = bySeries[series(l)] || []).push(l); });
+  const names = scenes.map(s => s.name), totB = names.reduce((a, n) => a + bytes(n), 0);
+  const secs = scenes.reduce((a, s) => a + (s.sample_ts.length ? (s.sample_ts[s.sample_ts.length - 1] - s.sample_ts[0]) / 1e6 + 0.5 : 0), 0);
+  const om = names.map(objMean).filter(v => v != null).sort((a, b) => a - b);
+  const med = om.length ? (om.length % 2 ? om[(om.length - 1) / 2] : (om[om.length / 2 - 1] + om[om.length / 2]) / 2) : null;
+  const props = names.filter(kind), fin = names.filter(finalDrop), nh = Object.keys(human).filter(n => names.includes(n)).length;
+  const hm = s => `${Math.floor(s / 3600)}시간 ${Math.round(s % 3600 / 60)}분`;
+  $('kpis').innerHTML = [
+    ['씬', names.length.toLocaleString(), `20초 단위 · 전체 ${hm(secs)}`],
+    ['route', logs.length, Object.entries(bySeries).map(([k, v]) => `${k} ${v.length}`).join(' · ')],
+    ['용량', gb(totB) + ' GB', `씬당 ${gb(totB / Math.max(1, names.length))} GB`],
+    ['가까운 객체', med == null ? '-' : med.toFixed(1), '씬별 샘플당 평균의 중앙값'],
+    ['삭제 후보', `${props.length} · ${pct(props.length, names.length)}`, `${gb(props.reduce((a, n) => a + bytes(n), 0))} GB`],
+    ['최종 삭제', `${fin.length} · ${pct(fin.length, names.length)}`, nh ? `사람 결정 ${nh}개 반영` : '아직 사람 결정 없음'],
+  ].map(([k, v, s]) => `<div class="kpi"><div class="k">${k}</div><div class="v num">${v}</div><div class="s">${esc(s)}</div></div>`).join('');
+
+  // ---- by logic
+  if (sel.missing) {
+    $('ruleNote').innerHTML = '<span class="err">규칙 결과 없음 — python tools/curate.py 를 먼저 실행하세요</span>';
+  } else {
+    $('ruleNote').textContent = `규칙 실행 ${String(sel.created || '').replace('T', ' ')} · 규칙은 제안만 하고 사람이 검토 화면에서 결정합니다`;
+  }
+  const byKind = KINDS.map(k => ({ ...k, ns: names.filter(n => kind(n) === k.key) }));
+  const other = names.filter(n => kind(n) && !KINDS.some(k => k.key === kind(n)));
+  if (other.length) byKind.push({ key: '기타', cls: 'c-stop', desc: () => '다른 규칙', ns: other });
+  const kept = names.length - props.length;
+  $('split').innerHTML = byKind.filter(k => k.ns.length).map(k => `<i class="${k.cls}" style="flex:${k.ns.length}" title="${k.key} ${k.ns.length}">${k.key} ${pct(k.ns.length, names.length)}</i>`).join('')
+    + `<i class="kept" style="flex:${kept}" title="남김 ${kept}">남김 ${pct(kept, names.length)}</i>`;
+  $('splitLeg').innerHTML = byKind.map(k => `<span><i class="sw ${k.cls}"></i>${k.key} ${k.ns.length}</span>`).join('')
+    + `<span><i class="sw c-kept"></i>남김 ${kept}</span><span>막대 길이 = 씬 수</span>`;
+  const bsum = ns => ns.reduce((a, n) => a + bytes(n), 0);
+  $('logic').innerHTML = `<thead><tr><th class="l">로직</th><th>씬</th><th>씬 비율</th><th>용량 (GB)</th><th>용량 비율</th><th>사람이 남김</th><th>사람이 버림</th></tr></thead><tbody>`
+    + byKind.map(k => `<tr><td class="l t"><span class="sw ${k.cls}"></span> <b>${k.key}</b><span class="desc">${esc(k.desc(P))}</span></td>`
+      + `<td>${k.ns.length}</td><td>${pct(k.ns.length, names.length)}</td><td>${gb(bsum(k.ns))}</td><td>${pct(bsum(k.ns), totB)}</td>`
+      + `<td>${k.ns.filter(n => (human[n] || {}).decision === 'keep').length}</td><td>${k.ns.filter(n => (human[n] || {}).decision === 'drop').length}</td></tr>`).join('')
+    + `<tr class="total"><td class="l t">규칙 제안 합계</td><td>${props.length}</td><td>${pct(props.length, names.length)}</td><td>${gb(bsum(props))}</td><td>${pct(bsum(props), totB)}</td>`
+    + `<td>${props.filter(n => (human[n] || {}).decision === 'keep').length}</td><td>${props.filter(n => (human[n] || {}).decision === 'drop').length}</td></tr>`
+    + `<tr><td class="l t">최종 삭제 <span class="desc">규칙 제안에 사람 결정을 반영한 목록 (삭제 확정 시 빠지는 씬)</span></td><td>${fin.length}</td><td>${pct(fin.length, names.length)}</td>`
+    + `<td>${gb(bsum(fin))}</td><td>${pct(bsum(fin), totB)}</td><td></td><td></td></tr></tbody>`;
+
+  // ---- by route
+  const maxObj = Math.max(1, ...logs.map(l => { const v = names.filter(n => S(n).log === l).map(objMean).filter(x => x != null); return v.length ? v.reduce((a, b) => a + b) / v.length : 0; }));
+  const row = (label, when, ls, cls, href) => {
+    const ns = scenes.filter(s => ls.includes(s.log)).map(s => s.name), n = ns.length;
+    const cnt = KINDS.map(k => ns.filter(m => kind(m) === k.key).length), del = ns.filter(kind).length;
+    const b0 = bsum(ns), b1 = bsum(ns.filter(m => !finalDrop(m))), ov = ns.map(objMean).filter(x => x != null);
+    const o = ov.length ? ov.reduce((a, b) => a + b) / ov.length : null, h = ns.filter(m => human[m]).length;
+    return `<tr class="${cls}"${href ? ` data-href="${esc(href)}"` : ''}><td class="l t"><b>${esc(label)}</b></td><td class="l">${esc(when)}</td><td>${n}</td>`
+      + `<td>${cnt[0]}</td><td>${cnt[1]}</td>`
+      + `<td class="l"><span class="bar">${KINDS.map((k, j) => cnt[j] ? `<i class="${k.cls}" style="width:${100 * cnt[j] / n}%"></i>` : '').join('')}</span></td>`
+      + `<td>${pct(del, n)}</td><td>${gb(b0)} → ${gb(b1)}</td>`
+      + `<td>${o == null ? '-' : `<span class="mini" style="width:${Math.round(60 * o / maxObj)}px"></span>${o.toFixed(1)}`}</td>`
+      + `<td>${h || ''}</td></tr>`;
+  };
+  const when = l => { const m = l.match(/_(\d{4})-(\d\d)-(\d\d)-(\d\d)-(\d\d)/); return m ? `${m[2]}-${m[3]} ${m[4]}:${m[5]}` : ''; };
+  let body = '';
+  for (const [k, ls] of Object.entries(bySeries)) {
+    for (const l of ls) body += row(routeOf(l), when(l), [l], 'route', review([l]));
+    body += row(`${k} 계열 (${ls.length})`, '', ls, 'sub route', review(ls));
+  }
+  body += row('전체', '', logs, 'total', null);
+  $('routes').innerHTML = `<thead><tr><th class="l">route</th><th class="l">녹화</th><th>씬</th><th>객체 부족</th><th>정지 중복</th>`
+    + `<th class="l">삭제 후보</th><th>비율</th><th>용량 GB (최종)</th><th>가까운 객체</th><th>사람 결정</th></tr></thead><tbody>${body}</tbody>`;
+  $('routes').onclick = e => { const tr = e.target.closest('tr[data-href]'); if (tr) location.href = tr.dataset.href; };
+
+  // ---- objects: histogram of scene means, class totals
+  if (!om.length) {
+    $('hist').innerHTML = $('cls').innerHTML = '<p class="err">객체 개수 없음 — python tools/scene_detect.py 를 먼저 실행하세요</p>';
+    return;
+  }
+  const edges = [0, 1, 2, 3, 5, 8, 12, 20, 30, 50, Infinity];
+  const bins = edges.slice(0, -1).map((a, i) => ({ a, b: edges[i + 1], n: om.filter(v => v >= a && v < edges[i + 1]).length }));
+  const W = 560, H = 220, m = { l: 34, r: 8, t: 18, b: 34 }, iw = W - m.l - m.r, ih = H - m.t - m.b, bw = iw / bins.length;
+  const ymax = Math.max(...bins.map(x => x.n)), step = ymax > 50 ? 20 : ymax > 20 ? 10 : 5, ytop = Math.ceil(ymax / step) * step;
+  const y = v => m.t + ih - v / ytop * ih;
+  let s = `<svg width="100%" viewBox="0 0 ${W} ${H}" role="img" aria-label="씬별 가까운 객체 수 분포">`;
+  for (let v = 0; v <= ytop; v += step) s += `<line class="grid" x1="${m.l}" x2="${W - m.r}" y1="${y(v)}" y2="${y(v)}"/><text x="${m.l - 6}" y="${y(v) + 4}" text-anchor="end">${v}</text>`;
+  bins.forEach((x, i) => {
+    const low = P.min && x.b <= P.min, cx = m.l + i * bw;
+    s += `<rect x="${cx + 3}" y="${y(x.n)}" width="${bw - 6}" height="${y(0) - y(x.n)}" rx="3" fill="${low ? 'var(--obj)' : 'var(--blue)'}" opacity="${low ? 1 : .75}"><title>${x.a}–${x.b === Infinity ? '' : x.b}: 씬 ${x.n}개</title></rect>`;
+    if (x.n) s += `<text class="lbl" x="${cx + bw / 2}" y="${y(x.n) - 5}" text-anchor="middle">${x.n}</text>`;
+    s += `<text x="${cx + bw / 2}" y="${H - 16}" text-anchor="middle">${x.b === Infinity ? x.a + '+' : x.a + '–' + x.b}</text>`;
+  });
+  s += `<text x="${m.l}" y="${H - 2}">샘플당 가까운 도로 이용자 (씬 평균)</text></svg>`;
+  $('hist').innerHTML = s;
+  $('histNote').textContent = `${om.length}개 씬 · 중앙값 ${med.toFixed(1)}` + (P.min ? ` · 보라 = ${P.min} 미만 (객체 부족 규칙)` : '');
+  if (!obj.missing) {
+    const tot = Object.fromEntries(CLS.map(([c]) => [c, [0, 0]]));
+    for (const v of Object.values(obj.scenes)) for (const [c] of CLS) { const x = (v.classes || {})[c] || [0, 0]; tot[c][0] += x[0]; tot[c][1] += x[1]; }
+    const vmax = Math.max(1, ...CLS.map(([c]) => tot[c][1]));
+    $('cls').innerHTML = `<table><thead><tr><th class="l">클래스</th><th class="l"></th><th>가까운</th><th>전체</th><th>씬당 가까운</th></tr></thead><tbody>`
+      + CLS.map(([c, ko]) => `<tr><td class="l t" title="${c}">${ko}</td>`
+        + `<td class="l"><span class="mini" style="width:${Math.max(2, Math.round(110 * tot[c][1] / vmax))}px"></span></td>`
+        + `<td>${tot[c][1].toLocaleString()}</td><td>${tot[c][0].toLocaleString()}</td><td>${(tot[c][1] / Math.max(1, Object.keys(obj.scenes).length)).toFixed(1)}</td></tr>`).join('')
+      + '</tbody></table>';
+    $('clsNote').textContent = `${obj.model} · 신뢰도 ≥ ${obj.conf} · 가까운 = 높이 ≥ ${obj.near_px}px · 모든 key frame 합`;
+  }
+}
+init().catch(e => { document.querySelector('main').insertAdjacentHTML('afterbegin', `<p class="err">불러오기 실패: ${esc(e.message)}</p>`); });
+</script>
+</body>
+</html>

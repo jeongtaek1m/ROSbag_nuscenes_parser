@@ -18,8 +18,8 @@ dependencies = [
 plots = ["matplotlib>=3.7", "jupyter"]
 # scripts/rerun_viz.py
 viz = ["rerun-sdk>=0.16"]
-# gui.py (PySide6 also works)
-gui = ["PyQt5>=5.15"]
+# gui.py (PySide6 also works); WebEngine shows the curation review viewer in the window
+gui = ["PyQt5>=5.15", "PyQtWebEngine>=5.15"]
 
 [build-system]
 requires = ["setuptools>=64"]   # 64+ for editable installs (PEP 660)

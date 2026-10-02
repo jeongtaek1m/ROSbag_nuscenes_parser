@@ -780,8 +780,12 @@ def _expand_bags(paths: list[Path]) -> list[Path]:
 
 
 def _imported_logs(json_dir: Path) -> set[str]:
+    """Logs in the dataset, and logs curation took every scene out of: their
+    <log>.import.json stays (curation/apply_selection.py), so they are not
+    converted again. remove_log.py deletes it, so an excluded bag can come back."""
     f = json_dir / "log.json"
-    return {r["logfile"] for r in json.loads(f.read_text())} if f.exists() else set()
+    logs = {r["logfile"] for r in json.loads(f.read_text())} if f.exists() else set()
+    return logs | {p.name[:-len(".import.json")] for p in json_dir.parent.glob("*.import.json")}
 
 
 def run(profile: Profile, doc: str, argv: list[str] | None = None) -> None:
@@ -823,7 +827,7 @@ def run(profile: Profile, doc: str, argv: list[str] | None = None) -> None:
             if len(bags) > 1:
                 print(f"\n{'=' * 78}\n[{i}/{len(bags)}] {bag}")
             if bag.stem in _imported_logs(args.out / args.version):
-                print(f"  already in the dataset (log '{bag.stem}') — skipped")
+                print(f"  already imported (log '{bag.stem}') — skipped")
                 results.append((bag, "skipped", "already imported"))
                 continue
             try:

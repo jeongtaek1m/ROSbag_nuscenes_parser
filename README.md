@@ -222,7 +222,12 @@ dataset, so scene names never collide.
   Bags under a `fail/` folder, and bags already in the dataset, start unticked.
 - **Parse** runs `bag2nuscenes.py` on the course's bags that are not in the dataset
   yet, in route order (A-2 before A-10), appending to `parsed/tcar_nuscenes`.
-- **Validate** loads the whole dataset with nuscenes-devkit.
+- **Validate** loads the whole dataset with nuscenes-devkit. A pass is kept in
+  `logs/validation.json` with every table's mtime and size, so it survives a
+  restart and is void as soon as a parse or an exclusion changes the tables.
+- **Time used**: per course and per bag, the original recording time, the time
+  that became scenes and the ratio (hover for where the rest went), from each
+  log's `<log>.import.json`; the whole dataset's totals alongside.
 - **Yield check** reads only the header stamps (a few hundred bytes per message
   through the bag's chunk index) and applies the converter's frame rule: scenes per
   bag, and a timeline of where the rest went (camera missing or out of sync, LiDAR
@@ -233,6 +238,24 @@ dataset, so scene names never collide.
   its log out of the dataset with `remove_log.py <dataroot> <log>`; restoring moves
   it back for the next parse.
 - Logs already in the dataset whose bag is not under `raw/` are listed as such.
+- **Curation** — the sidebar's 파서 | 큐레이션 switch opens the curation page, over the whole
+  dataset (no course split; the route table lists every route). The top shows how many scenes are **confirmed** (남기기 확정 / 버리기 확정), still
+  **candidates** (후보: a filter caught them — 객체 부족 or 정지 중복, counted per filter — and nobody
+  confirmed them yet), passed every filter (필터 통과) and
+  **deleted** (삭제 완료), updated as confirmations are made (also from a browser), and a map
+  of every scene's GNSS track on OpenStreetMap coloured by route or by state (click a track to
+  pick its route, double-click to review that scene). Below it the picked course, and the
+  routes inside it (select rows, Ctrl/Shift for several), run the [`curation/`](curation/README.md)
+  tools: "미검출 N개 검출" detects the scope's missing scenes, then reruns the rule; "검토 열기"
+  opens the review viewer (cameras, 3D LiDAR, map) inside the window (Qt WebEngine; a browser
+  tab without it). In the review, 남기기 / 버리기 confirm a scene at once (saved to
+  `selection/human_decisions.json` and the lists `keep.txt` / `drop.txt`); a scene left alone stays a
+  candidate. **최종 삭제** on the curation page takes out every confirmed 버리기 scene and nothing
+  else (moved to `<dataset>/_removed/<stamp>/`, the rest renumbered, listed in `deleted.txt`);
+  "마지막 최종 삭제 되돌리기…" undoes the latest. Detection needs a Python with torch and
+  ultralytics, found among the conda environments and remembered ("검출 환경…"). A course's time
+  used on the parser page counts the scenes curation took out, and a bag curation emptied is not
+  parsed again.
 - One job at a time; progress, log and cancel are in the bar at the bottom.
 
 ## Using the dataset
@@ -346,6 +369,7 @@ bag2nuscenes_full.py  # CLI: full dataset
 gui.py                # desktop GUI: import, parse, validate, yield check, exclude
 yield_check.py        # scenes per bag and why the rest is lost, from header stamps only
 remove_log.py         # take one log back out of a converted dataset
+curation/             # scene curation: detection, rule proposals, review viewer, apply/undo
 install_desktop.sh, assets/  # GUI app-menu entry, icons, Pretendard font (OFL)
 packaging/            # build_appimage.sh: the GUI and CLIs as one AppImage
 converter.py          # the pipeline both CLIs run: read, stage, rectify, materialize

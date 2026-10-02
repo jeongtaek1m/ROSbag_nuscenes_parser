@@ -44,7 +44,7 @@ fi
 
 echo "== app"
 cp "$REPO"/*.py "$APPDIR/usr/app/"
-cp -r "$REPO/assets" "$REPO/msg" "$REPO/packet_decoder" "$REPO/scripts" "$APPDIR/usr/app/"
+cp -r "$REPO/assets" "$REPO/curation" "$REPO/msg" "$REPO/packet_decoder" "$REPO/scripts" "$APPDIR/usr/app/"
 find "$APPDIR" -name __pycache__ -type d -prune -exec rm -rf {} +
 # bytecode now: the image is read-only at run time
 "$PY" -m compileall -q -j 0 "$APPDIR/usr/app" "$APPDIR"/usr/python/lib/python3*/site-packages >/dev/null || true

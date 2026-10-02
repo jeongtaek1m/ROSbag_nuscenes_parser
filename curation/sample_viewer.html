@@ -1,0 +1,1588 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>tcar 검토</title>
+<style>
+  @font-face { font-family: 'Pretendard'; font-weight: 400; src: url(/font/Pretendard-Regular.otf); }
+  @font-face { font-family: 'Pretendard'; font-weight: 500; src: url(/font/Pretendard-Medium.otf); }
+  @font-face { font-family: 'Pretendard'; font-weight: 600; src: url(/font/Pretendard-SemiBold.otf); }
+  @font-face { font-family: 'Pretendard'; font-weight: 700; src: url(/font/Pretendard-Bold.otf); }
+  /* the TCAR Parser app's palette */
+  :root { --bg: #0c0c0e; --side: #111113; --panel: #161618; --hover: #1c1c1f; --line: #232327; --line2: #303036;
+          --text: #ececef; --muted: #8e8e96; --faint: #5f5f67; --blue: #8b95ff; --rep: #4cc38a; --prop: #e8a94f;
+          --del: #f07068; --obj: #b9a4ff; }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; margin: 0; background: var(--bg); color: var(--text);
+               font: 13px/1.5 'Pretendard', 'Noto Sans CJK KR', 'Malgun Gothic', system-ui, sans-serif; }
+  body { display: grid; grid-template-rows: auto minmax(0, 1fr); }
+  .mono { font-family: 'JetBrains Mono', 'D2Coding', ui-monospace, Consolas, monospace; font-variant-numeric: tabular-nums; }
+  .muted { color: var(--muted); } .del { color: var(--del); } .rep { color: var(--rep); }
+  button, select { background: var(--panel); color: var(--text); border: 1px solid var(--line2); border-radius: 7px;
+                   padding: 5px 12px; cursor: pointer; font: inherit; font-weight: 500; }
+  button:hover, select:hover { background: var(--hover); border-color: #3c3c43; }
+  button:disabled { opacity: .45; cursor: default; }
+  button[hidden] { display: none; }
+  button.primary { background: var(--text); color: var(--bg); border-color: transparent; font-weight: 600; }
+  button.primary:hover { background: #fff; }
+  button.danger { color: var(--del); border-color: rgba(240, 112, 104, .45); background: transparent; }
+  button.danger:hover { background: rgba(240, 112, 104, .1); }
+  button.quiet { background: transparent; border-color: transparent; color: var(--muted); }
+  button.quiet:hover { color: var(--text); background: var(--hover); }
+  input[type=range] { accent-color: var(--blue); }
+  kbd { font: 11px ui-monospace, Consolas, monospace; opacity: .55; margin-left: 6px; }
+  /* top bar: which scene, and the transport */
+  header { display: flex; align-items: center; gap: 14px; padding: 10px 16px; background: var(--side); border-bottom: 1px solid var(--line); }
+  .ctl { display: flex; align-items: center; gap: 6px; }
+  #title { font-size: 16px; font-weight: 600; white-space: nowrap; }
+  .chip { padding: 1px 9px; border-radius: 999px; border: 1px solid currentColor; font-size: 12px; font-weight: 500; white-space: nowrap; }
+  .chip.prop { border-style: dashed; }
+  .chip.muted { color: var(--muted); border-color: var(--line2); }
+  .chip.obj { color: var(--obj); }
+  #play { min-width: 86px; }
+  #slider { flex: 1; min-width: 120px; }
+  #time { color: var(--muted); min-width: 52px; text-align: right; }
+  .tgl { display: flex; align-items: center; gap: 6px; white-space: nowrap; color: var(--muted); cursor: pointer; }
+  .tgl:has(input:checked) { color: var(--text); }
+  .tgl input { accent-color: var(--blue); margin: 0; }
+  #full, #home { color: var(--faint); font-size: 12px; text-decoration: none; white-space: nowrap; }
+  #full:hover, #home:hover { color: var(--text); }
+  main { display: grid; grid-template-columns: 300px minmax(0, 1fr); min-height: 0; }
+  /* left: the scope's progress, the filters, every scene */
+  #list { overflow: auto; background: var(--side); border-right: 1px solid var(--line); padding: 12px 0 16px; }
+  #sum { margin: 0 12px 10px; padding: 14px; border: 1px solid var(--line); border-radius: 10px; background: var(--panel); }
+  #sum .scope { font-size: 15px; font-weight: 600; }
+  #sum .scope span { color: var(--muted); font-size: 13px; font-weight: 400; margin-left: 6px; }
+  #sum .line { display: flex; justify-content: space-between; gap: 6px; margin-top: 10px; color: var(--muted); }
+  #sum .line b { color: var(--text); font-weight: 600; }
+  #sum .line > span:first-child { white-space: nowrap; }
+  #sum .line > span:last-child { text-align: right; }
+  #sum .note { margin-top: 10px; color: var(--faint); font-size: 11.5px; line-height: 1.5; }
+  body.app #home, body.app #full { display: none; }
+  #newver { position: fixed; top: 10px; left: 50%; transform: translateX(-50%); z-index: 50; display: flex; gap: 10px; align-items: center;
+            padding: 8px 10px 8px 14px; background: #1c1c1f; border: 1px solid var(--rep); border-radius: 9px; font-size: 13px;
+            box-shadow: 0 6px 24px rgba(0, 0, 0, .5); }
+  #newver[hidden] { display: none; }
+  #sum .bar { height: 4px; margin-top: 5px; border-radius: 2px; background: var(--line2); overflow: hidden; }
+  #sum .bar i { display: block; height: 100%; background: var(--rep); }
+  #sum .bar.ready i { background: var(--blue); }
+  #sum .go { width: 100%; margin-top: 12px; padding: 8px 0; }
+  #sum .go + .go { margin-top: 6px; }
+  #sum select { padding: 0 4px; font-size: 12px; }
+  .tabs { display: flex; gap: 2px; margin: 0 12px 4px; padding: 3px; background: var(--panel); border: 1px solid var(--line2); border-radius: 9px; }
+  .tabs { flex-wrap: wrap; }
+  .tabs button { flex: 1 1 auto; padding: 5px 6px; border: none; background: transparent; color: var(--muted); font-size: 12px; border-radius: 7px; white-space: nowrap; }
+  .tabs button:hover { color: var(--text); background: transparent; }
+  .tabs button.on { background: var(--line2); color: var(--text); font-weight: 600; }
+  .tabs button i { font-style: normal; color: var(--faint); margin-left: 4px; }
+  #list .sec { display: flex; justify-content: space-between; gap: 8px; padding: 14px 16px 6px; color: var(--muted); font-size: 12px; font-weight: 500; }
+  #list .row { display: flex; gap: 8px; align-items: center; min-height: 34px; padding: 0 12px 0 13px; cursor: pointer; border-left: 3px solid transparent; }
+  #list .row:hover { background: var(--hover); }
+  #list .row.prop { border-left-color: var(--prop); background: rgba(232, 169, 79, .05); }
+  #list .row.drop { border-left-color: var(--del); background: rgba(240, 112, 104, .06); }
+  #list .row.cur { background: #202027; border-left-color: var(--blue); }
+  #list .row.cur.prop { border-left-color: var(--prop); background: #2a241b; }
+  #list .row.cur.drop { border-left-color: var(--del); background: #2c1f1e; }
+  #list .row b { font: 600 13px 'JetBrains Mono', 'D2Coding', ui-monospace, Consolas, monospace; }
+  #list .row .kind { flex: 1; min-width: 0; color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  #list .row.child { padding-left: 24px; }
+  #list .row .br { color: var(--faint); font-family: ui-monospace, Consolas, monospace; }
+  #list .row .gp { padding: 1px 8px; font-size: 11px; }
+  .rd { width: 7px; height: 7px; border-radius: 50%; flex: none; border: 1px solid var(--faint); }
+  .rd.part { background: conic-gradient(var(--blue) var(--p), transparent 0); border-color: var(--blue); }
+  .rd.ok { background: var(--blue); border-color: var(--blue); }
+  .ob { font: 11px ui-monospace, Consolas, monospace; color: var(--faint); white-space: nowrap; }
+  .ob.low { color: var(--obj); }
+  .st { font-size: 11px; font-weight: 600; white-space: nowrap; padding: 0 7px; line-height: 18px; border-radius: 999px; }
+  .st.prop { color: var(--prop); box-shadow: inset 0 0 0 1px rgba(232, 169, 79, .6); }
+  .st.drop { color: #1a0d0c; background: var(--del); }
+  .st.keep { color: #0c1a12; background: var(--rep); }
+  .st.rule { color: var(--rep); box-shadow: inset 0 0 0 1px rgba(76, 195, 138, .45); }
+  .st.lock { color: var(--muted); box-shadow: inset 0 0 0 1px var(--line2); }
+  /* main view */
+  #view { display: grid; grid-template-rows: auto minmax(0, 1fr); gap: 12px; padding: 14px 16px; min-height: 0; }
+  /* decision card: the rule's verdict on this scene, why, and the person's decision */
+  #banner { display: flex; align-items: center; gap: 24px; padding: 14px 16px 14px 18px; border-radius: 10px;
+            background: var(--panel); border: 1px solid var(--line); border-left: 4px solid var(--faint); }
+  #banner.prop { border-left-color: var(--prop); }
+  #banner.drop { border-left-color: var(--del); }
+  #banner.keep { border-left-color: var(--rep); }
+  #banner[hidden] { display: none; }
+  #banner .why { flex: 1; min-width: 0; }
+  #banner .verdict { display: flex; align-items: center; flex-wrap: wrap; gap: 10px; font-size: 15px; font-weight: 600; }
+  #banner .lines { margin-top: 6px; color: var(--muted); }
+  #banner .lines div { margin-top: 2px; }
+  #banner .lines b { color: var(--text); font-weight: 600; }
+  #banner .cmp { padding: 2px 10px; font-size: 12px; }
+  #banner .acts { display: flex; flex-direction: column; align-items: flex-end; gap: 8px; }
+  #banner .btns { display: flex; align-items: center; gap: 8px; }
+  .seg { display: flex; gap: 2px; padding: 3px; background: var(--bg); border: 1px solid var(--line2); border-radius: 9px; }
+  .seg button { border: none; background: transparent; padding: 7px 16px; border-radius: 7px; color: var(--muted); font-weight: 600; }
+  .seg button:hover { color: var(--text); background: var(--hover); }
+  .seg button.keepb.on { background: var(--rep); color: #0c1a12; }
+  .seg button.dropb.on { background: var(--del); color: #1a0d0c; }
+  .seg button.on.auto { background: transparent; }
+  .seg button.keepb.on.auto { color: var(--rep); box-shadow: inset 0 0 0 1px rgba(76, 195, 138, .6); }
+  .seg button.dropb.on.auto { color: var(--del); box-shadow: inset 0 0 0 1px rgba(240, 112, 104, .6); }
+  #dNext { padding: 8px 16px; }
+  #banner .prog { color: var(--faint); font-size: 12px; }
+  /* cameras, route, LiDAR */
+  #grid { position: relative; display: grid; grid-template-columns: minmax(0, 1.6fr) minmax(0, 1fr); gap: 12px; min-height: 0; }
+  #left { display: grid; grid-template-rows: auto minmax(0, 1fr); gap: 12px; min-height: 0; }
+  #camBox { display: grid; gap: 8px; }
+  #cams { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 6px; }
+  #cams figure { position: relative; margin: 0; aspect-ratio: 16 / 9; background: #000; border-radius: 8px; overflow: hidden; }
+  #cams img { width: 100%; height: 100%; object-fit: cover; display: block; }
+  #cams figcaption { position: absolute; left: 8px; top: 6px; padding: 0 8px; border-radius: 999px; font-size: 11px; font-weight: 500;
+                     line-height: 18px; background: rgba(0, 0, 0, .6); }
+  svg.boxes { position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none; }
+  svg.boxes rect { fill: none; stroke-width: 2; vector-effect: non-scaling-stroke; }
+  svg.boxes .veh { stroke: #6ea8ff; } svg.boxes .ped { stroke: #ffd24a; } svg.boxes .two { stroke: #f472b6; }
+  svg.boxes .far { stroke-width: 1; opacity: .6; }
+  svg.boxes .ex { stroke: #9aa3b2; stroke-dasharray: 6 4; }
+  svg.boxes text { font: 600 36px 'Pretendard', system-ui, sans-serif; paint-order: stroke; stroke: rgba(0, 0, 0, .8); stroke-width: 8px; }
+  #cams svg.boxes text { display: none; }
+  #boxLeg { grid-column: 1 / -1; display: flex; flex-wrap: wrap; gap: 2px 14px; color: var(--faint); font-size: 12px; }
+  #boxLeg i { display: inline-block; width: 12px; height: 8px; border: 2px solid; border-radius: 2px; margin-right: 4px; }
+  #boxLeg i.far { border-width: 1px; } #boxLeg i.ex { border-style: dashed; border-color: #9aa3b2; }
+  #boxLeg b { color: var(--text); font-weight: 600; }
+  .panel { position: relative; display: grid; grid-template-rows: auto minmax(0, 1fr) auto; background: var(--panel);
+           border: 1px solid var(--line); border-radius: 10px; overflow: hidden; min-height: 0; }
+  .panel .ph { display: flex; justify-content: space-between; gap: 8px; padding: 8px 12px 0; font-size: 12px; font-weight: 600; color: var(--muted); }
+  .panel .pf { padding: 0 12px 8px; }
+  canvas { display: block; width: 100%; height: 100%; background: transparent; }
+  #map { min-height: 100px; }
+  #right { min-height: 0; }
+  #lidar { cursor: grab; } #lidar:active { cursor: grabbing; }
+  #stat, #lidarNote { color: var(--faint); font-size: 12px; font-weight: 400; }
+  /* loading: playback waits for the cache instead of stuttering */
+  .load { position: absolute; inset: 0; display: grid; place-items: center; z-index: 5; border-radius: 10px;
+          background: rgba(12, 12, 14, .7); backdrop-filter: blur(2px); }
+  .load[hidden] { display: none; }
+  .load .box { width: 340px; padding: 18px 20px; background: var(--panel); border: 1px solid var(--line2); border-radius: 12px; }
+  .load .t { font-size: 15px; font-weight: 600; }
+  .load .s { margin-top: 4px; color: var(--muted); font-size: 12px; }
+  .load .bar { height: 4px; margin-top: 12px; border-radius: 2px; background: var(--line2); overflow: hidden; }
+  .load .bar i { display: block; height: 100%; width: 0; background: var(--blue); transition: width .3s; }
+  /* review: the kept scene and its deletion proposals side by side (opened from a stop duplicate's card) */
+  #rev { position: fixed; inset: 0; display: grid; grid-template-rows: auto auto minmax(0, 1fr) auto; gap: 10px;
+         padding: 14px 16px; background: var(--bg); }
+  #rev[hidden] { display: none; }
+  #rev .bar { display: flex; align-items: center; gap: 10px; }
+  #revTitle { font-size: 15px; font-weight: 600; white-space: nowrap; }
+  #revSlider { flex: 1; min-width: 80px; }
+  #revReason { color: var(--muted); }
+  #revTiles { position: relative; display: grid; grid-template-columns: 1fr 1fr; grid-auto-rows: minmax(0, 1fr); gap: 12px; min-height: 0; }
+  #revTiles figure { margin: 0; display: grid; grid-template-rows: auto minmax(0, 1fr); gap: 8px; min-height: 0;
+                     padding: 10px; background: var(--panel); border: 1px solid var(--line); border-radius: 10px; }
+  #revTiles figure.drop { border-color: rgba(240, 112, 104, .6); }
+  #revTiles figure.keep { border-color: rgba(76, 195, 138, .5); }
+  #revTiles figcaption { display: flex; align-items: center; gap: 8px; font-size: 14px; }
+  #revTiles figcaption .sp { flex: 1; }
+  #revTiles img { width: 100%; height: 100%; object-fit: contain; background: #000; border-radius: 8px; min-height: 0; }
+  #revTiles .body { display: grid; grid-template-columns: minmax(0, 1fr); gap: 6px; min-height: 0; }
+  #revTiles .body.both { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); }
+  #revTiles .body canvas { height: 100%; min-height: 0; cursor: grab; }
+  #revTiles .body.cam canvas, #revTiles .body.lid .camwrap { display: none; }
+  #revTiles .camwrap { position: relative; min-height: 0; }
+  #revTiles figure.revmap { grid-column: 1 / -1; }
+  #revTiles figure.revmap .mapwrap { position: relative; min-height: 0; }
+  #revTiles figure.revmap canvas { position: absolute; inset: 0; width: 100%; height: 100%; border-radius: 8px; background: #101013; }
+  .dec { display: flex; gap: 2px; padding: 3px; background: var(--bg); border: 1px solid var(--line2); border-radius: 9px; }
+  .dec button { border: none; background: transparent; padding: 4px 14px; border-radius: 7px; color: var(--muted); font-weight: 600; }
+  .dec button.on.keep { background: var(--rep); color: #0c1a12; }
+  .dec button.on.drop { background: var(--del); color: #1a0d0c; }
+  .dec button.on.auto { background: transparent; box-shadow: inset 0 0 0 1px currentColor; }
+  .dec button.on.auto.keep { color: var(--rep); } .dec button.on.auto.drop { color: var(--del); }
+  #revFoot { display: flex; align-items: center; gap: 12px; color: var(--faint); font-size: 12px; }
+  #revFoot .sp { flex: 1; }
+  #revDone { color: var(--rep); font-weight: 600; }
+  /* 삭제 확정: plan first, then run */
+  #apply { position: fixed; inset: 0; display: grid; place-items: center; background: rgba(5, 6, 8, .78); }
+  #apply[hidden] { display: none; }
+  #apply .box { width: min(680px, calc(100vw - 32px)); max-height: 80vh; overflow: auto; padding: 18px 20px;
+                background: var(--panel); border: 1px solid var(--line2); border-radius: 12px; }
+  #apply h3 { margin: 0 0 12px; font-size: 17px; }
+  #apply .row { margin: 8px 0; }
+  #apply .warn { color: var(--prop); }
+  #apply .names { margin-top: 3px; font-family: ui-monospace, Consolas, monospace; font-size: 12px; color: var(--muted); }
+  #apply .acts { display: flex; justify-content: flex-end; gap: 8px; margin-top: 16px; }
+</style>
+</head>
+<body>
+<header>
+  <div class="ctl">
+    <button id="prevScene" class="quiet" title="이전 씬 (↑)">↑</button><button id="nextScene" class="quiet" title="다음 씬 (↓)">↓</button>
+    <span id="title">…</span><span class="chip" id="chip"></span><span class="chip obj" id="objChip" hidden></span>
+  </div>
+  <div class="ctl" style="flex: 1">
+    <button id="play" title="재생 / 멈춤 (Space)">▶ 재생</button>
+    <select id="speed" title="배속"><option value="0.5">0.5×</option><option value="1" selected>1×</option><option value="2">2×</option><option value="4">4×</option></select>
+    <input type="range" id="slider" min="0" max="39" value="0" title="key frame (← →)">
+    <span id="time" class="mono">0.0 s</span>
+  </div>
+  <label id="boxLab" class="tgl" title="객체 수 규칙이 센 2D 박스. key frame에만 있어서 멈춰 있을 때 보입니다 (B)"><input type="checkbox" id="boxOn"> 2D 박스</label>
+  <label id="autoLab" class="tgl" title="씬이 끝나면 목록의 다음 씬을 이어서 재생"><input type="checkbox" id="autoNext"> 이어서 재생</label>
+  <a id="home" href="/" title="데이터 개요: route별 씬 수, 객체 수, 로직별 삭제 후보">개요</a>
+  <a id="full" href="/full" title="이전의 자세한 뷰어 (분포, 위험, 라벨 등)">자세히 ↗</a>
+</header>
+<main>
+  <nav id="list"></nav>
+  <section id="view">
+    <div id="banner" hidden>
+      <div class="why"><div class="verdict"><span id="dChip" class="chip"></span><span id="dTitle"></span></div><div class="lines" id="dLines"></div></div>
+      <div class="acts">
+        <div class="btns">
+          <div class="seg">
+            <button id="dKeep" class="keepb" title="남기기로 확정합니다 (K) · 다시 누르면 후보로 돌아갑니다">남기기 확정<kbd>K</kbd></button>
+            <button id="dDrop" class="dropb" title="버리기로 확정합니다 (D) · 확정한 씬만 앱의 최종 삭제에서 빠집니다 · 다시 누르면 후보로">버리기 확정<kbd>D</kbd></button>
+          </div>
+          <button id="dSkip" title="이 후보는 지금 확정하지 않고 넘깁니다 (S) · 건너뛴 후보는 나머지를 다 본 뒤 다시 나옵니다">건너뛰기<kbd>S</kbd></button>
+          <button id="dNext" class="primary" title="아직 확정하지 않은 다음 후보로 (N)">다음 후보<kbd>N</kbd></button>
+        </div>
+        <span class="prog" id="dProg"></span>
+      </div>
+    </div>
+    <div id="grid">
+      <div id="left">
+        <div id="camBox"><div id="cams"></div></div>
+        <div class="panel"><div class="ph"><span>경로</span><span id="stat"></span></div><canvas id="map"></canvas><div class="pf"></div></div>
+      </div>
+      <div id="right" class="panel">
+        <div class="ph"><span>LiDAR</span></div>
+        <canvas id="lidar"></canvas>
+        <div class="pf" id="lidarNote">드래그 = 회전 · 오른쪽 드래그 = 이동 · 휠 = 확대 · 더블클릭 = 처음 시점 · 원 10 m 간격 · 색 = 높이</div>
+      </div>
+      <div class="load" id="load" hidden><div class="box"><div class="t" id="loadT">불러오는 중</div><div class="s" id="loadS"></div><div class="bar"><i id="loadBar"></i></div></div></div>
+    </div>
+  </section>
+</main>
+
+<div id="newver" hidden><span>검토 화면이 업데이트됐습니다</span><button class="primary" onclick="location.reload()">새로고침</button></div>
+<div id="rev" hidden>
+  <div class="bar">
+    <span id="revTitle"></span>
+    <button id="revPrev" title="이전 그룹 (←)">◀ 이전</button><button id="revNext" title="다음 그룹 (→)">다음 ▶</button>
+    <button id="revPlay" title="재생 / 멈춤 (Space)">▶ 재생</button>
+    <select id="revSpeed" title="배속"><option value="0.5">0.5×</option><option value="1" selected>1×</option><option value="2">2×</option><option value="4">4×</option></select>
+    <input type="range" id="revSlider" min="0" max="20" step="0.1" value="0">
+    <span id="revTime" class="mono">0.0 s</span>
+    <select id="revCam" title="카메라"></select>
+    <button id="revClose">닫기 (Esc)</button>
+  </div>
+  <div id="revReason" class="muted"></div>
+  <div id="revTiles"></div>
+  <div id="revFoot">
+    <span>씬마다 <b>남기기 / 버리기</b>를 누르면 확정 (바로 저장, 다시 누르면 후보로) · 점선 = 아직 후보 · <b>A</b> 후보대로 확정하고 다음 · <b>S</b> 건너뛰기 · <b>← →</b> 이전/다음 그룹 · <b>Space</b> 재생</span>
+    <span class="sp"></span><span id="revDone"></span>
+    <button id="revSkip" title="이 그룹은 지금 확정하지 않고 다음 그룹으로 (S) · 건너뛴 그룹은 나머지를 다 본 뒤 다시 나옵니다">건너뛰기 →</button>
+    <button id="revAccept" class="primary" title="아직 확정하지 않은 scene을 후보대로 확정하고 다음 그룹으로 (A)">후보대로 확정 → 다음</button>
+  </div>
+</div>
+
+<div id="apply" hidden>
+  <div class="box">
+    <h3>삭제 확정</h3>
+    <div id="applyBody"></div>
+    <div class="acts"><button id="applyCancel">취소</button><button id="applyRun" class="danger">실행 (되돌리기 가능)</button></div>
+  </div>
+</div>
+
+<script>
+const $ = id => document.getElementById(id);
+const esc = s => String(s).replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+const CAMS = ['CAM_FRONT_LEFT', 'CAM_FRONT', 'CAM_FRONT_RIGHT', 'CAM_BACK_LEFT', 'CAM_BACK', 'CAM_BACK_RIGHT'];
+const CAM_KO = { CAM_FRONT_LEFT: '앞 왼쪽', CAM_FRONT: '앞', CAM_FRONT_RIGHT: '앞 오른쪽',
+                 CAM_BACK_LEFT: '뒤 왼쪽', CAM_BACK: '뒤', CAM_BACK_RIGHT: '뒤 오른쪽' };
+const short = n => n.slice(-4);
+const routeOf = log => log.split('_')[0];
+
+let scenes = [], byName = {}, sel = null, human = {}, order = [], cur = { si: -1, i: 0 }, req = 0;
+const listed = () => scenes.filter(s => !s.extra);   // `extra`: out of ?logs=, loaded only as a candidate's kept scene
+let groupOf = {}, bounds = null, lastEgo = null, listView = 'all', SEQ = [];   // SEQ: every listed scene, route order
+try { listView = localStorage.getItem('simple.view') || 'all'; } catch (e) {}
+
+// ---------- data ----------
+async function getJSON(u) { const r = await fetch(u); if (!r.ok) throw new Error(r.status + ' ' + u); return r.json(); }
+const cache = new Map();
+function cached(u) {   // small LRU for sample JSON
+  if (cache.has(u)) { const p = cache.get(u); cache.delete(u); cache.set(u, p); return p; }
+  const p = getJSON(u);
+  cache.set(u, p);
+  if (cache.size > 60) cache.delete(cache.keys().next().value);
+  p.catch(() => cache.delete(u));
+  return p;
+}
+const S = n => (sel && !sel.missing && sel.scenes && sel.scenes[n]) || {};
+// ?logs=a,b: show only these logs' scenes (a course or a route, as the TCAR Parser GUI opens it); apply is scoped too
+const ONLY = (new URLSearchParams(location.search).get('logs') || '').split(',').filter(Boolean);
+if (new URLSearchParams(location.search).get('app')) document.body.classList.add('app');   // inside TCAR Parser: no links out
+// ---------- fewest objects: the lowest share of scenes by near road users per sample (shown only, the rule decides nothing here) ----------
+const OBJ = { share: 0.3, low: new Set(), sorted: [], rank: {}, cut: null };
+try { OBJ.share = +localStorage.getItem('simple.objShare') || 0.3; } catch (e) {}
+const objOf = n => { const o = S(n).objects_near; return o ? o.all.mean : null; };
+function objRank() {
+  OBJ.sorted = listed().map(s => s.name).filter(n => objOf(n) != null).sort((a, b) => objOf(a) - objOf(b) || (a < b ? -1 : 1));
+  const k = Math.round(OBJ.sorted.length * OBJ.share);
+  OBJ.low = new Set(OBJ.sorted.slice(0, k));
+  OBJ.cut = k ? objOf(OBJ.sorted[k - 1]) : null;
+  OBJ.rank = Object.fromEntries(OBJ.sorted.map((n, i) => [n, i + 1]));
+}
+const objBadge = n => objOf(n) == null ? '' : `<span class="ob${OBJ.low.has(n) ? ' low' : ''}" title="가까운 도로 이용자 샘플당 평균 `
+  + `(카메라 6대 합) · 적은 순 ${OBJ.rank[n]} / ${OBJ.sorted.length}">${objOf(n).toFixed(1)}</span>`;
+const diffOf = n => S(n).lidar_cells == null ? '?' : S(n).lidar_cells.toFixed(0);
+const capOf = n => [S(n).lidar_cells != null ? `diff ${diffOf(n)}` : '',
+                    S(n).objects_near ? `객체 ${S(n).objects_near.all.mean.toFixed(1)}` : ''].filter(Boolean).join(' · ');
+
+// ---------- decisions: a scene a filter caught (객체 부족, 정지 중복) is a candidate (후보); the rest passed the filters
+// (필터 통과). A person confirms (남기기 확정 / 버리기 확정).
+// Confirmed decisions are saved at once (selection/human_decisions.json, keep.txt, drop.txt); the app's final deletion
+// takes out only the confirmed 버리기 scenes. ----------
+const ruleDrop = n => S(n).status === 'remove';
+const humanOf = n => (human[n] && human[n].decision) || null;               // 'keep' | 'drop' | null
+const lockedOf = n => !!S(n).locked;             // an earlier round's 최종 확정: stays for good, no decision here
+const stateOf = n => lockedOf(n) ? 'locked' : humanOf(n) || (ruleDrop(n) ? 'cand' : 'pass');   // keep | drop | cand | pass | locked
+const kindOf = n => S(n).kind || '기타';                                     // the filter that caught a candidate
+const STEP = { '정지 중복': 1, '객체 부족': 2, '경로 겹침': 3 };                 // the filters' fixed order
+const SKIP = new Set();                          // candidates passed over for now: they come back after the rest
+try { JSON.parse(localStorage.getItem('simple.skip') || '[]').forEach(n => SKIP.add(n)); } catch (e) {}
+const saveSkip = () => { try { localStorage.setItem('simple.skip', JSON.stringify([...SKIP])); } catch (e) {} };
+const skipped = n => SKIP.has(n) && !humanOf(n);
+const STATE_KO = { keep: '남기기 확정', drop: '버리기 확정', cand: '후보', pass: '필터 통과', locked: '잠김 · 이전 라운드 확정' };
+const stateKo = n => stateOf(n) === 'cand' ? `후보 · ${kindOf(n)}` : STATE_KO[stateOf(n)];
+const finalDrop = n => (humanOf(n) || (ruleDrop(n) ? 'drop' : 'keep')) === 'drop';
+const childrenOf = p => Object.keys((sel && sel.scenes) || {}).filter(m => byName[m] !== undefined && ruleDrop(m) && S(m).substitute === p)
+  .sort((a, b) => (S(b).lidar_cells || 0) - (S(a).lidar_cells || 0));
+const isRuleRep = n => !ruleDrop(n) && childrenOf(n).length > 0;
+let GROUPS = [];                                  // review items: [kept scene, ...its deletion proposals]
+function buildGroups() {
+  const parents = [];
+  for (const s of listed()) {
+    const n = s.name;
+    if (ruleDrop(n)) {
+      const sub = S(n).substitute, p = sub && byName[sub] !== undefined ? sub : n;   // its kept scene may be outside ?logs=
+      if (!parents.includes(p)) parents.push(p);
+    }
+  }
+  parents.sort((a, b) => order.indexOf(byName[a]) - order.indexOf(byName[b]));
+  GROUPS = parents.map(p => ruleDrop(p) ? [p] : [p, ...childrenOf(p)]);
+  const gStep = g => STEP[kindOf(g.length > 1 ? g[1] : g[0])] || 9;   // ① 정지 중복 → ② 객체 부족 → ③ 경로 겹침
+  GROUPS.sort((a, b) => gStep(a) - gStep(b));                        // stable: list order inside a filter
+}
+function nextGroup(from) {   // the next group not settled, skipped ones last, after `from` first
+  const open = GROUPS.map((g, k) => k).filter(k => k !== from && !groupDone(GROUPS[k]));
+  const rank = k => GROUPS[k].some(skipped) ? 1 : 0, after = k => (k - from + GROUPS.length) % GROUPS.length;
+  open.sort((a, b) => rank(a) - rank(b) || after(a) - after(b));
+  return open.length ? open[0] : -1;
+}
+const groupDone = g => g.every(n => humanOf(n));
+const groupBtn = gi => GROUPS[gi].length > 1   // 비교: the group side by side (confirmed or not: a choice can be changed there)
+  ? `<button class="gp" data-review="${gi}" title="나란히 재생하며 비교 · 확정한 뒤에도 다시 보고 바꿀 수 있습니다">비교</button>`
+  : `<button class="gp" data-review="${gi}" title="크게 재생하며 보기 · 확정한 뒤에도 바꿀 수 있습니다">보기</button>`;
+const groupIndexOf = n => GROUPS.findIndex(g => g.includes(n));
+function tag(n) {   // one short status per scene: the proposal until a person decides
+  const h = humanOf(n);
+  if (lockedOf(n)) return '<span class="st lock" title="이전 라운드에서 최종 확정 · 삭제되지 않음">잠김</span>';
+  if (h === 'drop') return '<span class="st drop">버리기 확정</span>';
+  if (h === 'keep') return `<span class="st keep">남기기 확정</span>`;
+  if (ruleDrop(n)) return `<span class="st prop" title="후보: 이 필터에 걸림 · 아직 확정 전${skipped(n) ? ' · 건너뜀' : ''}">${esc(kindOf(n))}${skipped(n) ? ' · 건너뜀' : ''}</span>`;
+  if (isRuleRep(n)) return `<span class="st rule" title="필터 통과: 같은 곳에 멈춘 씬 중 대표">대표</span>`;
+  return '';
+}
+async function decide(n, v, via = 'manual') {   // v: 'keep' | 'drop' | null (back to the proposal); logged in decisions_log.txt
+  if (lockedOf(n)) { alertLine(`${short(n)}: 이전 라운드에서 최종 확정된 씬이라 바꿀 수 없습니다`); return; }
+  const r = await fetch('/api/decisions', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+                                            body: JSON.stringify({ scene: n, decision: v, via }) });
+  if (!r.ok) { alertLine('저장 실패: HTTP ' + r.status); return; }
+  human = (await r.json()).decisions || {};
+  if (v && SKIP.delete(n)) saveSkip();
+  refreshStatus();
+}
+function alertLine(t) { $('revDone').textContent = t; $('stat').textContent = t; }
+function refreshStatus() {
+  buildList();
+  if (cur.si >= 0) { header(scenes[cur.si]); banner(scenes[cur.si]); }
+  if (!$('rev').hidden) renderReviewState();
+}
+
+// ---------- left: summary + list ----------
+const pct = (a, b) => a ? `−${((1 - b / a) * 100).toFixed(1)}%` : '';
+const gb = v => (v / 1e9).toFixed(1) + ' GB';
+const sumBytes = ns => ns.reduce((a, n) => a + (S(n).bytes || 0), 0);
+let READY = {};
+function buildList() {
+  const logs = [], routeOrder = sel && sel.routes ? sel.routes.map(r => r.log) : [];
+  for (const s of listed()) if (!logs.includes(s.log)) logs.push(s.log);
+  logs.sort((a, b) => (routeOrder.indexOf(a) + 1 || 99) - (routeOrder.indexOf(b) + 1 || 99));
+  SEQ = logs.flatMap(lg => scenes.map((s, i) => i).filter(i => scenes[i].log === lg && !scenes[i].extra));   // whatever tab
+  const all = listed().map(s => s.name);
+  const props = all.filter(ruleDrop), open = props.filter(n => !humanOf(n));
+  const cKeep = all.filter(n => humanOf(n) === 'keep').length, cDrop = all.filter(n => humanOf(n) === 'drop').length;
+  const nPass = all.filter(n => stateOf(n) === 'pass').length;
+  const ready = all.filter(n => (READY[n] || 0) >= 0.999).length;
+  const scope = ONLY.length ? [...new Set(ONLY.map(routeOf))].join(', ') : '전체';
+  const on = v => listView === v ? ' class="on"' : '';
+  let html = `<div id="sum"><div class="scope">${esc(scope)}<span>씬 ${all.length}개</span></div>`
+    + `<div class="line"><span>후보 확정</span><span><b>${props.length - open.length}</b> / ${props.length}</span></div>`
+    + `<div class="bar"><i style="width:${props.length ? (props.length - open.length) / props.length * 100 : 100}%"></i></div>`
+    + `<div class="line"><span>후보</span><span>${Object.entries(props.reduce((a, n) => (a[kindOf(n)] = (a[kindOf(n)] || 0) + 1, a), {}))
+          .sort((a, b) => (STEP[a[0]] || 9) - (STEP[b[0]] || 9)).map(([k, v]) => `${esc(k)} <b>${v}</b>`).join(' · ') || '없음'}</span></div>`
+    + `<div class="line"><span>확정</span><span>남기기 <b>${cKeep}</b> · 버리기 <b>${cDrop}</b> · 필터 통과 <b>${nPass}</b></span></div>`
+    + `<div class="line" title="재생용 사본이 로컬 디스크에 다 있는 씬. 씬을 열면 그 씬부터 목록 순서대로 준비합니다"><span>재생 준비</span><span><b>${ready}</b> / ${all.length}</span></div>`
+    + `<div class="bar ready"><i style="width:${all.length ? ready / all.length * 100 : 0}%"></i></div>`
+    + (open.some(skipped) ? `<div class="line"><span>건너뜀</span><span><b>${open.filter(skipped).length}</b>개 · 나머지 뒤에 다시</span></div>` : '')
+    + (open.length ? `<button class="go primary" data-next="1">다음 후보 · ${open.length}개 남음</button>` : '')
+    + `<div class="note">필터(① 정지 중복 → ② 객체 부족 → ③ 경로 겹침, 앞에서 걸린 씬은 뒤에서 안 봄)에 걸린 씬이 후보입니다. 남기기 / 버리기를 누르면 확정되고 바로 저장됩니다. 버리기 확정 씬은 앱의 큐레이션 화면에서 최종 삭제합니다.</div>`
+    + `</div><div class="tabs"><button data-view="all"${on('all')}>전체<i>${all.length}</i></button>`
+    + `<button data-view="del"${on('del')} title="필터에 걸렸고 아직 확정하지 않은 씬 (확정하면 여기서 빠집니다)">후보<i>${open.length}</i></button>`
+    + `<button data-view="dec"${on('dec')} title="사람이 확정한 씬">확정<i>${cKeep + cDrop}</i></button>`
+    + `<button data-view="pass"${on('pass')} title="어느 필터에도 걸리지 않은 씬 (남기기로 확정된 것으로 봄)">필터 통과<i>${nPass}</i></button>`
+    + (OBJ.sorted.length ? `<button data-view="obj"${on('obj')} title="가까운 도로 이용자가 적은 하위 ${Math.round(OBJ.share * 100)}%">객체 적음<i>${OBJ.low.size}</i></button>` : '')
+    + `</div>`;
+  order = [];
+  const row = (i, extra = '', br = '', route = false) => {
+    const n = scenes[i].name, kind = (S(n).group_label || '').split(' · ').pop();
+    order.push(i);
+    const st = stateOf(n), mark = st === 'drop' ? ' drop' : st === 'cand' ? ' prop' : '';    // 버리기 확정 / 후보 stand out
+    const f = READY[n] || 0, rd = f >= 0.999 ? ' ok' : f > 0 ? ' part' : '';
+    return `<div class="row${br ? ' child' : ''}${mark}${i === cur.si ? ' cur' : ''}" data-i="${i}">${br ? `<span class="br">${br}</span>` : ''}`
+      + `<span class="rd${rd}" style="--p:${Math.round(f * 100)}%" title="재생 준비 ${Math.round(f * 100)}%"></span><b>${short(n)}</b><span class="kind">${route ? routeOf(scenes[i].log) + ' · ' : ''}${kind}</span>${objBadge(n)}${tag(n)}${extra}</div>`;
+  };
+  if (listView === 'dec') {   // what people confirmed, in route order; a group whole, with 비교, so it can be looked at again
+    const dec = SEQ.filter(i => humanOf(scenes[i].name)), seen = new Set();   //   and changed (press the other choice)
+    html += `<div class="sec"><span>사람이 확정한 씬 · 다시 비교하고 바꿀 수 있음</span><span>남기기 ${cKeep} · 버리기 ${cDrop}</span></div>`;
+    for (const i of dec) {
+      const n = scenes[i].name, gi = groupIndexOf(n);
+      if (seen.has(n)) continue;
+      const g = gi >= 0 ? GROUPS[gi] : [n];
+      g.forEach(m => seen.add(m));
+      html += row(byName[g[0]], gi >= 0 ? groupBtn(gi) : '', '', true);
+      g.slice(1).forEach((c, k) => { html += row(byName[c], '', k === g.length - 2 ? '└' : '├', true); });
+    }
+    if (!dec.length) html += '<div class="sec"><span>아직 확정한 씬이 없습니다</span></div>';
+    $('list').innerHTML = html;
+    return;
+  }
+  if (listView === 'obj' && OBJ.sorted.length) {           // flat, fewest first
+    html += `<div class="sec"><span>가까운 도로 이용자가 적은 순</span><span>하위 ${Math.round(OBJ.share * 100)}% · ${OBJ.low.size}개</span></div>`;
+    for (const n of OBJ.sorted) if (OBJ.low.has(n)) html += row(byName[n], '', '', true);
+    $('list').innerHTML = html;
+    return;
+  }
+  for (const lg of logs) {
+    const idx = scenes.map((s, i) => i).filter(i => scenes[i].log === lg && !scenes[i].extra);
+    const names = idx.map(i => scenes[i].name), nd = names.filter(n => humanOf(n) === 'drop').length;
+    const nc = names.filter(n => stateOf(n) === 'cand').length;
+    if (listView === 'del' && !nc) continue;          // 후보: only what is still to be confirmed
+    if (listView === 'pass') {                        // 필터 통과: flat per route
+      const ps = idx.filter(i => stateOf(scenes[i].name) === 'pass');
+      if (!ps.length) continue;
+      html += `<div class="sec"><span>${routeOf(lg)} · 필터 통과 ${ps.length} / ${idx.length}</span></div>`;
+      for (const i of ps) html += row(i, '<span class="st rule" title="어느 필터에도 걸리지 않음 · 남기기로 확정된 것으로 봄">필터 통과</span>');
+      continue;
+    }
+    html += `<div class="sec"><span>${routeOf(lg)} · ${idx.length}개</span><span>`
+      + [nc ? `후보 ${nc}` : '', nd ? `<span class="del">버리기 확정 ${nd}</span>` : ''].filter(Boolean).join(' · ') + '</span></div>';
+    for (const i of idx) {
+      const n = scenes[i].name, kids = childrenOf(n).filter(c => scenes[byName[c]].log === lg);   // other routes' list them
+      if (ruleDrop(n) && byName[S(n).substitute] !== undefined && scenes[byName[S(n).substitute]].log === lg) continue;   // under its kept scene
+      const shown = listView === 'del' ? kids.filter(c => stateOf(c) === 'cand') : kids;   // 후보: confirmed ones drop out
+      if (listView === 'del' && !shown.length && stateOf(n) !== 'cand') continue;          // (a kept scene stays while its
+      const gi = groupIndexOf(n);                                                           //  group has open candidates)
+      html += row(i, gi >= 0 ? groupBtn(gi) : '');
+      shown.forEach((c, k) => { html += row(byName[c], '', k === shown.length - 1 ? '└' : '├'); });
+    }
+  }
+  if (listView === 'del' && !open.length)
+    html += `<div class="sec"><span>확정할 후보가 없습니다 · 필터에 걸린 ${props.length}개를 모두 확정했습니다 (확정 탭)</span></div>`;
+  $('list').innerHTML = html;
+}
+$('list').onchange = e => {
+  if (e.target.id !== 'objShare') return;
+  OBJ.share = +e.target.value;
+  try { localStorage.setItem('simple.objShare', OBJ.share); } catch (err) {}
+  objRank(); buildList();
+  if (cur.si >= 0) header(scenes[cur.si]);
+};
+$('list').onclick = e => {
+  if (e.target.closest('select')) return;
+  const v = e.target.closest('[data-view]');
+  if (v) { listView = v.dataset.view; try { localStorage.setItem('simple.view', listView); } catch (err) {} return buildList(); }
+  if (e.target.closest('[data-next]')) return goNextProposal();
+  const g = e.target.closest('[data-review]');
+  if (g) return openReview(+g.dataset.review);
+  const r = e.target.closest('.row');
+  if (r) go(+r.dataset.i, 0);
+};
+
+// ---------- header + reason line ----------
+function header(sc) {
+  $('title').textContent = `${sc.name} · ${routeOf(sc.log)}`;
+  const n = sc.name, h = humanOf(n), chip = $('chip');
+  chip.textContent = stateKo(n);
+  chip.className = 'chip ' + (h === 'drop' ? 'del' : h === 'keep' ? 'rep' : ruleDrop(n) ? 'del prop' : 'rep prop');
+  const oc = $('objChip');
+  oc.hidden = !OBJ.low.has(n);
+  oc.textContent = OBJ.low.has(n) ? `객체 적음 · 샘플당 ${objOf(n).toFixed(1)} · 적은 순 ${OBJ.rank[n]} / ${OBJ.sorted.length}` : '';
+  oc.title = `가까운 도로 이용자 샘플당 평균이 하위 ${Math.round(OBJ.share * 100)}%인 scene`;
+  document.querySelectorAll('#list .row').forEach(r => r.classList.toggle('cur', +r.dataset.i === cur.si));
+  const row = document.querySelector('#list .row.cur');
+  if (row) row.scrollIntoView({ block: 'nearest' });
+}
+function ruleText(g) {   // why the rule proposes what it proposes, for one review group
+  const p = g[0], grp = groupOf[p] || g;
+  if (g.length === 1) return `후보 · ${S(p).summary || ''}`
+    + (S(p).kind === '객체 부족' && S(p).detail ? ` · ${S(p).detail[1]}` : '');
+  if (S(g[1]).kind === '경로 겹침')
+    return `경로 겹침: ${short(p)}이 ${g.slice(1).map(short).join(', ')}의 경로를 같은 방향으로 덮음 — 가까운 도로 이용자가 더 많은 ${short(p)}을 남기고 나머지는 후보`;
+  const ranking = g.map(m => `${short(m)} ${diffOf(m)}`).join(' > ');
+  return sel.mode === 'stops'
+    ? `규칙: 같은 장소에 멈춘 scene [${grp.map(short).join(', ')}] 중 LiDAR diff가 가장 큰 ${short(p)}만 필터 통과, ${g.length - 1}개는 후보 (정지 중복) · diff ${ranking}`
+    : `규칙: ${S(g[1]).summary || ''}`;
+}
+const num1 = v => v == null ? '?' : (+v).toFixed(1);
+function explain(n) {   // the rule's verdict on one scene, and why, in plain words
+  const r = S(n), P = (sel && sel.params) || {}, o = r.objects_near, min = P.min_objects;
+  const objLine = o ? `가까운 도로 이용자 샘플당 <b>${num1(o.all.mean)}개</b>`
+    + ` (차량 ${num1(o.veh.mean)} · 보행자 ${num1(o.ped.mean)} · 이륜차 ${num1(o.two.mean)})` + (min ? ` — 기준 ${min}개` : '')
+    : '객체 검출 전 — 객체 수로는 판정하지 않았습니다';
+  const drive = [r.group_label, r.v_mean_kmh != null ? `평균 ${num1(r.v_mean_kmh)} km/h` : ''].filter(Boolean).join(' · ');
+  if (sel && !sel.missing && !sel.scenes[n]) return { cls: '', title: '필터를 아직 돌리지 않은 씬', lines: [objLine] };
+  if (ruleDrop(n) && r.kind === '객체 부족')
+    return { cls: 'prop', title: '후보 · 객체 부족 (주변 도로 이용자가 적음)',
+             lines: [objLine + ' 미만', '카메라 6대 합, 박스 높이 50px 이상만 셈 (멀리 있는 것은 제외) · ' + drive] };
+  if (ruleDrop(n) && r.kind === '경로 겹침')
+    return { cls: 'prop', title: `후보 · 경로 겹침 (남긴 ${short(r.substitute)}이 이 씬 경로를 같은 방향으로 덮음)`,
+             cmp: true, lines: (r.detail || []).slice(0, 2).concat(['지도: 파랑 = 이 씬 · 주황 점선 = 먼저 남긴 씬 (같은 길이라 옆으로 띄워 그림)']) };
+  if (ruleDrop(n) && r.substitute)
+    return { cls: 'prop', title: `후보 · 정지 중복 (같은 곳에 멈춘 씬의 대표: ${short(r.substitute)})`, cmp: true,
+             lines: [`같은 장소(10 m · 30° 이내)에서 정차한 씬이 여럿이면, 주변 움직임(LiDAR 변화량)이 가장 큰 하나만 남깁니다`,
+                     `주변 움직임: 대표 <b>${short(r.substitute)}</b> ${diffOf(r.substitute)} · 이 씬 <b>${diffOf(n)}</b> · ${objLine}`] };
+  if (ruleDrop(n)) return { cls: 'prop', title: '후보 · ' + (r.summary || r.kind || ''), lines: (r.detail || []).slice(0, 2) };
+  if (isRuleRep(n) && childrenOf(n).every(m => S(m).kind === '경로 겹침'))
+    return { cls: 'keep', title: '필터 통과 · 경로가 겹치는 씬 중 남긴 쪽', cmp: true,
+             lines: [`이 씬이 경로를 덮어 후보가 된 씬: ${childrenOf(n).map(short).join(', ')} (가까운 도로 이용자가 더 많은 쪽을 남김)`,
+                     objLine, '지도: 파랑 = 이 씬 · 색 선 = 이 씬이 덮어 후보가 된 씬 (옆으로 띄워 그림)'] };
+  if (isRuleRep(n))
+    return { cls: 'keep', title: '필터 통과 · 같은 곳에 멈춘 씬 중 대표', cmp: true,
+             lines: [`같은 곳에 멈춘 씬 ${[n, ...childrenOf(n)].map(m => `${short(m)} ${diffOf(m)}`).join(' · ')} 중 주변 움직임(LiDAR 변화량)이 가장 큼`, objLine] };
+  return { cls: 'keep', title: '필터 통과', lines: [objLine + (o && min ? ' 이상' : ''), drive].filter(Boolean) };
+}
+function nextProposal(from) {   // the next candidate nobody confirmed: filter by filter (정지 중복 → 객체 부족 → 경로 겹침),
+  const seq = SEQ.length ? SEQ : order, k = seq.indexOf(from), open = [];   // route order (whatever tab), wrapping; skipped last
+  for (let d = 1; d < seq.length; d++) {          // not the scene on screen itself
+    const i = seq[(k + d) % seq.length], n = scenes[i].name;
+    if (ruleDrop(n) && !humanOf(n)) open.push({ s: skipped(n) ? 1 : 0, f: STEP[kindOf(n)] || 9, d, i });
+  }
+  if (!open.length) return -1;
+  const cur = scenes[from] && ruleDrop(scenes[from].name) ? STEP[kindOf(scenes[from].name)] || 9 : 0;
+  open.sort((a, b) => a.s - b.s || (b.f === cur) - (a.f === cur) || a.f - b.f || a.d - b.d);   // this filter first
+  return open[0].i;
+}
+function skipHere() {   // pass over the candidate on screen for now
+  const n = scenes[cur.si] && scenes[cur.si].name;
+  if (n && ruleDrop(n) && !humanOf(n)) { SKIP.add(n); saveSkip(); }
+  const nxt = nextProposal(cur.si);
+  if (nxt >= 0) go(nxt, 0); else refreshStatus();
+}
+function banner(sc) {
+  const n = sc.name, b = $('banner'), x = explain(n), h = humanOf(n), fin = finalDrop(n) ? 'drop' : 'keep';
+  b.className = h ? fin : x.cls;
+  $('dChip').className = 'chip ' + (h === 'drop' ? 'del' : h === 'keep' ? 'rep' : ruleDrop(n) ? 'del prop' : 'rep prop');
+  $('dChip').textContent = lockedOf(n) ? '잠김' : h ? STATE_KO[h] : ruleDrop(n) ? '후보 · 아직 확정 전' : '필터 통과';
+  $('dTitle').innerHTML = esc(x.title) + (x.cmp ? ' <button class="cmp" id="dCmp" title="같은 곳에 멈춘 씬들을 나란히 재생">나란히 비교</button>' : '');
+  $('dLines').innerHTML = x.lines.map(l => `<div>${l}</div>`).join('');
+  if (x.cmp) $('dCmp').onclick = () => { const gi = groupIndexOf(n); if (gi >= 0) openReview(gi); };
+  if (lockedOf(n)) $('dTitle').innerHTML = '잠김 · 이전 라운드에서 최종 확정된 씬 (삭제·변경 안 됨)';
+  for (const [id, v] of [['dKeep', 'keep'], ['dDrop', 'drop']]) {
+    $(id).disabled = lockedOf(n);
+    const on = fin === v;
+    $(id).classList.toggle('on', on);
+    $(id).classList.toggle('auto', on && !h);
+  }
+  const L = listed(), props = L.filter(s => ruleDrop(s.name)), done = props.filter(s => humanOf(s.name)).length, nxt = nextProposal(cur.si);
+  const cKeep = L.filter(s => humanOf(s.name) === 'keep').length, cDrop = L.filter(s => humanOf(s.name) === 'drop').length;
+  $('dNext').textContent = '';
+  if (nxt >= 0) { $('dNext').append('다음 후보'); $('dNext').insertAdjacentHTML('beforeend', '<kbd>N</kbd>'); $('dNext').className = 'primary'; }
+  else { $('dNext').append('확정할 후보 없음'); $('dNext').className = ''; }
+  $('dNext').disabled = nxt < 0;
+  $('dProg').textContent = `후보 ${props.length}개 중 ${done}개 확정 · 확정: 남기기 ${cKeep} · 버리기 ${cDrop}`;
+  b.hidden = false;
+}
+async function decideHere(v) {   // same button again = back to the rule's verdict
+  const n = scenes[cur.si] && scenes[cur.si].name;
+  if (n) await decide(n, humanOf(n) === v ? null : v);
+}
+function goNextProposal() {
+  const nxt = nextProposal(cur.si);
+  if (nxt >= 0) return go(nxt, 0);
+}
+$('dKeep').onclick = () => decideHere('keep');
+$('dDrop').onclick = () => decideHere('drop');
+$('dNext').onclick = goNextProposal;
+$('dSkip').onclick = skipHere;
+
+// ---------- one sample: cameras, LiDAR, map (all change together) ----------
+const camImg = {};
+$('cams').innerHTML = CAMS.map(c => `<figure><img id="img_${c}" alt=""><svg class="boxes" id="box_${c}" viewBox="0 0 1920 1080" `
+  + `preserveAspectRatio="xMidYMid slice"></svg><figcaption>${CAM_KO[c]}<span id="cnt_${c}"></span></figcaption></figure>`).join('')
+  + '<div id="boxLeg"></div>';
+CAMS.forEach(c => { camImg[c] = $('img_' + c); });
+function loadImg(fn) {   // the half-size copy (server /p/, cached on the local disk): the boxes' viewBox keeps its aspect
+  return new Promise(res => {
+    if (!fn) return res(null);
+    const im = new Image();
+    im.src = '/p/' + fn;
+    im.decode().then(() => res(im), () => res(null));
+  });
+}
+function swapCams(ims) {
+  CAMS.forEach((c, k) => { if (ims[k]) { ims[k].alt = ''; camImg[c].replaceWith(ims[k]); camImg[c] = ims[k]; } });
+}
+async function go(si, i) {
+  if (PLAY.on) stopPlay();
+  const sc = scenes[si];
+  if (!sc) return;
+  i = Math.max(0, Math.min(sc.samples.length - 1, i));
+  const changed = si !== cur.si;
+  cur = { si, i };
+  if (changed) prefetch(scopeFrom(si), ALLCH);      // this scene, then the rest of the list: the route gets ready
+  $('slider').max = sc.samples.length - 1; $('slider').value = i;
+  $('time').textContent = ((sc.sample_ts[i] - sc.sample_ts[0]) / 1e6).toFixed(1) + ' s';
+  history.replaceState(null, '', `#scene=${sc.name}&i=${i}`);
+  if (changed) { header(sc); banner(sc); }
+  const my = ++req;
+  let s;
+  try { s = await cached('/api/sample/' + sc.samples[i]); } catch (e) { $('stat').textContent = '불러오기 실패: ' + e.message; return; }
+  if (my !== req) return;
+  const lid = s.channels.LIDAR_TOP;
+  const [ims, xyz] = await Promise.all([Promise.all(CAMS.map(c => loadImg(s.channels[c] && s.channels[c].filename))),
+                                        lid ? lidBuf(lid.filename).catch(() => null) : null]);
+  if (my !== req) return;
+  swapCams(ims);
+  showBoxes(sc, i);
+  if (xyz) setLidar(xyz);
+  const e = s.ego_status;
+  lastEgo = e && Object.assign({}, e, { heading: (((90 - e.yaw_deg) % 360) + 360) % 360 });
+  const clock = new Date(s.timestamp / 1000).toLocaleTimeString('ko-KR');
+  $('stat').textContent = e ? `${clock} · 속도 ${e.speed_kmh.toFixed(1)} km/h · 방위 ${(((90 - e.yaw_deg) % 360) + 360) % 360 | 0}° (북 = 0)` : clock;
+  drawMap();
+  const nx = sc.samples[i + 1];      // warm the next frame
+  if (nx) cached('/api/sample/' + nx).then(p => {
+    for (const c of CAMS) if (p.channels[c]) new Image().src = '/p/' + p.channels[c].filename;
+    if (p.channels.LIDAR_TOP) lidBuf(p.channels.LIDAR_TOP.filename).catch(() => {});
+  }).catch(() => {});
+}
+
+function sizeCanvas(c) {
+  const dpr = window.devicePixelRatio || 1, w = Math.round(c.clientWidth * dpr), h = Math.round(c.clientHeight * dpr);
+  if (c.width !== w || c.height !== h) { c.width = w; c.height = h; }
+  return dpr;
+}
+const LUT = new Uint32Array(256);
+for (let k = 0; k < 256; k++) {     // turbo colormap (polynomial approximation)
+  const t = k / 255, cl = v => Math.max(0, Math.min(255, Math.round(v)));
+  const r = cl(34.61 + t * (1172.33 - t * (10793.56 - t * (33300.12 - t * (38394.49 - t * 14825.05)))));
+  const g = cl(23.31 + t * (557.33 + t * (1225.33 - t * (3574.96 - t * (1073.77 + t * 707.56)))));
+  const b = cl(27.2 + t * (3211.1 - t * (15327.97 - t * (27814 - t * (22569.18 - t * 6838.66)))));
+  LUT[k] = (255 << 24) | (b << 16) | (g << 8) | r;
+}
+
+// ---------- LiDAR: x, y, z only (server /lidar/: int16 cm, 1.25 MB per sweep instead of 4.2 MB) ----------
+const LID = { busy: false, k: -1, cache: new Map() };
+function lidBuf(fn) {   // -> Float32Array [x, y, z, x, y, z, ...]
+  if (LID.cache.has(fn)) return LID.cache.get(fn);
+  const p = fetch('/lidar/' + fn).then(r => {
+    if (r.ok) return r.arrayBuffer().then(b => { const q = new Int16Array(b), f = new Float32Array(q.length); for (let i = 0; i < q.length; i++) f[i] = q[i] * 0.01; return f; });
+    return fetch('/data/' + fn).then(r2 => r2.arrayBuffer()).then(b => {   // server without numpy: raw float32 x 5
+      const a = new Float32Array(b), n = Math.floor(a.length / 5), f = new Float32Array(n * 3);
+      for (let i = 0; i < n; i++) { f[i * 3] = a[i * 5]; f[i * 3 + 1] = a[i * 5 + 1]; f[i * 3 + 2] = a[i * 5 + 2]; }
+      return f;
+    });
+  });
+  LID.cache.set(fn, p);
+  p.catch(() => LID.cache.delete(fn));
+  if (LID.cache.size > 24) LID.cache.delete(LID.cache.keys().next().value);
+  return p;
+}
+// 3D point view with a mouse orbit camera; one instance for the main view, one per review tile (tiles share a view)
+const VIEW0 = { yaw: Math.PI, pitch: 0.5, dist: 42, tx: 8, ty: 0, tz: -1.9 };   // behind and above the ego, looking forward
+const FOV = 50 * Math.PI / 180;
+function makeLidarView(cv, view, onViewChange, step = 1) {
+  const ctx = cv.getContext('2d');
+  const st = { pts: null, npts: 0, pcol: null, groundZ: -1.9, img: null, zb: null, pending: false };
+  const camera = (W, H) => {
+    const cp = Math.cos(view.pitch), sp = Math.sin(view.pitch);
+    const fx = -cp * Math.cos(view.yaw), fy = -cp * Math.sin(view.yaw), fz = -sp;
+    let rx = fy, ry = -fx; const rn = Math.hypot(rx, ry) || 1; rx /= rn; ry /= rn;
+    return { W, H, fx, fy, fz, rx, ry, ux: ry * fz, uy: -rx * fz, uz: rx * fy - ry * fx,
+             cx: view.tx - fx * view.dist, cy: view.ty - fy * view.dist, cz: view.tz - fz * view.dist, F: (H / 2) / Math.tan(FOV / 2) };
+  };
+  const project = (c, x, y, z) => {
+    const dx = x - c.cx, dy = y - c.cy, dz = z - c.cz, zc = dx * c.fx + dy * c.fy + dz * c.fz;
+    if (zc < 0.3) return null;
+    return [c.W / 2 + (dx * c.rx + dy * c.ry) * c.F / zc, c.H / 2 - (dx * c.ux + dy * c.uy + dz * c.uz) * c.F / zc];
+  };
+  const line = (c, P) => {
+    ctx.beginPath(); let pen = false;
+    for (const [x, y, z] of P) {
+      const q = project(c, x, y, z);
+      if (!q) { pen = false; continue; }
+      pen ? ctx.lineTo(q[0], q[1]) : ctx.moveTo(q[0], q[1]); pen = true;
+    }
+    ctx.stroke();
+  };
+  function render() {
+    st.pending = false;
+    const dpr = sizeCanvas(cv), W = cv.width, H = cv.height;
+    if (!W || !H) return;
+    if (!st.img || st.img.width !== W || st.img.height !== H) { st.img = ctx.createImageData(W, H); st.zb = new Float32Array(W * H); }
+    const px = new Uint32Array(st.img.data.buffer), zb = st.zb, pts = st.pts, pcol = st.pcol;
+    px.fill(0xff100c0a); zb.fill(Infinity);
+    const c = camera(W, H), size = Math.max(1, Math.round(1.5 * dpr)), half = size >> 1;
+    if (pts) {
+      const { fx, fy, fz, rx, ry, ux, uy, uz, cx, cy, cz, F } = c, W2 = W / 2, H2 = H / 2;
+      for (let i = 0; i < st.npts; i += step) {
+        const o = i * 3, x = pts[o], y = pts[o + 1], z = pts[o + 2];
+        if (x * x + y * y > 10000) continue;      // 100 m
+        const dx = x - cx, dy = y - cy, dz = z - cz, zc = dx * fx + dy * fy + dz * fz;
+        if (zc < 0.3) continue;
+        const k = F / zc, sx = (W2 + (dx * rx + dy * ry) * k) | 0, sy = (H2 - (dx * ux + dy * uy + dz * uz) * k) | 0;
+        if (sx < half || sy < half || sx >= W - size || sy >= H - size) continue;
+        const col = pcol[i];
+        for (let yy = sy - half, ye = yy + size; yy < ye; yy++) {
+          let p = yy * W + sx - half;
+          for (const e = p + size; p < e; p++) if (zc < zb[p]) { zb[p] = zc; px[p] = col; }
+        }
+      }
+    }
+    ctx.putImageData(st.img, 0, 0);
+    const g = st.groundZ;
+    ctx.lineWidth = dpr; ctx.strokeStyle = 'rgba(140,150,170,.25)';
+    ctx.fillStyle = 'rgba(140,150,170,.7)'; ctx.font = `${11 * dpr}px system-ui`;
+    for (let r = 10; r <= 50; r += 10) {          // rings on the ground every 10 m
+      const P = []; for (let a = 0; a <= 96; a++) { const t = a / 96 * 2 * Math.PI; P.push([r * Math.cos(t), r * Math.sin(t), g]); }
+      line(c, P);
+      const q = project(c, r, 0, g); if (q) ctx.fillText(r + 'm', q[0] + 3, q[1] - 3);
+    }
+    ctx.lineWidth = 1.5 * dpr; ctx.strokeStyle = 'rgba(255,255,255,.85)';   // ego footprint
+    line(c, [[2.3, 0.95, g], [2.3, -0.95, g], [-2.3, -0.95, g], [-2.3, 0.95, g], [2.3, 0.95, g]]);
+  }
+  function schedule() { if (!st.pending) { st.pending = true; requestAnimationFrame(render); } }
+  function set(xyz) {
+    st.pts = xyz; st.npts = Math.floor(xyz.length / 3);
+    const zs = [];                                // ground ~ 10th percentile of z within 25 m
+    for (let i = 0; i < st.npts; i += 13) { const o = i * 3; if (xyz[o] * xyz[o] + xyz[o + 1] * xyz[o + 1] < 625) zs.push(xyz[o + 2]); }
+    zs.sort((a, b) => a - b);
+    st.groundZ = zs.length ? zs[Math.floor(zs.length * 0.1)] : -1.9;
+    if (!st.pcol || st.pcol.length < st.npts) st.pcol = new Uint32Array(st.npts);
+    for (let i = 0; i < st.npts; i++) st.pcol[i] = LUT[Math.max(0, Math.min(255, ((xyz[i * 3 + 2] - st.groundZ + 0.3) / 4 * 255) | 0))];
+    schedule();
+  }
+  let drag = null;
+  cv.addEventListener('contextmenu', e => e.preventDefault());
+  cv.addEventListener('pointerdown', e => { cv.setPointerCapture(e.pointerId); drag = { x: e.clientX, y: e.clientY, pan: e.button === 2 || e.shiftKey }; });
+  cv.addEventListener('pointerup', () => { drag = null; });
+  cv.addEventListener('pointermove', e => {
+    if (!drag) return;
+    const dx = e.clientX - drag.x, dy = e.clientY - drag.y;
+    drag.x = e.clientX; drag.y = e.clientY;
+    if (drag.pan) {                               // move the target along the ground, following the screen
+      const dpr = window.devicePixelRatio || 1, c = camera(cv.width, cv.height), s = view.dist / c.F * dpr;
+      let fx = c.ux, fy = c.uy; const fn = Math.hypot(fx, fy) || 1; fx /= fn; fy /= fn;
+      view.tx -= (c.rx * dx - fx * dy) * s; view.ty -= (c.ry * dx - fy * dy) * s;
+    } else {
+      view.yaw -= dx * 0.006;
+      view.pitch = Math.max(0.02, Math.min(Math.PI / 2 - 1e-4, view.pitch + dy * 0.006));
+    }
+    onViewChange();
+  });
+  cv.addEventListener('wheel', e => { e.preventDefault(); view.dist = Math.max(3, Math.min(300, view.dist * Math.exp(e.deltaY * 0.0012))); onViewChange(); }, { passive: false });
+  cv.addEventListener('dblclick', () => { Object.assign(view, VIEW0, { tz: st.groundZ }); onViewChange(); });
+  return { set, schedule, st };
+}
+const view = Object.assign({}, VIEW0);
+const mainLidar = makeLidarView($('lidar'), view, () => mainLidar.schedule());
+const setLidar = xyz => mainLidar.set(xyz), lschedule = () => mainLidar.schedule();
+
+const TILES = new Map();
+const merc = (lat, lon, z) => {   // Web Mercator world pixels at zoom z (256 px tiles)
+  const n = 256 * 2 ** z, sn = Math.sin(lat * Math.PI / 180);
+  return [(lon + 180) / 360 * n, (0.5 - Math.log((1 + sn) / (1 - sn)) / (4 * Math.PI)) * n];
+};
+function tileImg(z, x, y) {   // OpenStreetMap tiles, fetched and cached by the server; absent offline
+  const k = `${z}/${x}/${y}`;
+  if (!TILES.has(k)) {
+    const im = new Image();
+    im.onload = () => requestAnimationFrame(() => { drawMap(); drawRevMap(); });
+    im.src = `/tile/${k}.png`;
+    TILES.set(k, im);
+  }
+  const im = TILES.get(k);
+  return im.complete && im.naturalWidth ? im : null;
+}
+// ---------- path overlap on the map: the paths side by side (shifted apart), direction marks, start points ----------
+const OV_COL = ['#ffb454', '#8b95ff', '#4cc38a', '#f07068', '#c792ea', '#5ec8e5'];   // the kept scene first (amber)
+function relOf(n) {   // 경로 겹침: the scene that covers n, or the scenes n covers (in this view)
+  return [S(n).kind === '경로 겹침' ? S(n).substitute : null,
+          ...Object.keys((sel && sel.scenes) || {}).filter(m => S(m).kind === '경로 겹침' && S(m).substitute === n)]
+    .filter(m => m && byName[m] !== undefined).map(m => scenes[byName[m]]);
+}
+function boundsOf(list) {
+  const b = [Infinity, -Infinity, Infinity, -Infinity];
+  for (const s of list) for (const p of s.route) if (p.length > 5) {
+    b[0] = Math.min(b[0], p[4]); b[1] = Math.max(b[1], p[4]); b[2] = Math.min(b[2], p[5]); b[3] = Math.max(b[3], p[5]);
+  }
+  return b;
+}
+function mapFrame(c, b, pad) {   // canvas, zoom and projection that fit bounds b; the OSM tiles drawn faint
+  const dpr = sizeCanvas(c), W = c.width, H = c.height, g = c.getContext('2d');
+  g.clearRect(0, 0, W, H);
+  if (!W || !H || !isFinite(b[0])) return null;
+  let z = 18;
+  for (; z > 3; z--) {                             // the closest zoom at which they all fit
+    const [xa, ya] = merc(b[1], b[2], z), [xb, yb] = merc(b[0], b[3], z);
+    if ((xb - xa) * dpr <= W - 2 * pad * dpr && (yb - ya) * dpr <= H - 2 * pad * dpr) break;
+  }
+  const [xa, ya] = merc(b[1], b[2], z), [xb, yb] = merc(b[0], b[3], z);
+  const cx = (xa + xb) / 2, cy = (ya + yb) / 2;
+  const P = (lat, lon) => { const [x, y] = merc(lat, lon, z); return [W / 2 + (x - cx) * dpr, H / 2 + (y - cy) * dpr]; };
+  const tx0 = Math.floor((cx - W / 2 / dpr) / 256), tx1 = Math.floor((cx + W / 2 / dpr) / 256);
+  const ty0 = Math.floor((cy - H / 2 / dpr) / 256), ty1 = Math.floor((cy + H / 2 / dpr) / 256);
+  g.globalAlpha = 0.5;
+  g.filter = 'invert(100%) hue-rotate(180deg) saturate(40%) brightness(90%)';   // OSM's light style, dark and faint
+  for (let tx = tx0; tx <= tx1; tx++) for (let ty = ty0; ty <= ty1; ty++) {
+    if (ty < 0 || ty >= 2 ** z) continue;
+    const im = tileImg(z, ((tx % 2 ** z) + 2 ** z) % 2 ** z, ty);
+    if (im) g.drawImage(im, W / 2 + (tx * 256 - cx) * dpr, H / 2 + (ty * 256 - cy) * dpr, 256 * dpr, 256 * dpr);
+  }
+  g.globalAlpha = 1;
+  g.filter = 'none';
+  return { g, dpr, W, H, P };
+}
+function fitFrame(c, list, pad, rotate) {   // the paths of `list` (scenes) as large as the canvas allows: zoom past
+  const dpr = sizeCanvas(c), W = c.width, H = c.height, g = c.getContext('2d');   // the tiles' own (19, scaled up),
+  g.setTransform(1, 0, 0, 1, 0, 0); g.clearRect(0, 0, W, H);                      // and with rotate the way they run
+  const pts = list.flatMap(s => s.route.filter(p => p.length > 5).map(p => merc(p[4], p[5], 20)));   // along the width
+  if (!W || !H || !pts.length) return null;
+  let th = 0;
+  if (rotate && pts.length > 2) {                  // principal direction of the points, the first path running left to right
+    const mx = pts.reduce((a, p) => a + p[0], 0) / pts.length, my = pts.reduce((a, p) => a + p[1], 0) / pts.length;
+    let sxx = 0, syy = 0, sxy = 0;
+    for (const [x, y] of pts) { sxx += (x - mx) ** 2; syy += (y - my) ** 2; sxy += (x - mx) * (y - my); }
+    th = 0.5 * Math.atan2(2 * sxy, sxx - syy);
+    const r0 = list[0].route.filter(p => p.length > 5), last = list[list.length - 1].route.filter(p => p.length > 5);
+    const a = merc(last[0][4], last[0][5], 20), b = merc(last[last.length - 1][4], last[last.length - 1][5], 20);
+    if ((b[0] - a[0]) * Math.cos(th) + (b[1] - a[1]) * Math.sin(th) < 0) th += Math.PI;
+    if (!r0.length) th = 0;
+  }
+  const cs = Math.cos(-th), sn = Math.sin(-th);
+  const rot = ([x, y]) => [x * cs - y * sn, x * sn + y * cs];
+  const rp = pts.map(rot), xs = rp.map(p => p[0]), ys = rp.map(p => p[1]);
+  const [x0, x1, y0, y1] = [Math.min(...xs), Math.max(...xs), Math.min(...ys), Math.max(...ys)];
+  const s = Math.min((W - 2 * pad * dpr) / Math.max(x1 - x0, 1), (H - 2 * pad * dpr) / Math.max(y1 - y0, 1), 1.6 * dpr);   // <= zoom ~20.7
+  const cx = (x0 + x1) / 2, cy = (y0 + y1) / 2;
+  const P = (lat, lon) => { const [u, v] = rot(merc(lat, lon, 20)); return [W / 2 + (u - cx) * s, H / 2 + (v - cy) * s]; };
+  const zt = Math.max(3, Math.min(19, Math.round(20 + Math.log2(s / dpr)))), T = 256 * 2 ** (20 - zt);   // tile size, z20 px
+  // the visible world: the screen's corners back in z20 px, then the tiles over it
+  const inv = (X, Y) => { const u = (X - W / 2) / s + cx, v = (Y - H / 2) / s + cy; return [u * cs + v * sn, -u * sn + v * cs]; };
+  const cn = [inv(0, 0), inv(W, 0), inv(0, H), inv(W, H)];
+  const tx0 = Math.floor(Math.min(...cn.map(q => q[0])) / T), tx1 = Math.floor(Math.max(...cn.map(q => q[0])) / T);
+  const ty0 = Math.floor(Math.min(...cn.map(q => q[1])) / T), ty1 = Math.floor(Math.max(...cn.map(q => q[1])) / T);
+  g.save();
+  g.translate(W / 2, H / 2); g.scale(s, s); g.translate(-cx, -cy); g.rotate(-th);
+  g.globalAlpha = 0.5;
+  g.filter = 'invert(100%) hue-rotate(180deg) saturate(40%) brightness(90%)';
+  for (let tx = tx0; tx <= tx1; tx++) for (let ty = ty0; ty <= ty1; ty++) {
+    if (ty < 0 || ty >= 2 ** zt) continue;
+    const im = tileImg(zt, ((tx % 2 ** zt) + 2 ** zt) % 2 ** zt, ty);
+    if (im) g.drawImage(im, tx * T, ty * T, T + 0.5 / s, T + 0.5 / s);
+  }
+  g.restore();
+  if (th) {                                        // rotated: where north is
+    const a = -th, x = W - 26 * dpr, y = 40 * dpr;
+    g.save(); g.translate(x, y); g.rotate(a);
+    g.fillStyle = 'rgba(236,236,239,.85)'; g.beginPath(); g.moveTo(0, -11 * dpr); g.lineTo(5 * dpr, 5 * dpr); g.lineTo(-5 * dpr, 5 * dpr); g.closePath(); g.fill();
+    g.restore();
+    g.font = `600 ${10 * dpr}px Pretendard, system-ui`; g.fillStyle = 'rgba(236,236,239,.85)';
+    g.fillText('N', x + Math.sin(a) * 20 * dpr - 3 * dpr, y - Math.cos(a) * 20 * dpr + 4 * dpr);   // past the arrow's tip
+  }
+  return { g, dpr, W, H, P, rot: th };
+}
+function shifted(pts, d) {   // a path moved d px to the right of its travel, so two paths on one road both show
+  return pts.map((p, i) => {
+    const a = pts[Math.max(i - 1, 0)], b = pts[Math.min(i + 1, pts.length - 1)], dx = b[0] - a[0], dy = b[1] - a[1], L = Math.hypot(dx, dy);
+    return L < 0.5 ? p : [p[0] - dy / L * d, p[1] + dx / L * d];
+  });
+}
+function pathLine(f, pts, col, w, dash) {   // a dark edge, the line (dashed or not), direction marks, the start point
+  const { g, dpr } = f;
+  if (!pts.length) return;
+  const trace = () => { g.beginPath(); pts.forEach(([u, v], j) => j ? g.lineTo(u, v) : g.moveTo(u, v)); };
+  g.save(); g.lineCap = 'round'; g.lineJoin = 'round';
+  g.strokeStyle = 'rgba(10,10,12,.85)'; g.lineWidth = (w + 3) * dpr; trace(); g.stroke();
+  g.strokeStyle = col; g.lineWidth = w * dpr; g.setLineDash(dash ? [9 * dpr, 6 * dpr] : []); trace(); g.stroke(); g.setLineDash([]);
+  let acc = 0;
+  g.lineWidth = 2 * dpr;
+  for (let i = 1; i < pts.length; i++) {             // a chevron every ~70 px, pointing the way it drove
+    acc += Math.hypot(pts[i][0] - pts[i - 1][0], pts[i][1] - pts[i - 1][1]);
+    if (acc < 70 * dpr) continue;
+    acc = 0;
+    const a = Math.atan2(pts[i][1] - pts[i - 1][1], pts[i][0] - pts[i - 1][0]), r = 6 * dpr;
+    g.beginPath();
+    g.moveTo(pts[i][0] + r * Math.cos(a + 2.5), pts[i][1] + r * Math.sin(a + 2.5));
+    g.lineTo(pts[i][0], pts[i][1]);
+    g.lineTo(pts[i][0] + r * Math.cos(a - 2.5), pts[i][1] + r * Math.sin(a - 2.5));
+    g.strokeStyle = '#0c0c0e'; g.lineWidth = 4 * dpr; g.stroke();
+    g.strokeStyle = col; g.lineWidth = 2 * dpr; g.stroke();
+  }
+  g.beginPath(); g.arc(pts[0][0], pts[0][1], 4.5 * dpr, 0, 2 * Math.PI);   // where it started
+  g.fillStyle = col; g.fill(); g.strokeStyle = '#0c0c0e'; g.lineWidth = 2 * dpr; g.stroke();
+  g.restore();
+}
+function drawMap() {
+  const c = $('map'), dpr = sizeCanvas(c), W = c.width, H = c.height, g = c.getContext('2d'), sc = scenes[cur.si];
+  g.clearRect(0, 0, W, H);
+  if (!sc || !W || !H) return;
+  if (!bounds) {                                   // every route of this view, in lat/lon
+    bounds = [Infinity, -Infinity, Infinity, -Infinity];
+    for (const s of listed()) for (const p of s.route) if (p.length > 5) {
+      bounds[0] = Math.min(bounds[0], p[4]); bounds[1] = Math.max(bounds[1], p[4]);
+      bounds[2] = Math.min(bounds[2], p[5]); bounds[3] = Math.max(bounds[3], p[5]);
+    }
+  }
+  if (!isFinite(bounds[0])) return;
+  const rel = relOf(sc.name);                      // path overlap: fit and draw this scene with the overlapping ones
+  if (rel.length) return drawOverlapMap(c, sc, rel);
+  const pad = 36;
+  let z = 18;
+  for (; z > 3; z--) {                             // the closest zoom at which they all fit
+    const [xa, ya] = merc(bounds[1], bounds[2], z), [xb, yb] = merc(bounds[0], bounds[3], z);
+    if ((xb - xa) * dpr <= W - 2 * pad * dpr && (yb - ya) * dpr <= H - 2 * pad * dpr) break;
+  }
+  const [xa, ya] = merc(bounds[1], bounds[2], z), [xb, yb] = merc(bounds[0], bounds[3], z);
+  const cx = (xa + xb) / 2, cy = (ya + yb) / 2;
+  const P = (lat, lon) => { const [x, y] = merc(lat, lon, z); return [W / 2 + (x - cx) * dpr, H / 2 + (y - cy) * dpr]; };
+  // the base map, faint
+  const tx0 = Math.floor((cx - W / 2 / dpr) / 256), tx1 = Math.floor((cx + W / 2 / dpr) / 256);
+  const ty0 = Math.floor((cy - H / 2 / dpr) / 256), ty1 = Math.floor((cy + H / 2 / dpr) / 256);
+  g.globalAlpha = 0.5;
+  g.filter = 'invert(100%) hue-rotate(180deg) saturate(40%) brightness(90%)';   // OSM's light style, dark and faint
+  for (let tx = tx0; tx <= tx1; tx++) for (let ty = ty0; ty <= ty1; ty++) {
+    if (ty < 0 || ty >= 2 ** z) continue;
+    const im = tileImg(z, ((tx % 2 ** z) + 2 ** z) % 2 ** z, ty);
+    if (im) g.drawImage(im, W / 2 + (tx * 256 - cx) * dpr, H / 2 + (ty * 256 - cy) * dpr, 256 * dpr, 256 * dpr);
+  }
+  g.globalAlpha = 1;
+  g.filter = 'none';
+  const line = (s, col, w) => {
+    const pts = s.route.filter(p => p.length > 5);
+    if (!pts.length) return;
+    g.strokeStyle = col; g.lineWidth = w * dpr; g.lineCap = 'round'; g.lineJoin = 'round'; g.beginPath();
+    pts.forEach((p, j) => { const [u, v] = P(p[4], p[5]); j ? g.lineTo(u, v) : g.moveTo(u, v); });
+    const [u, v] = P(pts[0][4], pts[0][5]); g.moveTo(u, v); g.lineTo(u + 0.01, v);   // a stop is a single point
+    g.stroke();
+  };
+  for (const s of listed()) if (s !== sc) line(s, s.log === sc.log ? 'rgba(236,236,239,.35)' : 'rgba(236,236,239,.18)', 2.5);
+  line(sc, 'rgba(139,149,255,.35)', 10);
+  line(sc, '#8b95ff', 4);
+  if (lastEgo && lastEgo.lat != null) {            // the ego: where it is and which way it faces
+    const [u, v] = P(lastEgo.lat, lastEgo.lon), a = (lastEgo.heading || 0) * Math.PI / 180;
+    g.fillStyle = 'rgba(255,210,74,.18)';
+    g.beginPath(); g.arc(u, v, 16 * dpr, 0, 2 * Math.PI); g.fill();
+    g.save(); g.translate(u, v); g.rotate(a); g.scale(dpr, dpr);
+    g.beginPath(); g.moveTo(0, -11); g.lineTo(8, 8); g.lineTo(0, 4); g.lineTo(-8, 8); g.closePath();
+    g.fillStyle = '#ffd24a'; g.strokeStyle = '#0c0c0e'; g.lineWidth = 2; g.fill(); g.stroke();
+    g.restore();
+  }
+  g.font = `${11 * dpr}px Pretendard, system-ui`;
+  g.fillStyle = 'rgba(142,142,150,.9)';
+  g.fillText('노랑 화살표 = 자차 (진행 방향) · 파랑 = 이 씬 · 흰 선 = 같은 루트 · 북 ↑', 10 * dpr, H - 10 * dpr);
+  const attr = '© OpenStreetMap contributors';
+  g.fillText(attr, W - g.measureText(attr).width - 10 * dpr, H - 10 * dpr);
+}
+
+function egoMark(f, u, v, heading, col, label) {   // where a scene is now: an arrow (heading) at canvas point u, v
+  const { g, dpr } = f, a = (heading || 0) * Math.PI / 180;
+  g.fillStyle = 'rgba(255,255,255,.14)'; g.beginPath(); g.arc(u, v, 15 * dpr, 0, 2 * Math.PI); g.fill();
+  g.save(); g.translate(u, v); g.rotate(a); g.scale(dpr, dpr);
+  g.beginPath(); g.moveTo(0, -11); g.lineTo(8, 8); g.lineTo(0, 4); g.lineTo(-8, 8); g.closePath();
+  g.fillStyle = col; g.strokeStyle = '#0c0c0e'; g.lineWidth = 2; g.fill(); g.stroke();
+  g.restore();
+  if (label) {
+    g.font = `600 ${12 * dpr}px Pretendard, system-ui`;
+    g.lineWidth = 3 * dpr; g.strokeStyle = '#0c0c0e'; g.strokeText(label, u + 14 * dpr, v - 10 * dpr);
+    g.fillStyle = col; g.fillText(label, u + 14 * dpr, v - 10 * dpr);
+  }
+}
+function atTime(s, t) {   // the route points and the index at t seconds into the scene
+  const r = s.route.filter(p => p.length > 5), t0 = s.sample_ts[0] + t * 1e6;
+  let k = 0;
+  while (k + 1 < r.length && r[k + 1][2] <= t0) k++;
+  return [r, k];
+}
+function overlapPaths(f, list, t) {   // list: [{ s, col, dash, label, mark }]: the paths spread apart, then (mark)
+  const n = list.length;                //   where each is t seconds into its scene, on its own shifted path
+  list.forEach((it, k) => {
+    const [r, i] = atTime(it.s, t || 0);
+    const pts = shifted(r.map(p => f.P(p[4], p[5])), (k - (n - 1) / 2) * 7 * f.dpr);
+    pathLine(f, pts, it.col, 4, it.dash);
+    it.at = pts.length ? [pts[i], r[i][6]] : null;
+  });
+  for (const it of list) if (it.mark && it.at) egoMark(f, it.at[0][0], it.at[0][1], it.at[1] - (f.rot || 0) * 180 / Math.PI, it.mark, it.label);
+}
+function drawOverlapMap(c, sc, rel) {   // the main view's map for a path-overlap scene: this one and the overlapping ones
+  const f = fitFrame(c, [...rel, sc], 44, false);
+  if (!f) return;
+  const kept = S(sc.name).kind === '경로 겹침';     // sc is the candidate: rel is the kept scene (the earlier path)
+  const list = [...rel.map((s, k) => ({ s, col: OV_COL[kept ? 0 : k + 2], dash: kept })),
+                { s: sc, col: '#8b95ff', dash: false, mark: '#ffd24a' }];
+  overlapPaths(f, list, PLAY.on ? PLAY.t : (sc.sample_ts[cur.i] - sc.sample_ts[0]) / 1e6);
+  const { g, dpr, W, H } = f;
+  g.font = `${11 * dpr}px Pretendard, system-ui`;
+  g.fillStyle = 'rgba(190,190,198,.95)';
+  const text = kept ? `파랑 = 이 씬 ${short(sc.name)} · 주황 점선 = 먼저 남긴 ${rel.map(s => short(s.name)).join(', ')} (같은 길, 옆으로 띄워 그림)`
+                    : `파랑 = 이 씬 ${short(sc.name)} (남긴 쪽) · 색 선 = 이 씬이 덮어 후보가 된 ${rel.map(s => short(s.name)).join(', ')} (옆으로 띄워 그림)`;
+  g.fillText(text + ' · 꺾쇠 = 진행 방향 · 점 = 시작 · 노랑 = 자차', 10 * dpr, H - 10 * dpr);
+  const attr = '© OpenStreetMap contributors';
+  g.fillText(attr, W - g.measureText(attr).width - 10 * dpr, 16 * dpr);
+}
+function drawRevMap() {   // the comparison's map (path-overlap groups): every scene of the group, where each is now
+  const c = $('revMap');
+  if (!c || $('rev').hidden) return;
+  const list = REV.names.map((n, k) => ({ s: scenes[byName[n]], col: OV_COL[k % OV_COL.length], dash: k === 0,
+                                          mark: OV_COL[k % OV_COL.length], label: '①②③④⑤⑥⑦⑧⑨'[k] + ' ' + short(n) }))
+    .filter(it => it.s);
+  const f = fitFrame(c, list.map(it => it.s), 26, true);   // the strip: the paths run along its width
+  if (!f) return;
+  overlapPaths(f, list, REV.t);
+  const { g, dpr, W, H } = f;
+  g.font = `${11 * dpr}px Pretendard, system-ui`;
+  g.fillStyle = 'rgba(190,190,198,.95)';
+  g.fillText(`① 주황 점선 = 남긴 ${short(REV.names[0])} (먼저 그 길을 지난 경로) · 다른 색 = 후보 · 같은 길이라 옆으로 띄워 그림 · 꺾쇠 = 진행 방향 · 화살표 = 지금 위치`,
+             10 * dpr, H - 10 * dpr);
+  const attr = '© OpenStreetMap contributors';
+  g.fillText(attr, W - g.measureText(attr).width - 10 * dpr, 16 * dpr);
+}
+
+// ---------- 2D boxes (scene_detect.py): key frames only, so they show while paused ----------
+const BOX = { on: true, data: new Map() };
+try { BOX.on = (localStorage.getItem('simple.boxes') ?? '1') === '1'; } catch (e) {}
+$('boxOn').checked = BOX.on;
+const COCO = { 0: ['person', 'ped'], 1: ['bicycle', 'two'], 2: ['car', 'veh'], 3: ['motorcycle', 'two'], 5: ['bus', 'veh'], 7: ['truck', 'veh'] };
+const BOX_COL = { veh: '#4ea1ff', ped: '#ffd24a', two: '#f472b6' };
+function boxesOf(name) {
+  if (!BOX.data.has(name)) BOX.data.set(name, getJSON('/api/boxes/' + name).catch(() => ({ missing: true })));
+  return BOX.data.get(name);
+}
+function drawBoxes(svg, b, cam, k) {   // key frame k of one camera -> the SVG; returns the counted near boxes per group
+  if (!svg) return null;
+  if (!BOX.on || !b || b.missing || k < 0) { svg.innerHTML = ''; return null; }
+  const cnt = { veh: 0, ped: 0, two: 0 };
+  let h = '';
+  for (const [f, x1, y1, x2, y2, cls, conf, flag] of b.boxes[cam] || []) {
+    if (f !== k) continue;
+    const [nm, g] = COCO[cls] || ['?', 'veh'], far = y2 - y1 < b.near_px, ex = flag !== 0;
+    if (!ex && !far) cnt[g]++;
+    h += `<rect class="${g}${far ? ' far' : ''}${ex ? ' ex' : ''}" x="${x1}" y="${y1}" width="${x2 - x1}" height="${y2 - y1}"/>`;
+    if (!far || ex) h += `<text x="${x1 + 4}" y="${Math.max(36, y1 - 10)}" style="fill:${ex ? '#9aa3b2' : BOX_COL[g]}">`
+      + `${nm} ${conf.toFixed(2)}${flag === 2 ? ' · 자차' : flag === 3 ? ' · 탑승자' : ''}</text>`;
+  }
+  svg.innerHTML = h;
+  return cnt;
+}
+function boxLegend(b, tot, n) {
+  const leg = $('boxLeg');
+  if (!BOX.on) { leg.innerHTML = ''; return; }
+  if (!b || b.missing) { leg.textContent = '2D 박스 없음 — python scene_detect.py 를 먼저 실행하세요'; return; }
+  const o = S(n).objects_near;
+  leg.innerHTML = `<span>2D 박스 · ${esc(b.model)} · 신뢰도 ≥ ${b.conf}</span>`
+    + `<span><i style="border-color:${BOX_COL.veh}"></i>차량 <i style="border-color:${BOX_COL.ped}"></i>보행자 <i style="border-color:${BOX_COL.two}"></i>이륜차</span>`
+    + `<span><i class="far" style="border-color:#8a93a3"></i>얇은 선 = 멀어서 안 셈 (높이 &lt; ${b.near_px}px) <i class="ex"></i>점선 = 제외 (자차 차체 · 탑승자)</span>`
+    + `<span>이 샘플 가까운 객체 <b>${tot.veh + tot.ped + tot.two}</b> (차 ${tot.veh} · 보 ${tot.ped} · 이 ${tot.two})</span>`
+    + (o ? `<span>scene 샘플 평균 <b>${o.all.mean.toFixed(1)}</b></span>` : '');
+}
+async function showBoxes(sc, i) {   // main view, key frame i of scene sc
+  const my = req, b = BOX.on ? await boxesOf(sc.name) : null;
+  if (my !== req || PLAY.on) return;              // late (e.g. 이어서 재생 started meanwhile): boxes are key-frame only
+  const tot = { veh: 0, ped: 0, two: 0 };
+  CAMS.forEach(c => {
+    const cnt = drawBoxes($('box_' + c), b, c, i);
+    $('cnt_' + c).textContent = cnt ? ` · ${cnt.veh + cnt.ped + cnt.two}` : '';
+    if (cnt) for (const g in tot) tot[g] += cnt[g];
+  });
+  boxLegend(b, tot, sc.name);
+}
+$('boxOn').onchange = () => {
+  BOX.on = $('boxOn').checked;
+  try { localStorage.setItem('simple.boxes', BOX.on ? '1' : '0'); } catch (e) {}
+  if (!$('rev').hidden) revShow(); else if (cur.si >= 0) go(cur.si, cur.i);
+};
+
+// ---------- frames (full rate) ----------
+const FRAMES = new Map();
+function framesOf(name, cam) {
+  const k = name + '|' + cam;
+  if (!FRAMES.has(k)) { const p = getJSON(`/api/frames/${name}?ch=${cam}`); FRAMES.set(k, p); p.catch(() => FRAMES.delete(k)); }
+  return FRAMES.get(k);
+}
+function pickIdx(fr, t0, t) {   // index of the frame nearest to t seconds after t0
+  const target = t0 + t * 1e6;
+  let lo = 0, hi = fr.ts.length - 1;
+  while (lo < hi) { const m = (lo + hi) >> 1; if (fr.ts[m] < target) lo = m + 1; else hi = m; }
+  if (lo > 0 && target - fr.ts[lo - 1] < fr.ts[lo] - target) lo--;
+  return lo;
+}
+const pick = (fr, t0, t) => fr.fn[pickIdx(fr, t0, t)];
+
+// ---------- playback (main view): real time, cameras at full rate, LiDAR 10 Hz on its own track ----------
+const PLAY = { on: false, base: 0, start: 0, t: 0, busy: false, key: -1 };
+const speedOf = () => +$('speed').value || 1;
+function togglePlay() {
+  if (!PLAY.on) return startPlay();
+  stopPlay();
+  if (BOX.on) go(cur.si, cur.i);                  // back to the key frame, where the boxes are
+}
+const BUF = { names: [], chs: '', s: 0, dur: 1e9, timer: 0 };
+function watchBuffer(names, chs) {   // seconds from the start that are in the cache, for every scene and channel asked
+  const key = chs.join(',');
+  if (BUF.names.join() === names.join() && BUF.chs === key && (BUF.timer || ready())) return;
+  clearInterval(BUF.timer);
+  Object.assign(BUF, { names, chs: key, s: 0, dur: 1e9 });
+  let busy = false;                                 // one question at a time: the browser has only 6 connections
+  const poll = async () => {
+    if (busy) return;
+    busy = true;
+    try {
+      const rs = await Promise.all(names.map(n => fetch(`/api/buffered?scene=${encodeURIComponent(n)}&chs=${key}`).then(r => r.json())));
+      if (BUF.names !== names) return;
+      BUF.s = Math.min(...rs.map(r => r.buffered)); BUF.dur = Math.min(...rs.map(r => r.dur));
+      if (BUF.s >= BUF.dur - 0.05) { clearInterval(BUF.timer); BUF.timer = 0; }
+    } catch (e) {} finally { busy = false; }
+  };
+  poll();
+  BUF.timer = setInterval(poll, 400);
+}
+const ready = () => BUF.dur < 1e8 && BUF.s >= BUF.dur - 0.05;
+function showLoad(id, what) {   // before playing: the whole scene into the cache first, then it plays without a hitch
+  const known = BUF.dur < 1e8, el = $(id), pc = known ? Math.floor(BUF.s / BUF.dur * 100) : 0;
+  el.querySelector('.t').textContent = `씬 준비 중 · ${pc}%`;
+  el.querySelector('.s').textContent = `${what}를 처음 한 번 디스크에서 읽습니다. 다 준비되면 바로 재생합니다.`;
+  el.querySelector('.bar i').style.width = `${pc}%`;
+  el.hidden = false;
+}
+function stopPlay() { PLAY.on = false; $('play').textContent = '▶ 재생'; $('load').hidden = true; }
+function startPlay() {
+  const sc = scenes[cur.si];
+  if (!sc) return;
+  PLAY.base = cur.i >= sc.samples.length - 1 ? 0 : (sc.sample_ts[cur.i] - sc.sample_ts[0]) / 1e6;
+  PLAY.start = performance.now(); PLAY.t = PLAY.base; PLAY.key = cur.i; PLAY.on = true; LID.k = -1;
+  PLAY.wait = true;                                  // playTick waits until the scene is all in the cache
+  prefetch(scopeFrom(cur.si), ALLCH);                // this scene first (the review may have asked for others)
+  watchBuffer([sc.name], ALLCH);
+  $('play').textContent = '❚❚ 멈춤';
+  if (BOX.on) {                                   // boxes belong to key frames only: hidden while playing
+    CAMS.forEach(c => { $('box_' + c).innerHTML = ''; $('cnt_' + c).textContent = ''; });
+    $('boxLeg').innerHTML = '<span>2D 박스: 재생 중에는 숨김 (key frame에만 있음) · 멈추면 다시 보입니다</span>';
+  }
+  requestAnimationFrame(playTick);
+}
+async function playTick() {
+  if (!PLAY.on) return;
+  const sc = scenes[cur.si], t0 = sc.sample_ts[0], dur = (sc.sample_ts[sc.sample_ts.length - 1] - t0) / 1e6;
+  if (PLAY.wait) {                                  // not all in the cache yet: say so, start once it is
+    if (!ready()) {                                 // no overlay until the server has answered: a cached scene just plays
+      if (BUF.dur < 1e8) showLoad('load', '이 씬의 카메라 6대와 LiDAR');
+      requestAnimationFrame(playTick); return;
+    }
+    PLAY.wait = false; PLAY.start = performance.now(); $('load').hidden = true;
+    if (BOX.on) CAMS.forEach(c => { $('box_' + c).innerHTML = ''; $('cnt_' + c).textContent = ''; });   // none while playing
+  }
+  const t = PLAY.t = Math.min(dur, PLAY.base + (performance.now() - PLAY.start) / 1000 * speedOf());
+  lidarFollow(sc, t0, t);                          // never holds the cameras back
+  if (!PLAY.busy) {
+    PLAY.busy = true;
+    try { await playFrame(sc, t0, t); } catch (e) {} finally { PLAY.busy = false; }
+  }
+  if (t >= dur) {
+    stopPlay();
+    if ($('autoNext').checked) playNextScene();
+    else if (BOX.on) go(cur.si, cur.i);
+    return;
+  }
+  requestAnimationFrame(playTick);
+}
+function lidarFollow(sc, t0, t) {   // every 10 Hz sweep, at most one load in flight, the next two read ahead
+  if (LID.busy) return;
+  LID.busy = true;
+  framesOf(sc.name, 'LIDAR_TOP').then(fr => {
+    const k = pickIdx(fr, t0, t);
+    for (const j of [k + 1, k + 2]) if (fr.fn[j]) lidBuf(fr.fn[j]).catch(() => {});
+    return k === LID.k ? null : lidBuf(fr.fn[k]).then(xyz => [k, xyz]);
+  }).then(r => { if (r && PLAY.on) { LID.k = r[0]; setLidar(r[1]); } })
+    .catch(() => {}).finally(() => { LID.busy = false; });
+}
+async function playFrame(sc, t0, t) {
+  const my = ++req;
+  const lists = await Promise.all(CAMS.map(c => framesOf(sc.name, c).catch(() => null)));
+  let i = 0;                                        // key frame at or before t (slider)
+  while (i + 1 < sc.sample_ts.length && sc.sample_ts[i + 1] <= t0 + t * 1e6) i++;
+  const ims = await Promise.all(lists.map(fr => loadImg(fr && pick(fr, t0, t))));
+  if (my !== req || !PLAY.on) return;
+  swapCams(ims);
+  if (i !== PLAY.key) {
+    PLAY.key = cur.i = i;
+    $('slider').value = i;
+    history.replaceState(null, '', `#scene=${sc.name}&i=${i}`);
+  }
+  $('time').textContent = t.toFixed(1) + ' s';
+  const r = sc.route;
+  if (r.length) {
+    let k = 0;
+    while (k + 1 < r.length && r[k + 1][2] <= t0 + t * 1e6) k++;
+    lastEgo = Object.assign({}, lastEgo, { x: r[k][0], y: r[k][1], speed_kmh: r[k][3], lat: r[k][4], lon: r[k][5], heading: r[k][6] });
+    drawMap();
+    $('stat').textContent = `${new Date((t0 + t * 1e6) / 1000).toLocaleTimeString('ko-KR')} · ${r[k][3].toFixed(1)} km/h`
+      + (r[k][6] != null ? ` · 방위 ${r[k][6] | 0}°` : '');
+  }
+}
+async function playNextScene() {   // "이어서 재생": next scene of the list on the left, after the last one the first again
+  if (!order.length) return;
+  const j = order[(order.indexOf(cur.si) + 1) % order.length];
+  await go(j, 0);
+  if ($('autoNext').checked && !PLAY.on) startPlay();
+}
+function stepScene(d) {
+  const k = order.indexOf(cur.si), j = order[Math.max(0, Math.min(order.length - 1, k + d))];
+  if (j !== undefined && j !== cur.si) go(j, 0);
+}
+function setSpeed(v) {   // header and review share the speed
+  if (PLAY.on) { PLAY.base = PLAY.t; PLAY.start = performance.now(); }
+  if (REV.on) { REV.base = REV.t; REV.start = performance.now(); }
+  $('speed').value = $('revSpeed').value = v;
+  try { localStorage.setItem('simple.speed', v); } catch (e) {}
+}
+$('play').onclick = togglePlay;
+$('prevScene').onclick = () => stepScene(-1);
+$('nextScene').onclick = () => stepScene(1);
+$('slider').oninput = () => go(cur.si, +$('slider').value);
+$('speed').onchange = () => setSpeed($('speed').value);
+$('revSpeed').onchange = () => setSpeed($('revSpeed').value);
+try { $('autoNext').checked = (localStorage.getItem('simple.autoNext') ?? '1') === '1'; } catch (e) { $('autoNext').checked = true; }
+$('autoNext').onchange = () => { try { localStorage.setItem('simple.autoNext', $('autoNext').checked ? '1' : '0'); } catch (e) {} };
+try { const v = localStorage.getItem('simple.speed'); if (v) $('speed').value = $('revSpeed').value = v; } catch (e) {}
+
+// ---------- review: one group at a time, all members side by side, decided per scene ----------
+const REV = { gi: -1, names: [], imgs: [], boxes: [], lids: [], lidBusy: [], lidK: [], t: 0, on: false, base: 0, start: 0, req: 0 };
+const RVIEW = Object.assign({}, VIEW0);           // one LiDAR viewpoint for all tiles, so they compare like for like
+$('revCam').innerHTML = CAMS.map(c => `<option value="${c}"${c === 'CAM_FRONT' ? ' selected' : ''}>보기: 카메라 ${CAM_KO[c]}</option>`).join('')
+  + '<option value="LIDAR">보기: LiDAR 3D</option><option value="CAM_FRONT+LIDAR">보기: 앞 카메라 + LiDAR</option>';
+try { const v = localStorage.getItem('simple.revView'); if (v && [...$('revCam').options].some(o => o.value === v)) $('revCam').value = v; } catch (e) {}
+const ALLCH = [...CAMS, 'LIDAR_TOP'];
+let PREF_KEY = '';
+function prefetch(names, chs) {   // the server reads these into its local-disk cache in 2 s slices; a new request replaces the queue
+  names = names.filter(Boolean);
+  const key = names.join(',') + '|' + chs.join(',');
+  if (!names.length || key === PREF_KEY) return;
+  PREF_KEY = key;
+  fetch(`/api/prefetch?scenes=${encodeURIComponent(names.join(','))}&chs=${encodeURIComponent(chs.join(','))}`).catch(() => {});
+}
+const scopeFrom = si => { const k = Math.max(0, order.indexOf(si)); return [...order.slice(k), ...order.slice(0, k)].map(i => scenes[i].name); };
+const revChs = () => { const m = revMode(); return [...(m.cam ? [m.cam] : []), ...(m.lid ? ['LIDAR_TOP'] : [])]; };
+const revMode = () => { const v = $('revCam').value; return { cam: v === 'LIDAR' ? null : v.split('+')[0], lid: v.includes('LIDAR') }; };
+function applyRevMode() {
+  const m = revMode(), cls = m.cam && m.lid ? 'both' : m.lid ? 'lid' : 'cam';
+  $('revTiles').querySelectorAll('.body').forEach(b => { b.className = 'body ' + cls; });
+  REV.lidK = REV.names.map(() => -1);
+  if (m.lid) REV.lids.forEach(l => l.schedule());
+}
+function revLidar(k, n, t) {   // tile k: LiDAR sweep nearest to t, one load in flight per tile
+  if (REV.lidBusy[k]) return;
+  REV.lidBusy[k] = true;
+  const sc = scenes[byName[n]];
+  framesOf(n, 'LIDAR_TOP').then(fr => {
+    const j = pickIdx(fr, sc.sample_ts[0], t);
+    if (fr.fn[j + 1]) lidBuf(fr.fn[j + 1]).catch(() => {});
+    return j === REV.lidK[k] ? null : lidBuf(fr.fn[j]).then(xyz => [j, xyz]);
+  }).then(r => { if (r && REV.names[k] === n) { REV.lidK[k] = r[0]; REV.lids[k].set(r[1]); } })
+    .catch(() => {}).finally(() => { REV.lidBusy[k] = false; });
+}
+function openReview(gi, t = 0, autoplay = true) {
+  if (!GROUPS.length) return;
+  gi = ((gi % GROUPS.length) + GROUPS.length) % GROUPS.length;
+  if (PLAY.on) stopPlay();
+  if (REV.on) revToggle();
+  REV.gi = gi; REV.names = GROUPS[gi]; REV.t = t;
+  const N = REV.names.length, cols = N <= 2 ? N : N <= 4 ? 2 : Math.ceil(Math.sqrt(N));   // 2x2 keeps 16:9 frames large
+  $('revTiles').style.gridTemplateColumns = `repeat(${cols}, minmax(0, 1fr))`;
+  const hasMap = N > 1 && S(REV.names[1]).kind === '경로 겹침';   // the map row: about a quarter, the tiles keep the rest
+  $('revTiles').style.gridTemplateRows = hasMap ? `repeat(${Math.ceil(N / cols)}, minmax(0, 1fr)) minmax(0, .42fr)` : '';
+  const num = k => '①②③④⑤⑥⑦⑧⑨'[k] || k + 1;
+  $('revTiles').innerHTML = REV.names.map((n, k) => `<figure data-n="${n}"><figcaption>`
+    + `<b${N > 1 && S(REV.names[1]).kind === '경로 겹침' ? ` style="color:${OV_COL[k % OV_COL.length]}"` : ''}>${num(k)} ${n}</b><span class="muted">${routeOf(scenes[byName[n]].log)}${scenes[byName[n]].extra ? ' · 검토 범위 밖' : ''}</span><span class="rule-lab"></span><span class="muted" title="diff = LiDAR 변화량 · 객체 = 가까운 도로 이용자 샘플 평균">${capOf(n)}</span><span class="sp"></span>`
+    + `<span class="dec"><button data-dec="keep" data-n="${n}">남기기</button><button data-dec="drop" data-n="${n}">버리기</button></span>`
+    + `</figcaption><div class="body"><div class="camwrap"><img alt=""><svg class="boxes" viewBox="0 0 1920 1080" `
+    + `preserveAspectRatio="xMidYMid meet"></svg></div><canvas title="드래그 = 회전 · 오른쪽 드래그 = 이동 · 휠 = 확대 · 더블클릭 = 처음 시점 (모든 칸 같이)"></canvas></div></figure>`).join('');
+  if (N > 1 && S(REV.names[1]).kind === '경로 겹침')   // path overlap: both paths on the map, under the tiles
+    $('revTiles').insertAdjacentHTML('beforeend', '<figure class="revmap"><figcaption><b>경로</b><span class="muted">번호 색 = 위 칸</span>'
+      + '</figcaption><div class="mapwrap"><canvas id="revMap"></canvas></div></figure>');
+  $('revTiles').insertAdjacentHTML('beforeend', '<div class="load" id="revLoad" hidden><div class="box"><div class="t"></div>'
+    + '<div class="s"></div><div class="bar"><i></i></div></div></div>');
+  REV.imgs = [...$('revTiles').querySelectorAll('img')];
+  REV.boxes = [...$('revTiles').querySelectorAll('svg.boxes')];
+  const redrawAll = () => REV.lids.forEach(l => l.schedule());
+  REV.lids = [...$('revTiles').querySelectorAll('.body canvas')].map(cv => makeLidarView(cv, RVIEW, redrawAll, N > 2 ? 2 : 1));
+  REV.lidBusy = REV.names.map(() => false);
+  applyRevMode();
+  $('revReason').textContent = ruleText(REV.names);
+  $('rev').hidden = false;
+  prefetch([...REV.names, ...(GROUPS[(gi + 1) % GROUPS.length] || [])], revChs());
+  renderReviewState();
+  revShow();
+  if (autoplay) revToggle();
+}
+function renderReviewState() {
+  const done = GROUPS.filter(groupDone).length;
+  const sk = GROUPS.filter(g => !groupDone(g) && g.some(skipped)).length;
+  $('revTitle').textContent = `검토 ${REV.gi + 1} / ${GROUPS.length} · 완료 ${done}` + (sk ? ` · 건너뜀 ${sk}` : '');
+  $('revTiles').querySelectorAll('figure[data-n]').forEach(f => {   // the scenes' tiles (not the map)
+    const n = f.dataset.n, h = humanOf(n), fin = finalDrop(n) ? 'drop' : 'keep';
+    f.className = h ? fin : '';
+    f.querySelector('.rule-lab').innerHTML = ' · ' + (lockedOf(n) ? '<span class="muted">잠김 (이전 라운드)</span>'
+      : h ? `<span class="${h === 'drop' ? 'del' : 'rep'}">${STATE_KO[h]}</span>`
+      : ruleDrop(n) ? `<span class="del">후보 · ${esc(kindOf(n))}</span>` : '<span class="rep">필터 통과</span>');
+    f.querySelectorAll('.dec button').forEach(b => {
+      b.disabled = lockedOf(n);
+      const on = b.dataset.dec === fin;
+      b.className = on ? `on ${fin}${h ? '' : ' auto'}` : '';
+      b.title = on && !h ? '후보 (아직 확정 전) · 누르면 확정' : on ? '확정됨 · 다시 누르면 후보로' : '누르면 확정';
+    });
+  });
+  const g = GROUPS[REV.gi];
+  const cDrop = listed().filter(s => humanOf(s.name) === 'drop').length;
+  if (GROUPS.length && GROUPS.every(groupDone)) {
+    $('revDone').textContent = `✓ 모든 후보 확정 · 버리기 확정 ${cDrop}개는 앱에서 최종 삭제`;
+    $('revAccept').hidden = true;
+  } else {
+    $('revDone').textContent = g && groupDone(g) ? '✓ 이 그룹 확정 완료 → 다음 그룹 (→)' : '';
+    $('revAccept').hidden = false;
+  }
+}
+$('revTiles').addEventListener('click', e => {
+  const b = e.target.closest('[data-dec]');
+  if (!b) return;
+  const n = b.dataset.n, v = b.dataset.dec;
+  decide(n, humanOf(n) === v ? null : v);         // same button again = back to the rule's proposal
+});
+async function acceptRule() {   // undecided members take the rule's proposal, then the next open group
+  for (const n of REV.names) if (!humanOf(n)) await decide(n, ruleDrop(n) ? 'drop' : 'keep', 'rule');
+  const any = nextGroup(REV.gi);
+  if (any >= 0) openReview(any);
+  else renderReviewState();
+}
+function revSkip() {   // this group for now: its open candidates come back after the rest
+  REV.names.filter(n => ruleDrop(n) && !humanOf(n)).forEach(n => SKIP.add(n));
+  saveSkip();
+  const any = nextGroup(REV.gi);
+  if (any >= 0) openReview(any); else { renderReviewState(); buildList(); }
+}
+async function revShow() {   // camera tiles load + decode first, then change together; LiDAR follows on its own
+  const my = ++REV.req, m = revMode(), cam = m.cam, t = REV.t;
+  $('revSlider').value = t; $('revTime').textContent = t.toFixed(1) + ' s';
+  drawRevMap();
+  if (m.lid) REV.names.forEach((n, k) => revLidar(k, n, t));
+  if (!cam) return;
+  const lists = await Promise.all(REV.names.map(n => framesOf(n, cam).catch(() => null)));
+  const bxs = BOX.on && !REV.on ? await Promise.all(REV.names.map(boxesOf)) : null;
+  if (my !== REV.req) return;
+  // paused with boxes on: each tile shows its key frame nearest to t, the frame its boxes belong to
+  const keys = REV.names.map((n, k) => {
+    const b = bxs && bxs[k], fr = lists[k];
+    if (!b || b.missing || !fr) return [-1, -1];
+    const kt = b.key_ts[cam], target = scenes[byName[n]].sample_ts[0] + t * 1e6;
+    let best = 0;
+    kt.forEach((v, j) => { if (Math.abs(v - target) < Math.abs(kt[best] - target)) best = j; });
+    const j = fr.ts.indexOf(kt[best]);
+    return j >= 0 ? [best, j] : [-1, -1];
+  });
+  const fns = lists.map((fr, k) => fr && (keys[k][1] >= 0 ? fr.fn[keys[k][1]] : pick(fr, scenes[byName[REV.names[k]]].sample_ts[0], t)));
+  const ims = await Promise.all(fns.map((fn, k) => fn && REV.imgs[k].dataset.fn !== fn ? loadImg(fn) : null));
+  if (my !== REV.req) return;
+  ims.forEach((im, k) => { if (im) { im.dataset.fn = fns[k]; REV.imgs[k].replaceWith(im); REV.imgs[k] = im; } });
+  REV.boxes.forEach((svg, k) => drawBoxes(svg, bxs && bxs[k], cam, keys[k][0]));
+}
+function revToggle() {   // real time: the next frame is whatever time it is once the previous one is shown
+  if (REV.on) { REV.on = false; $('revPlay').textContent = '▶ 재생'; $('revLoad').hidden = true; if (BOX.on) revShow(); return; }
+  if (REV.t >= 20) REV.t = 0;
+  REV.on = true; REV.base = REV.t; REV.start = performance.now(); REV.wait = true;
+  prefetch(REV.names, revChs());
+  watchBuffer(REV.names, revChs());
+  $('revPlay').textContent = '❚❚ 멈춤';
+  requestAnimationFrame(revTick);
+}
+async function revTick() {
+  if (!REV.on) return;
+  if (REV.wait) {
+    if (!ready()) {
+      if (BUF.dur < 1e8) showLoad('revLoad', `나란히 보는 씬 ${REV.names.length}개`);
+      requestAnimationFrame(revTick); return;
+    }
+    REV.wait = false; REV.start = performance.now(); $('revLoad').hidden = true;
+  }
+  REV.t = Math.min(20, REV.base + (performance.now() - REV.start) / 1000 * speedOf());
+  await revShow();
+  if (REV.t >= 20) { REV.t = 0; REV.base = 0; REV.start = performance.now(); }   // loop the group until decided
+  requestAnimationFrame(revTick);
+}
+function closeReview() {
+  if (REV.on) revToggle();
+  $('rev').hidden = true;
+  const n = REV.names[0];
+  if (n !== undefined && byName[n] !== undefined && byName[n] !== cur.si) go(byName[n], 0);
+}
+$('revPlay').onclick = revToggle;
+$('revClose').onclick = closeReview;
+$('revPrev').onclick = () => openReview(REV.gi - 1);
+$('revNext').onclick = () => openReview(REV.gi + 1);
+$('revAccept').onclick = acceptRule;
+$('revSkip').onclick = revSkip;
+$('revSlider').oninput = () => { REV.t = +$('revSlider').value; REV.base = REV.t; REV.start = performance.now(); revShow(); };
+$('revCam').onchange = () => {
+  try { localStorage.setItem('simple.revView', $('revCam').value); } catch (e) {}
+  prefetch(REV.names, revChs());
+  applyRevMode(); revShow();
+};
+
+// ---------- 삭제 확정: show the plan, then move the deleted scenes out and renumber (server: apply_selection.py) ----------
+async function openApply() {
+  if (PLAY.on) stopPlay();
+  $('apply').hidden = false;
+  $('applyRun').hidden = false; $('applyRun').disabled = true;
+  $('applyCancel').disabled = false; $('applyCancel').textContent = '취소';
+  $('applyCancel').onclick = () => { $('apply').hidden = true; };
+  $('applyBody').textContent = '계획 불러오는 중…';
+  let p;
+  try { p = await getJSON('/api/apply/plan' + (ONLY.length ? '?logs=' + encodeURIComponent(ONLY.join(',')) : '')); } catch (e) { $('applyBody').textContent = '계획을 불러오지 못함: ' + e.message; return; }
+  if (p.error) { $('applyBody').textContent = p.error; return; }
+  const rule = p.deleted.filter(n => p.by[n] !== 'human'), ren = Object.entries(p.rename);
+  $('applyBody').innerHTML =
+    `<div class="row"><b>scene ${p.n_before} → ${p.n_after}</b> · ${p.deleted.length}개를 데이터에서 뺍니다 (${(p.bytes_moved / 1e9).toFixed(1)} GB)</div>`
+    + `<div class="row">빼는 scene: ${p.deleted.map(n => `<b class="mono">${short(n)}</b> ${p.by[n] === 'human'
+        ? '<span class="muted">(사람 결정)</span>' : '<span class="del">(규칙 제안)</span>'}`).join(' · ')}</div>`
+    + (rule.length ? `<div class="row warn">⚠ 아직 사람이 보지 않은 규칙 제안 ${rule.length}개(${rule.map(short).join(', ')})도 그대로 빠집니다. 먼저 검토하는 것을 권장합니다.</div>` : '')
+    + `<div class="row">이름 당김 ${ren.length}개 (빈 번호 없이 앞으로 채움)<div class="names">${ren.map(([a, b]) => `${short(a)}→${short(b)}`).join('  ') || '없음'}</div></div>`
+    + `<div class="row muted">지우지 않고 <span class="mono">_removed/&lt;시각&gt;/</span> 폴더로 옮기고, 원래 표와 이름 대응표를 같이 저장해 되돌릴 수 있습니다. `
+    + `남는 scene에 대한 결정(예: 남기기)은 새 이름으로 따라가고, 규칙은 새 데이터로 다시 돌립니다. 모든 결정은 decisions_log.txt에 남습니다.</div>`;
+  $('applyRun').disabled = false;
+}
+async function runApply() {
+  $('applyRun').disabled = true; $('applyCancel').disabled = true;
+  $('applyBody').textContent = '적용 중… (파일 이동 · 이름 변경 · 규칙 다시 실행)';
+  let r;
+  try {
+    const res = await fetch('/api/apply', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ confirm: true, logs: ONLY.length ? ONLY : null }) });
+    r = res.ok ? await res.json() : { ok: false, error: 'HTTP ' + res.status };
+  } catch (e) { r = { ok: false, error: e.message }; }
+  $('applyCancel').disabled = false;
+  if (!r.ok) {
+    $('applyBody').innerHTML = `<div class="row warn">실패: ${esc(r.error || '')}</div><div class="row muted">${esc(r.hint || '')}</div>`;
+    return;
+  }
+  $('applyBody').innerHTML = `<div class="row"><b>완료</b> · 이제 scene ${r.n_after}개 · ${r.deleted.length}개를 백업으로 옮김</div>`
+    + `<div class="row muted">백업: <span class="mono">${esc(r.backup)}</span></div>`
+    + `<div class="row muted">되돌리기: <span class="mono">${esc(r.undo)}</span></div>`
+    + (r.curate_ok ? '' : '<div class="row warn">규칙 재실행 실패 — python curate.py 를 직접 실행하세요</div>');
+  $('applyRun').hidden = true;
+  $('applyCancel').textContent = '새로고침';
+  $('applyCancel').onclick = () => { history.replaceState(null, '', '/review' + location.search); location.reload(); };
+}
+$('applyRun').onclick = runApply;
+
+// ---------- keys ----------
+document.addEventListener('keydown', e => {
+  if (e.target.tagName === 'SELECT') return;
+  if (!$('apply').hidden) { if (e.key === 'Escape' && !$('applyCancel').disabled) $('applyCancel').click(); return; }
+  if (!$('rev').hidden) {
+    if (e.key === 'Escape') closeReview();
+    else if (e.key === ' ') { e.preventDefault(); revToggle(); }
+    else if (e.key === 'ArrowRight') { e.preventDefault(); openReview(REV.gi + 1); }
+    else if (e.key === 'ArrowLeft') { e.preventDefault(); openReview(REV.gi - 1); }
+    else if (e.key === 'a' || e.key === 'A') acceptRule();
+    else if (e.key === 's' || e.key === 'S') revSkip();
+    else if (e.key === 'b' || e.key === 'B') { $('boxOn').checked = !$('boxOn').checked; $('boxOn').onchange(); }
+    return;
+  }
+  if (e.target === $('slider') && (e.key === 'ArrowLeft' || e.key === 'ArrowRight')) return;   // the slider moves itself
+  if (e.key === 'ArrowRight') { e.preventDefault(); go(cur.si, cur.i + 1); }
+  else if (e.key === 'ArrowLeft') { e.preventDefault(); go(cur.si, cur.i - 1); }
+  else if (e.key === 'ArrowDown') { e.preventDefault(); stepScene(1); }
+  else if (e.key === 'ArrowUp') { e.preventDefault(); stepScene(-1); }
+  else if (e.key === ' ') { e.preventDefault(); togglePlay(); }
+  else if (e.key === 'b' || e.key === 'B') { $('boxOn').checked = !$('boxOn').checked; $('boxOn').onchange(); }
+  else if (e.key === 'k' || e.key === 'K') decideHere('keep');
+  else if (e.key === 'd' || e.key === 'D') decideHere('drop');
+  else if (e.key === 'n' || e.key === 'N') goNextProposal();
+  else if (e.key === 's' || e.key === 'S') skipHere();
+});
+let resizeT = 0;
+window.addEventListener('resize', () => {
+  clearTimeout(resizeT);
+  resizeT = setTimeout(() => { drawMap(); drawRevMap(); lschedule(); }, 100);
+});
+
+// ---------- start ----------
+let readyBusy = false;
+async function pollReady() {
+  const names = scenes.map(s => s.name).filter(n => (READY[n] || 0) < 0.999);
+  if (!names.length || readyBusy) return;
+  readyBusy = true;
+  try {
+    const got = await fetch('/api/ready?scenes=' + encodeURIComponent(names.join(','))).then(r => r.json());
+    const moved = Object.entries(got).some(([n, f]) => Math.abs((READY[n] || 0) - f) >= 0.02 || (f >= 0.999) !== ((READY[n] || 0) >= 0.999));
+    Object.assign(READY, got);
+    if (moved) buildList();
+  } catch (e) {} finally { readyBusy = false; }
+}
+setInterval(pollReady, 3000);
+let PAGE_MTIME = null;                           // the page's code changed on the server: offer a reload (decisions are saved)
+setInterval(async () => {
+  try {
+    const m = (await getJSON('/api/page')).mtime;
+    if (PAGE_MTIME === null) PAGE_MTIME = m; else if (m !== PAGE_MTIME) $('newver').hidden = false;
+  } catch (e) {}
+}, 15000);
+async function init() {
+  const [sc, se, hd] = await Promise.all([getJSON('/api/scenes'), getJSON('/api/selection').catch(() => ({ missing: true })),
+                                          getJSON('/api/decisions').catch(() => ({ decisions: {} }))]);
+  sel = se;
+  scenes = ONLY.length ? sc.scenes.filter(s => ONLY.includes(s.log)) : sc.scenes;
+  if (ONLY.length && sel && !sel.missing) {       // a candidate here whose kept scene is in another route or course (path
+    const want = new Set(scenes.map(s => S(s.name).substitute).filter(Boolean));   // overlap crosses them): load that
+    for (const s of sc.scenes) if (want.has(s.name) && !ONLY.includes(s.log)) scenes.push(Object.assign(s, { extra: true }));
+  }                                               // scene too, for the comparison and its map (not listed, not counted)
+  scenes.forEach((s, i) => { byName[s.name] = i; });
+  human = hd.decisions || {};
+  if (sel && !sel.missing) for (const r of sel.routes || []) for (const g of r.stage1_groups || []) for (const m of g) groupOf[m] = g;
+  objRank();
+  const h = new URLSearchParams(location.hash.slice(1));
+  if (['del', 'all', 'obj', 'dec', 'pass'].includes(h.get('view'))) listView = h.get('view');
+  const saveView = listView;
+  listView = 'all'; buildList();                   // scene order for the review groups
+  buildGroups();
+  listView = saveView; buildList();
+  pollReady();
+  let si = byName[h.get('scene')] ?? order[0];
+  if (h.get('next') !== null) { const j = nextProposal(order[order.length - 1]); if (j >= 0) si = j; }
+  await go(si, +h.get('i') || 0);
+  if (h.get('play')) startPlay();
+  const ri = h.get('review');                      // review=next: the first group not decided yet (the GUI opens this)
+  if (ri !== null && ri !== undefined && GROUPS.length) {
+    const gi = ri === 'next' ? Math.max(0, GROUPS.findIndex(g => !groupDone(g))) : +ri || 0;
+    openReview(gi, +h.get('t') || 0, h.get('pause') === null);
+  }
+}
+init().catch(e => { $('title').textContent = '초기화 실패: ' + e.message; });
+</script>
+</body>
+</html>

@@ -51,3 +51,9 @@ CLAUDE.md
 msg/*
 !msg/ObjectType.msg
 !msg/MotionType.msg
+
+# curation: the app's copy of the confirmed lists (data, rewritten on every decision; the dataset's selection/ holds the originals)
+curation/keep.txt
+curation/drop.txt
+curation/deleted.txt
+curation/human_decisions.json

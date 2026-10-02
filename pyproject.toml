@@ -20,6 +20,8 @@ plots = ["matplotlib>=3.7", "jupyter"]
 viz = ["rerun-sdk>=0.16"]
 # gui.py (PySide6 also works); WebEngine shows the curation review viewer in the window
 gui = ["PyQt5>=5.15", "PyQtWebEngine>=5.15"]
+# scripts/hf_release.py: publish the curated dataset to a Hugging Face dataset repo
+release = ["huggingface_hub>=0.30", "hf_xet"]
 
 [build-system]
 requires = ["setuptools>=64"]   # 64+ for editable installs (PEP 660)

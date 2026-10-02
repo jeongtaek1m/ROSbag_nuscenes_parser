@@ -361,6 +361,34 @@ msgs = json.load(open(f"{root}/ext/{scene['name']}/bsw__vehicle_can.json"))
 - Detection evaluation needs a class/attribute mapping first (known
   limitation 6), and poses must stay float64 (limitation 8).
 
+## Publishing (Hugging Face)
+
+The curated dataset goes to the dataset repo `shchon11/TCar`, append-only, with
+[`scripts/hf_release.py`](scripts/hf_release.py) (`pip install -e '.[release]'`):
+
+```bash
+python scripts/hf_release.py --branch 1002 --from main --token-file ~/Documents/<hf token>.txt            # plan
+python scripts/hf_release.py --branch 1002 --from main --token-file ~/Documents/<hf token>.txt --upload   # do it
+```
+
+- **Only finalized data**: every scene must be locked by curation's 최종 확정. Locked scenes never change,
+  so a published tar never changes either; new recordings only add tars.
+- **Sensor tars per recording**: `sensors/<log>/<log>.partNN.tar`, split at scene boundaries into tars of at most
+  `--part-gb` (10 GB; 268 scenes = 71 tars, 6–9.4 GB). Files are read 16 at a time from the HDD (~74 MB/s).
+- **One table tar per release**: `meta/TCar_meta.tar` (tables, CAN bus, maps, import records, `curation/` lists),
+  replaced every release; scene names may change between releases only for new scenes.
+- **`manifest.json`**: every tar (recording, scene tokens, files, bytes, sha256, release) and the release history
+  with the parser commit; `README.md` (the dataset card) is written from it.
+- **One branch per delivery**: `--branch 1015 --from 1002` makes the next one from the last; only the new
+  recordings' tars are built and uploaded (identical files are stored once). Earlier branches stay as they were.
+- Before uploading, the dataset is checked (`apply_selection.py --check`: references, devkit, CAN bus) and the
+  published tars' scenes must still be in it. Uploads are one commit per tar and resume where they stopped
+  (`<stage>/<branch>.state.json`); the tables, manifest, README and `assemble.py` go last, in one commit.
+- **Recipients**: `hf download shchon11/TCar --repo-type dataset --revision <release> --local-dir tcar_tars`, then
+  `python tcar_tars/assemble.py --tars tcar_tars --out tcar_nuscenes` ([`scripts/hf_assemble.py`](scripts/hf_assemble.py)).
+  The same two commands update a copy to a newer release: only new tars are fetched and extracted.
+- `--to-dir DIR` writes the same layout into a directory instead (a copy to hand over on a disk, or a test).
+
 ## Layout
 
 ```

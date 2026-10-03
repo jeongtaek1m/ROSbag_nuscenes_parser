@@ -285,6 +285,18 @@ class HfRemote:
         self.api.upload_file(path_or_fileobj=str(local), path_in_repo=path, repo_id=self.repo, repo_type='dataset',
                              revision=self.branch, commit_message=msg)
 
+    def mirror(self, src, dst='main'):
+        """Make branch dst hold exactly what release src holds: files copied on the server (nothing re-uploaded),
+        the ones src does not have removed. One commit."""
+        from huggingface_hub import CommitOperationCopy, CommitOperationDelete
+        have, want = self.files(dst), self.files(src)
+        ops = [CommitOperationDelete(path_in_repo=p) for p in have if p not in want]
+        ops += [CommitOperationCopy(src_path_in_repo=p, path_in_repo=p, src_revision=src)
+                for p, sha in want.items() if sha is None or have.get(p) != sha]   # small files: always (cheap)
+        self.api.create_commit(self.repo, repo_type='dataset', revision=dst, operations=ops,
+                               commit_message=f'{dst} = release {src}')
+        return len(ops)
+
     def commit(self, adds, deletes, msg):
         """adds: path in repo -> Path (a local file) or str (text)."""
         from huggingface_hub import CommitOperationAdd, CommitOperationDelete
@@ -319,6 +331,11 @@ class DirRemote:
         src, dst = self.base / base, self.base / self.branch
         if not dst.exists():
             shutil.copytree(src, dst, copy_function=os.link) if src.is_dir() else dst.mkdir(parents=True)
+
+    def mirror(self, src, dst='main'):
+        shutil.rmtree(self.base / dst, ignore_errors=True)
+        shutil.copytree(self.base / src, self.base / dst, copy_function=os.link)
+        return 1
 
     def put(self, local, path, msg):
         dst = self.base / self.branch / path
@@ -447,7 +464,9 @@ the tables are replaced. Add `--delete-tars` to `assemble.py` to remove each tar
 ## Releases and versioning
 
 Each release is a branch of this repository (`--revision <name>`), a complete dataset on its own; a release
-is never changed after it is published. Later releases only **add** data:
+is never changed after it is published. **`main` always holds the latest release** (a copy, stored once), so
+`hf download` without `--revision` gets it; give `--revision` to stay on one release. Later releases only
+**add** data:
 
 - `sensors/<recording>/<recording>.partNN.tar.gz` — the sensor files (`samples/`, `sweeps/`) of a group of whole
   scenes of one recording, at most 10 GB unpacked (gzip: the LiDAR files shrink by about a third, the JPEGs not). Once published, a tar never changes and is carried into every
@@ -462,8 +481,8 @@ is never changed after it is published. Later releases only **add** data:
 |---|---|---|---|---|---|
 {rel_rows}
 
-The `main` branch holds an earlier upload (2026-09-23 recordings, one tar per channel, its own scene
-numbering), not part of this series.
+The `0923` branch holds the calibration sample recordings of 2026-09-23 (one tar per channel, its own
+scene numbering); they are not part of this series.
 
 ## Contents
 
@@ -529,6 +548,8 @@ def main():
     ap.add_argument('--skip-check', action='store_true', help='skip the dataset check (tables, devkit, CAN bus)')
     ap.add_argument('--readme-out', default=None, help='with the plan: write the README this release would get here')
     ap.add_argument('--card-only', action='store_true', help='rewrite only README.md of the published release (from its manifest)')
+    ap.add_argument('--no-main', action='store_true', help='leave main as it is (default: main becomes a copy of this release)')
+    ap.add_argument('--main-only', action='store_true', help='only make main a copy of the published release --branch')
     args = ap.parse_args()
     root = os.path.realpath(args.dataroot)
 
@@ -540,12 +561,15 @@ def main():
         token = m.group(0)
     remote = DirRemote(args.to_dir, args.branch) if args.to_dir else HfRemote(args.repo, args.branch, token or os.environ.get('HF_TOKEN'))
 
-    if args.card_only:                            # the card text changed: nothing else is touched
+    if args.card_only or args.main_only:          # nothing of the release's data is touched
         man = remote.read_json('manifest.json')
         if not man:
             sys.exit(f'{args.branch} has no manifest.json')
-        remote.commit({'README.md': readme(man, args.repo)}, [], f'{args.branch}: README')
-        log(f'README.md of {args.branch} rewritten')
+        if args.card_only:
+            remote.commit({'README.md': readme(man, args.repo)}, [], f'{args.branch}: README')
+            log(f'README.md of {args.branch} rewritten')
+        if args.main_only or not args.no_main:
+            log(f"main = release {args.branch}: {remote.mirror(args.branch)} changes")
         return
 
     # 1. the dataset: finalized and whole
@@ -676,6 +700,8 @@ def main():
                   [], f'{args.branch}: tables, manifest, README ({len(ds["scenes"])} scenes, +{rels[-1]["new_scenes"]})')
     os.remove(meta_dest)
     log(f"release {args.branch} done: {len(shards)} sensor tars + meta, {len(ds['scenes'])} scenes")
+    if not args.no_main and args.branch != 'main':  # main always holds the latest release
+        log(f"main = release {args.branch}: {remote.mirror(args.branch)} changes")
 
 
 if __name__ == '__main__':

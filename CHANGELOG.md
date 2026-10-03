@@ -79,6 +79,7 @@ IRCV-DM-Ops `parser` 브랜치의 DM Parser GUI를 같은 디자인·기능으�
 - 실제 데이터 규모 검증(그림자 데이터셋: 센서 파일은 하드링크, 표·selection·can_bus·import는 복사, 원본은 그대로): 최종 확정(66개 삭제, 이름 264개 당김, 센서 파일 244,200개 이동, 268개 잠금)을 CLI와 앱 버튼 경로 양쪽으로 실행 → devkit NuScenes 268 scene · NuScenesCanBus 268, devkit으로 모든 scene의 sample 사슬과 채널별 sample_data 사슬(991,534개 전부) 추적, 파일 991,534개 모두 존재, LIDAR_TOP · CAM_FRONT를 devkit으로 열기, 이름이 바뀐 268개 scene 모두 CAN bus pose가 자기 시간대와 일치. 되돌리기 뒤 표 13개 · import.json · can_bus 이름 · 파일 1,235,734개가 원본과 바이트까지 같음.
 - 수정(그 검증에서 발견): 첫 라운드의 최종 확정을 되돌려도 `locked.json`이 남아 268개가 계속 잠겨 있던 문제 — 백업 당시 잠금 파일이 없었으면 되돌릴 때 지움.
 - **허깅페이스 배포** `scripts/hf_release.py` / `scripts/hf_assemble.py`: 잠긴(최종 확정된) 데이터만, 녹화별 센서 tar(10 GB 이하, 씬 경계) + 배포마다 바뀌는 표 tar 하나 + manifest(sha256, 파서 커밋) + README + 받는 쪽 assemble.py. 배포마다 브랜치(1002, 다음은 1002에서 만든 1015…), 새 녹화의 tar만 올라감. 올리기 전 데이터셋 점검과 "이미 올린 tar의 씬이 그대로인지" 검사, tar 단위 커밋으로 이어 올리기. 로컬 폴더로 끝까지 시험(1002 → 새 녹화 → 1015, 받는 쪽 1002 조립 → 1015 업데이트에서 새 tar 1개만 풀림, devkit · CAN bus 통과, 센서 파일 집합 동일). 그 시험에서 tar 대신 경로 문자열이 올라가던 버그를 잡음. 실제 데이터 계획: 268개 씬 → 71개 tar(6–9.4 GB, 554 GB), HDD에서 16개 동시 읽기로 74 MB/s(한 개씩은 36 MB/s).
+- 허깅페이스 `shchon11/TCar`: 첫 배포 `1002` 업로드(268개 씬, tar 71개 + 표 tar, 476 GB, sha256 전부 manifest와 일치, 표 + D-1만 내려받아 조립 → devkit 정상). `main` = 항상 최신 배포(배포 뒤 서버에서 복사, 다시 올리지 않음), 9/23 캘리브레이션 샘플은 `0923` 브랜치에만.
 - 수정: 지도 타일 요청이 응답을 못 받던 문제 — PyQt5에서 `QNetworkReply`를 파이썬 쪽에서 붙잡지 않으면 람다 슬롯 연결이 사라짐. 끝날 때까지 dict에 보관.
 
 ### 검증

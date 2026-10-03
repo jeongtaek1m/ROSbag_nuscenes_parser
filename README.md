@@ -381,6 +381,8 @@ python scripts/hf_release.py --branch 1002 --from main --token-file ~/Documents/
   with the parser commit; `README.md` (the dataset card) is written from it.
 - **One branch per delivery**: `--branch 1015 --from 1002` makes the next one from the last; only the new
   recordings' tars are built and uploaded (identical files are stored once). Earlier branches stay as they were.
+- **`main` = the latest release**: after a release, `main` becomes a copy of it (server-side, nothing re-uploaded;
+  `--no-main` to skip, `--main-only` to redo). The 2026-09-23 calibration samples are on the branch `0923` only.
 - Before uploading, the dataset is checked (`apply_selection.py --check`: references, devkit, CAN bus) and the
   published tars' scenes must still be in it. Uploads are one commit per tar and resume where they stopped
   (`<stage>/<branch>.state.json`); the tables, manifest, README and `assemble.py` go last, in one commit.

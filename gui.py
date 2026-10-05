@@ -396,6 +396,7 @@ def curation_data(dataroot: Path) -> dict:
             # locked by an earlier round's 최종 확정 (apply_selection.py --finalize): never deleted, never candidates
             "locked": {n for n, v in rule.items() if (v or {}).get("locked")},
             "rounds": read("locked.json").get("rounds") or [],
+            "release": read("hf_release.json"),     # what went out to the Hub (scripts/hf_release.py writes it)
             # the filters' evidence: per-scene near road users, the rule's parameters, same-place stop groups
             "objects": {n: ((v.get("near") or {}).get("all") or {}).get("mean") for n, v in (counts.get("scenes") or {}).items()},
             "detector": {k: counts.get(k) for k in ("model", "conf", "near_px")},
@@ -412,6 +413,21 @@ def curation_data(dataroot: Path) -> dict:
 
 FILTER_KEY = {"정지 중복": "stops", "객체 부족": "objects", "경로 겹침": "overlap"}   # result.json `kind` -> state
 CANDIDATES = ("stops", "objects", "overlap", "other")     # the filters' fixed order (curate.py); other kinds: "other"
+
+
+def log_stage(data: dict, log: str) -> tuple:
+    """(round number or None, release name or None) of a recording: the curation round whose 최종 확정 locked it,
+    and the Hugging Face release it first went out in."""
+    rnd = next((k for k, r in enumerate(data["rounds"], 1) if log in (r.get("logs") or [])), None)
+    return rnd, ((data.get("release") or {}).get("logs") or {}).get(log)
+
+
+def stage_text(data: dict, log: str, names: list) -> tuple:
+    """Short label and colour: 새 데이터 (not finalized yet), 1라운드 · 미배포, 1라운드 · 배포 1002."""
+    rnd, rel = log_stage(data, log)
+    if any(scene_state(data, n) != "locked" for n in names) or rnd is None:
+        return "새 데이터 · 확정 전", C["accent"]
+    return (f"{rnd}라운드 · 배포 {rel}", C["ok"]) if rel else (f"{rnd}라운드 · 미배포", C["warn"])
 
 
 def scene_state(data: dict, name: str) -> str:
@@ -2002,6 +2018,32 @@ class MainWindow(QtWidgets.QMainWindow):
         whole_layout.addWidget(self.cur_kept)
         layout.addWidget(whole)
         layout.addSpacing(16)
+        # curation rounds and Hugging Face releases: what is finalized / published, and what is new
+        stage = QtWidgets.QFrame()
+        stage.setObjectName("actionCard")
+        stage_layout = QtWidgets.QVBoxLayout(stage)
+        stage_layout.setContentsMargins(20, 14, 16, 14)
+        stage_layout.setSpacing(8)
+        head = QtWidgets.QHBoxLayout()
+        head.addWidget(label("라운드 · 배포", "section"))
+        head.addSpacing(10)
+        self.stage_note = label("", "faint", True)
+        head.addWidget(self.stage_note, 1)
+        stage_layout.addLayout(head)
+        self.stage_table = QtWidgets.QTableWidget(0, 6)
+        setup_table(self.stage_table, ["구분", "최종 확정", "녹화", "남긴 씬", "지운 씬", "허깅페이스 배포"])
+        self.stage_table.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.NoSelection)
+        self.stage_table.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.stage_table.verticalHeader().setDefaultSectionSize(52)
+        header = self.stage_table.horizontalHeader()
+        header.setSectionResizeMode(2, QtWidgets.QHeaderView.ResizeMode.Stretch)
+        for column, width in ((0, 150), (1, 130), (3, 90), (4, 90), (5, 200)):
+            header.setSectionResizeMode(column, QtWidgets.QHeaderView.ResizeMode.Fixed)
+            self.stage_table.setColumnWidth(column, width)
+        self.stage_table.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        stage_layout.addWidget(self.stage_table)
+        layout.addWidget(stage)
+        layout.addSpacing(16)
         # every scene's GNSS track on OSM
         map_card = QtWidgets.QFrame()
         map_card.setObjectName("actionCard")
@@ -2077,13 +2119,14 @@ class MainWindow(QtWidgets.QMainWindow):
         bar.addWidget(self.cur_clear_btn)
         layout.addLayout(bar)
         layout.addSpacing(6)
-        self.cur_table = QtWidgets.QTableWidget(0, 8)
-        setup_table(self.cur_table, ["루트", "씬", "검출", "① 정지 중복", "② 객체 부족", "③ 경로 겹침", "남기기 확정", "버리기 확정"])
+        self.cur_table = QtWidgets.QTableWidget(0, 9)
+        setup_table(self.cur_table, ["루트", "확정 · 배포", "씬", "검출", "① 정지 중복", "② 객체 부족", "③ 경로 겹침",
+                                     "남기기 확정", "버리기 확정"])
         self.cur_table.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.ExtendedSelection)
         self.cur_table.setMinimumHeight(240)
         header = self.cur_table.horizontalHeader()
         header.setSectionResizeMode(0, QtWidgets.QHeaderView.ResizeMode.Stretch)
-        for column, width in ((1, 56), (2, 80), (3, 96), (4, 96), (5, 96), (6, 92), (7, 92)):
+        for column, width in ((1, 150), (2, 56), (3, 80), (4, 96), (5, 96), (6, 96), (7, 92), (8, 92)):
             header.setSectionResizeMode(column, QtWidgets.QHeaderView.ResizeMode.Fixed)
             self.cur_table.setColumnWidth(column, width)
         self.cur_table.itemSelectionChanged.connect(self._scope_changed)
@@ -2466,7 +2509,8 @@ class MainWindow(QtWidgets.QMainWindow):
             for row, name in enumerate(routes):
                 rc = curation_counts(self.cdata, self.status_all["names_by_log"][name])
                 m, when = BAG_RE.match(name), _bag_time(name)
-                cells = (name, f"{rc['n']}", f"{rc['detected']} / {rc['n']}", f"{rc['stops']}", f"{rc['objects']}",
+                st_text, st_col = stage_text(self.cdata, name, self.status_all["names_by_log"][name])
+                cells = (name, st_text, f"{rc['n']}", f"{rc['detected']} / {rc['n']}", f"{rc['stops']}", f"{rc['objects']}",
                          f"{rc['overlap']}", f"{rc['keep']}", f"{rc['drop']}")
                 for column, text in enumerate(cells):
                     item = QtWidgets.QTableWidgetItem(text)
@@ -2474,10 +2518,12 @@ class MainWindow(QtWidgets.QMainWindow):
                         item.setData(Qt.ItemDataRole.UserRole, name)
                         item.setData(SUB_ROLE, " · ".join(filter(None, [f"{m['course']}-{m['num']}" if m else "",
                                                                         f"{when:%Y-%m-%d %H:%M}" if when else ""])))
-                    elif column == 2 and rc["detected"] < rc["n"]:
+                    elif column == 1:
+                        item.setForeground(QtGui.QColor(st_col))
+                    elif column == 3 and rc["detected"] < rc["n"]:
                         item.setForeground(QtGui.QColor(C["warn"]))
-                    elif column >= 3 and rc[("stops", "objects", "overlap", "keep", "drop")[column - 3]]:
-                        item.setForeground(QtGui.QColor(("#c792ea", "#e8a94f", "#5ec8e5", C["ok"], C["bad"])[column - 3]))
+                    elif column >= 4 and rc[("stops", "objects", "overlap", "keep", "drop")[column - 4]]:
+                        item.setForeground(QtGui.QColor(("#c792ea", "#e8a94f", "#5ec8e5", C["ok"], C["bad"])[column - 4]))
                     else:
                         item.setForeground(QtGui.QColor(C["sub"] if column else C["text"]))
                     self.cur_table.setItem(row, column, item)
@@ -2566,9 +2612,50 @@ class MainWindow(QtWidgets.QMainWindow):
                                    + (f"같은 목록과 human_decisions.json을 {copy}에도 복사합니다.\n" if copy else "")
                                    + "루트를 고르면(여러 개: Ctrl/Shift) 검토·검출이 그 루트에만, 고르지 않으면 데이터셋 전체에 "
                                    "적용됩니다. 두 번 누르면 그 루트를 바로 검토합니다.")
+        self._show_stages()
         self._show_filters()
         self._style_map()
         self._update_buttons()
+
+    def _show_stages(self):
+        """The 라운드 · 배포 table: each curation round (what its 최종 확정 locked and deleted, and the release it went
+        out in), then the recordings not finalized yet."""
+        d, by_log = self.cdata, self.status_all["names_by_log"]
+        rel = d.get("release") or {}
+        rel_date = {r["name"]: (r.get("created") or "")[5:10].replace("-", "/") for r in rel.get("releases") or []}
+
+        def courses(logs):
+            c = {}
+            for lg in logs:
+                m = BAG_RE.match(lg)
+                c[m["course"] if m else "?"] = c.get(m["course"] if m else "?", 0) + 1
+            return " · ".join(f"{k} {v}" for k, v in sorted(c.items())) + f"  ({len(logs)}개)"
+        rows = []
+        for k, r in enumerate(d["rounds"], 1):
+            logs = r.get("logs") or []
+            rels = sorted({(rel.get("logs") or {}).get(lg) for lg in logs} - {None})
+            st = r.get("stamp", "")
+            when = f"{st[4:6]}/{st[6:8]} {st[9:11]}:{st[11:13]}" if len(st) >= 13 else st
+            out = ", ".join(f"{x} ({rel_date.get(x, '')})" for x in rels) if rels else "아직 안 올림"
+            rows.append((f"{k}라운드", when, courses(logs), f"{r.get('n', 0):,}", f"{r.get('deleted', 0):,}", out,
+                         C["ok"] if rels else C["warn"]))
+        new_logs = [lg for lg, names in by_log.items() if stage_text(d, lg, names)[0].startswith("새 데이터")]
+        if new_logs:
+            c = curation_counts(d, [n for lg in new_logs for n in by_log[lg]])
+            rows.append(("새 데이터 · 확정 전", "—", courses(new_logs), f"{c['n']:,} (후보 {c['cand']})", "—",
+                         "최종 확정 뒤 배포", C["accent"]))
+        if not rows:
+            rows.append(("아직 최종 확정한 라운드가 없습니다", "", "", "", "", "", C["sub"]))
+        self.stage_table.setRowCount(len(rows))
+        for i, row in enumerate(rows):
+            for j, text in enumerate(row[:6]):
+                item = QtWidgets.QTableWidgetItem(text)
+                item.setForeground(QtGui.QColor(row[6] if j in (0, 5) else C["sub"] if j else C["text"]))
+                self.stage_table.setItem(i, j, item)
+        self.stage_table.setFixedHeight(len(rows) * 52 + 40)
+        latest = rel.get("latest")
+        self.stage_note.setText((f"허깅페이스 {rel.get('repo')} · main = 최신 배포 {latest}" if latest else "아직 허깅페이스에 올린 배포가 없습니다")
+                                + " · 새 녹화는 파싱 → 검토 → 최종 확정 → scripts/hf_release.py 순서로 새 배포가 됩니다")
 
     def _scope_changed(self):
         self._show_curation()
@@ -3042,7 +3129,8 @@ class MainWindow(QtWidgets.QMainWindow):
                 elif self.status["error"]:
                     state, color = "데이터셋 확인 필요", C["warn"]
                 elif rec["name"] in self.status["logs"]:
-                    state, color = f"데이터셋에 포함 ({self.status['logs'][rec['name']]}씬)", C["ok"]
+                    st_text, _ = stage_text(self.cdata, rec["name"], self.status_all["names_by_log"].get(rec["name"], []))
+                    state, color = f"데이터셋에 포함 ({self.status['logs'][rec['name']]}씬) · {st_text}", C["ok"]
                 elif rec["name"] in self.status["imported"]:
                     state, color = "큐레이션으로 모두 제외", C["muted"]
                 else:

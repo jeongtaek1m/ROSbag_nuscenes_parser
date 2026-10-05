@@ -524,6 +524,26 @@ go last. First release of this series: `{first}`.
 
 
 # ---------------------------------------------------------------- main
+RECORD = 'hf_release.json'                        # <dataroot>/selection/: what went out, for the app
+
+
+def save_record(root, man, repo):
+    """The releases and which recording first went out in which one, next to the curation files, so the app can
+    tell published data from new data without asking the Hub."""
+    first = {}
+    for sh in man.get('shards', []):
+        first.setdefault(sh['log'], sh['release'])
+    rec = {'repo': repo, 'latest': man['release'], 'updated': datetime.datetime.now().astimezone().isoformat(timespec='seconds'),
+           'releases': [{k: r.get(k) for k in ('name', 'created', 'new_logs', 'new_scenes', 'scenes', 'parser_commit')}
+                        for r in man.get('releases', [])],
+           'logs': first, 'scene_tokens': sorted({t for sh in man.get('shards', []) for t in sh['scene_tokens']})}
+    path = os.path.join(root, 'selection', RECORD)
+    with open(path + '.tmp', 'w', encoding='utf-8') as f:
+        json.dump(rec, f, ensure_ascii=False, indent=1)
+    os.replace(path + '.tmp', path)
+    log(f'release record: {path}')
+
+
 def git_state():
     try:
         commit = subprocess.check_output(['git', '-C', str(REPO_DIR), 'rev-parse', 'HEAD'], text=True).strip()
@@ -550,6 +570,7 @@ def main():
     ap.add_argument('--card-only', action='store_true', help='rewrite only README.md of the published release (from its manifest)')
     ap.add_argument('--no-main', action='store_true', help='leave main as it is (default: main becomes a copy of this release)')
     ap.add_argument('--main-only', action='store_true', help='only make main a copy of the published release --branch')
+    ap.add_argument('--record-only', action='store_true', help=f'only write selection/{RECORD} from the published release --branch')
     args = ap.parse_args()
     root = os.path.realpath(args.dataroot)
 
@@ -561,10 +582,13 @@ def main():
         token = m.group(0)
     remote = DirRemote(args.to_dir, args.branch) if args.to_dir else HfRemote(args.repo, args.branch, token or os.environ.get('HF_TOKEN'))
 
-    if args.card_only or args.main_only:          # nothing of the release's data is touched
+    if args.card_only or args.main_only or args.record_only:   # nothing of the release's data is touched
         man = remote.read_json('manifest.json')
         if not man:
             sys.exit(f'{args.branch} has no manifest.json')
+        save_record(root, man, args.repo)
+        if args.record_only:
+            return
         if args.card_only:
             remote.commit({'README.md': readme(man, args.repo)}, [], f'{args.branch}: README')
             log(f'README.md of {args.branch} rewritten')
@@ -700,6 +724,7 @@ def main():
                   [], f'{args.branch}: tables, manifest, README ({len(ds["scenes"])} scenes, +{rels[-1]["new_scenes"]})')
     os.remove(meta_dest)
     log(f"release {args.branch} done: {len(shards)} sensor tars + meta, {len(ds['scenes'])} scenes")
+    save_record(root, man, args.repo)
     if not args.no_main and args.branch != 'main':  # main always holds the latest release
         log(f"main = release {args.branch}: {remote.mirror(args.branch)} changes")
 

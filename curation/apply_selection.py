@@ -19,7 +19,8 @@ every move, so --undo puts the dataset back exactly:
   1. backup   the tables (v1.0-trainval/*.json), *.import.json and selection/ are copied first
   2. tables   deleted scenes, their samples, sample_data (key frames and sweeps), ego poses and annotations
               are removed; a log / map left without scenes is dropped
-  3. files    the deleted scenes' samples/ + sweeps/ files and can_bus/ files are moved into the backup
+  3. files    the deleted scenes' samples/ + sweeps/ files (with the full dataset's *.time.bin), can_bus/ files
+              and ext/<scene>/ are moved into the backup
   4. names    the remaining scenes take the dataset's sorted names in order, so there is no gap: with
               2, 3, 4 and 3 deleted, 4 becomes 3. The names are the first N of the official nuScenes train
               split (what the converter assigned), so the devkit still sees them all as train;
@@ -395,6 +396,11 @@ def _rekey(d, rename, deleted):
     return {rename.get(k, k): v for k, v in d.items() if k not in deleted}
 
 
+def point_time_file(filename):
+    """The full dataset's per-point time file next to a LiDAR frame (<name>.time.bin), or nothing."""
+    return (filename[:-len('.pcd.bin')] + '.time.bin',) if filename.endswith('.pcd.bin') else ()
+
+
 def apply(dataroot, log=print, logs=None):
     with _Locked(dataroot, 'apply_selection'):
         return _apply(dataroot, log, logs)
@@ -489,9 +495,10 @@ def _apply(dataroot, log, logs=None):
 
     # 3. files ------------------------------------------------------------------------------------------
     for x in del_sd:
-        src = os.path.join(dataroot, x['filename'])
-        if os.path.isfile(src):
-            move(src, os.path.join(B, 'files', x['filename']))
+        for fn in (x['filename'], *point_time_file(x['filename'])):
+            src = os.path.join(dataroot, fn)
+            if os.path.isfile(src):
+                move(src, os.path.join(B, 'files', fn))
     for n in sorted(deleted):
         for f in glob.glob(os.path.join(dataroot, 'can_bus', n + '_*')):
             move(f, os.path.join(B, 'can_bus', os.path.basename(f)))

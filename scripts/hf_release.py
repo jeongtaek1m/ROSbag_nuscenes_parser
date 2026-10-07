@@ -70,16 +70,26 @@ def load_dataset(root):
         span[smp['scene_token']] = (min(a, smp['timestamp']), max(b, smp['timestamp']))
     seconds = sum((b - a) / 1e6 + 0.5 for a, b in span.values())     # key frames every 0.5 s
     files, chans = {}, {}                         # scene token -> [sensor file names]; channel -> [frames, w, h, key]
+    full = os.path.isdir(os.path.join(root, 'ext'))   # the full-data converter's dataset
     for sd in rd('sample_data'):
-        files.setdefault(scene_of[sd['sample_token']], []).append(sd['filename'])
+        fl = files.setdefault(scene_of[sd['sample_token']], [])
+        fl.append(sd['filename'])
+        if full:                                  # per-point LiDAR time next to the frame
+            fl += [t for t in apply_selection.point_time_file(sd['filename']) if os.path.isfile(os.path.join(root, t))]
         c = chans.setdefault(sd['filename'].split('/')[1], [0, sd['width'], sd['height'], 0])
         c[0] += 1
         c[3] += sd['is_key_frame']
+    if full:                                      # every other topic, per scene: ext/<scene name>/
+        for s in scenes:
+            d = os.path.join(root, 'ext', s['name'])
+            if os.path.isdir(d):
+                files.setdefault(s['token'], []).extend(f'ext/{s["name"]}/{n}' for n in sorted(os.listdir(d)))
     by_log = {}
     for s in sorted(scenes, key=lambda s: s['name']):
         by_log.setdefault(logfile[s['log_token']], []).append(s)
     hz = {ch: round(c[0] / seconds, 1) for ch, c in chans.items()}
-    return {'scenes': scenes, 'by_log': by_log, 'files': files, 'samples': len(samples), 'seconds': seconds,
+    return {'profile': 'full' if full else 'standard',
+            'scenes': scenes, 'by_log': by_log, 'files': files, 'samples': len(samples), 'seconds': seconds,
             'sample_data': sum(len(v) for v in files.values()),
             'channels': {ch: {'frames': c[0], 'hz': hz[ch], 'width': c[1], 'height': c[2], 'key_frames': c[3]}
                          for ch, c in sorted(chans.items())},
@@ -225,12 +235,14 @@ def write_tar(root, members, dest, workers=16, window=96):
 
 
 def meta_members(root):
-    """(arcname, path): the tables, CAN bus, maps, import records, and selection/'s curation lists as curation/."""
+    """(arcname, path): the tables, CAN bus, maps, calibration, import records, and selection/'s curation lists as
+    curation/."""
     out = []
-    for d in (VERSION, 'can_bus', 'maps'):
+    for d in (VERSION, 'can_bus', 'maps', 'calibration'):
         base = os.path.join(root, d)
-        if os.path.isdir(base):
-            out += [(f'{d}/{n}', os.path.join(base, n)) for n in sorted(os.listdir(base)) if os.path.isfile(os.path.join(base, n))]
+        for dirpath, dirs, names in sorted(os.walk(base)):
+            rel = os.path.relpath(dirpath, root)
+            out += [(f'{rel}/{n}', os.path.join(dirpath, n)) for n in sorted(names)]
     out += [(n, os.path.join(root, n)) for n in sorted(os.listdir(root)) if n.endswith('.import.json')]
     for n in CURATION_FILES:
         p = os.path.join(root, 'selection', n)
@@ -374,6 +386,65 @@ the NovAtel INSPVA solution (100 Hz, RTK), placed at the receiver's GPS measurem
 """
 
 
+STANDARD_NOTES = """Key frames (`samples/`) are 2 Hz, synchronised across the seven sensors as in nuScenes; every other frame
+is a sweep (`sweeps/`). LiDAR files hold five float32 per point (x, y, z, intensity, ring), as in nuScenes.
+`calibrated_sensor` holds the intrinsics and extrinsics, one set per recording.
+"""
+
+FULL_NOTES = """Key frames (`samples/`) are 2 Hz, chosen where `LIDAR_TOP` and the six standard cameras are synchronised
+(the same frames as the standard set). `CAM_TRAFFIC`, the bottom LiDARs and the radar join a key frame when
+their nearest frame is close enough (25 ms for the camera, half a frame period otherwise); every other frame is
+a sweep (`sweeps/`). The images are the JPEGs as recorded: not rectified.
+
+- **LiDAR** — `.pcd.bin`: five float32 per point (x, y, z, intensity, ring) in the sensor frame, as in nuScenes.
+  Next to each one, `<same name>.time.bin` holds each point's time: float32 seconds relative to the frame's
+  `sample_data` timestamp, one per point in the same order. `LIDAR_TOP` is the roof RoboSense Ruby 128; `LIDAR_BOTTOM_FRONT` /
+  `_REAR` are the M1s, `LIDAR_BOTTOM_LEFT` / `_RIGHT` the Bpearls.
+- **Radar** — `RADAR_FRONT` is the Continental ARS548's detection point cloud (`/radar/PointCloudDetection`)
+  as nuScenes radar `.pcd`, in the sensor frame. The full detection list, object list and status are in
+  `ext/`.
+- **`ext/<scene>/<topic>.json`** (topic `/` → `__`) — every other topic of the recording, for the scene ± 0.5 s,
+  as a JSON array of `{"utime", "bag_utime", "msg"}`: `utime` is the message header stamp (the bag time when
+  there is none) in the same microseconds as `sample_data`, `msg` the message fields as recorded (their own
+  units; constants omitted). `_index.json` lists each file's topic and ROS message type. About 240 MB per
+  scene, 51 topics:
+  - INS / GNSS (`/novatel/oem7/*`): `inspva`, `inspvax`, `corrimu`, `insstdev`, `bestpos`, `bestgnsspos`,
+    `bestutm`, `bestvel`, `ppppos`, `heading2`, `rxstatus`, `time`, `odom`, and `oem7raw` (`message_data` is
+    the receiver's binary log; concatenated in order it is a file NovAtel tools read, with logs the decoded
+    topics lack, e.g. RAWIMUSX);
+  - vehicle: decoded CAN `/bsw/vehicle_can`, `/bsw/vehicle_can_extended`, raw CAN frames `/can_rx0`,
+    `/can_rx1` (CAN FD), `/can_tx0`, `/app/loc/vehicle_state`, `/bsw/ad_state`, the mode switches
+    (`/bsw/*_mode_sw`), `/hmi/logging_status`;
+  - radar: `/radar/DetectionList` (all 800 slots as sent; only the first `list_numofdetections` are this
+    cycle's detections), `/radar/ObjectList`, `/radar/PointCloudObject`, `/radar/DirectionVelocity`,
+    `/radar/Status`, and the corner / vehicle radar objects (`/bsw/corner_radar_objects*`,
+    `/bsw/vehicle_radar_objects`);
+  - the cameras' `camera_info` (the driver's placeholder, not the calibration), the LiDARs' `rslidar_status`,
+    and diagnostics `/diag/ptp`, `/diag/disk`.
+- **`can_bus/`** — the nuScenes CAN bus expansion (`pose`, `ms_imu`, `meta`) from the INS, as in the standard set.
+
+## Calibration
+
+`calibration/` is the calibration of 2026-09-23 (`tcar_calib_20260923`; its `README.md` documents the model
+and the accuracy): the seven cameras and `LIDAR_TOP`. Its values are also in `calibrated_sensor`, the same
+for every recording:
+
+- `translation`, `rotation` — sensor → ego (`T_ego_cam`, `T_ego_lidar`). The ego frame is the NovAtel output
+  point (x forward, y left, z up), the frame `ego_pose` places.
+- `camera_intrinsic` — fx, fy, cx, cy of the **Kannala-Brandt** (OpenCV `cv2.fisheye`) model of the raw image.
+  The distortion is in extra keys of the record: `camera_model` (`"kannala_brandt"`), `camera_distortion`
+  (k1…k4), `image_size`, `time_offset_s` and `rolling_shutter_readout_s` (exposure time of each image row), and
+  `windshield` — the file of the windshield refraction field, a smooth pixel offset added after the lens model
+  (up to 3.6 px at 10 m without it).
+- `calibration` — the calibration's name; `null` for the bottom LiDARs and the radar, which are not calibrated
+  (identity placeholder).
+
+The devkit's own projection (`view_points`) is a plain pinhole and ignores the distortion; to project LiDAR
+into the images use `calibration/project.py` (`load_camera`, `project_lidar`), which applies the lens model and
+the windshield field.
+"""
+
+
 def _course(log):
     return log.split('-', 1)[0] if '-' in log else log
 
@@ -405,10 +476,17 @@ def readme(man, repo):
         c['dates'].add((info.get(lg) or {}).get('date') or lg.split('_')[-1][:10])
     course_rows = '\n'.join(f"| {k} | {', '.join(sorted(v['dates']))} | {v['logs']} | {v['scenes']} | {v['scenes'] * 20 / 60:.0f} min | {v['gb']:.0f} |"
                             for k, v in sorted(courses.items()))
+    full = man.get('profile') == 'full'
     ch = man.get('channels', {})
-    ch_rows = '\n'.join(f"| `{k}` | {'camera' if k.startswith('CAM') else 'lidar'} | "
-                        f"{f'{v['width']}×{v['height']} JPEG' if v['width'] else 'point cloud (.pcd.bin)'} | "
-                        f"{v['hz']:.0f} Hz | {v['frames']:,} |" for k, v in ch.items())
+
+    def ch_data(k, v):
+        if k.startswith('CAM'):
+            return f"{v['width']}×{v['height']} JPEG" + (', as recorded' if full else '')
+        if k.startswith('RADAR'):
+            return 'detections (.pcd, nuScenes radar fields)'
+        return 'point cloud (.pcd.bin' + (' + .time.bin)' if full else ')')
+    kind = lambda k: 'camera' if k.startswith('CAM') else 'radar' if k.startswith('RADAR') else 'lidar'
+    ch_rows = '\n'.join(f"| `{k}` | {kind(k)} | {ch_data(k, v)} | {v['hz']:.0f} Hz | {v['frames']:,} |" for k, v in ch.items())
     rel_rows = '\n'.join(f"| `{r['name']}` | {r['created'][:10]} | {', '.join(_short(x) for x in sorted(r['new_logs'], key=_order)) or '—'} | {r['new_scenes']} | {r['scenes']} | "
                          f"`{r['parser_commit'][:7]}`{' (+local changes)' if r.get('parser_dirty') else ''} |" for r in man['releases'])
     log_rows = '\n'.join(f"| {lg} | {(info.get(lg) or {}).get('date', '')} | {sum(len(x['scene_tokens']) for x in ss)} | {len(ss)} | "
@@ -419,10 +497,30 @@ def readme(man, repo):
                    f"`{rel}` are downloaded and extracted." if prev else
                    "when a newer release is out, run the same two commands with its name as `--revision`, in the same "
                    "directories: only the new tars are downloaded and extracted.")
-    return f"""# T-Car nuScenes — release `{rel}`
+    if full:
+        title = f"# T-Car nuScenes, full sensor set — release `{rel}`"
+        intro = ("Driving data from the T-Car test vehicle with every sensor it records — seven cameras, five LiDARs, "
+                 "the front radar, RTK INS / GNSS, vehicle CAN — in the [nuScenes](https://www.nuscenes.org/) "
+                 "`v1.0-trainval` format, with the camera and roof-LiDAR calibration.")
+        sensors_note = FULL_NOTES
+        tar_note = ("the sensor files (`samples/`, `sweeps/` with the `.time.bin` next to each LiDAR frame, and "
+                    "`ext/<scene>/`) of a group of whole scenes of one recording")
+        meta_note = "the tables (`v1.0-trainval/`), `can_bus/`, `maps/`, `calibration/`, the per-recording `*.import.json`"
+        side_note = ''
+        maint = f" --repo {repo} --dataroot <full dataroot>"
+    else:
+        title = f"# T-Car nuScenes — release `{rel}`"
+        intro = ("Driving data from the T-Car test vehicle (six cameras, a roof LiDAR, RTK INS) in the\n"
+                 "[nuScenes](https://www.nuscenes.org/) `v1.0-trainval` format: load it with the `nuscenes-devkit` as is.")
+        sensors_note = STANDARD_NOTES
+        tar_note = "the sensor files (`samples/`, `sweeps/`) of a group of whole scenes of one recording"
+        meta_note = "the tables (`v1.0-trainval/`), `can_bus/`, `maps/`, the per-recording `*.import.json`"
+        side_note = ("\nThe `0923` branch holds the calibration sample recordings of 2026-09-23 (one tar per channel, its own\n"
+                     "scene numbering); they are not part of this series.\n")
+        maint = ''
+    return f"""{title}
 
-Driving data from the T-Car test vehicle (six cameras, a roof LiDAR, RTK INS) in the
-[nuScenes](https://www.nuscenes.org/) `v1.0-trainval` format: load it with the `nuscenes-devkit` as is.
+{intro}
 
 **{tot['scenes']} scenes** of 20 s ({hours:.2f} h) from **{tot['logs']} recordings** · {tot['samples']:,} key-frame samples ·
 {tot['sample_data']:,} sensor frames · {tot['bytes'] / 1e9:.0f} GB to download in {len(shards)} sensor tars + 1 table tar
@@ -468,10 +566,9 @@ is never changed after it is published. **`main` always holds the latest release
 `hf download` without `--revision` gets it; give `--revision` to stay on one release. Later releases only
 **add** data:
 
-- `sensors/<recording>/<recording>.partNN.tar.gz` — the sensor files (`samples/`, `sweeps/`) of a group of whole
-  scenes of one recording, at most 10 GB unpacked (gzip: the LiDAR files shrink by about a third, the JPEGs not). Once published, a tar never changes and is carried into every
+- `sensors/<recording>/<recording>.partNN.tar.gz` — {tar_note}, at most 10 GB unpacked (gzip: the LiDAR files shrink by about a third, the JPEGs not). Once published, a tar never changes and is carried into every
   later release (stored once).
-- `meta/TCar_meta.tar.gz` — the tables (`v1.0-trainval/`), `can_bus/`, `maps/`, the per-recording `*.import.json`
+- `meta/TCar_meta.tar.gz` — {meta_note}
   (how each recording was converted) and `curation/`. The only file that changes between releases.
 - `manifest.json` — every tar with its recording, scene tokens, files, bytes and sha256, and the release history.
 - Scene tokens never change. Scene names (`scene-0001`, …) are the nuScenes train split names in recording
@@ -480,10 +577,7 @@ is never changed after it is published. **`main` always holds the latest release
 | release | date | recordings added | scenes added | scenes in total | parser commit |
 |---|---|---|---|---|---|
 {rel_rows}
-
-The `0923` branch holds the calibration sample recordings of 2026-09-23 (one tar per channel, its own
-scene numbering); they are not part of this series.
-
+{side_note}
 ## Contents
 
 | course | dates | recordings | scenes | time | GB |
@@ -494,10 +588,7 @@ scene numbering); they are not part of this series.
 |---|---|---|---|---|
 {ch_rows}
 
-Key frames (`samples/`) are 2 Hz, synchronised across the seven sensors as in nuScenes; every other frame
-is a sweep (`sweeps/`). LiDAR files hold five float32 per point (x, y, z, intensity, ring), as in nuScenes.
-`calibrated_sensor` holds the intrinsics and extrinsics, one set per recording.
-
+{sensors_note}
 {FRAMES}
 ## Recordings
 
@@ -512,8 +603,8 @@ Releases are made with `scripts/hf_release.py` of the parser repository (`ROSbag
 
 ```bash
 # new recordings: parse them, curate them in the TCAR Parser app, press 최종 확정, then
-python scripts/hf_release.py --branch <new> --from {rel} --token-file <hf token file>            # plan
-python scripts/hf_release.py --branch <new> --from {rel} --token-file <hf token file> --upload   # build + upload
+python scripts/hf_release.py --branch <new> --from {rel}{maint} --token-file <hf token file>            # plan
+python scripts/hf_release.py --branch <new> --from {rel}{maint} --token-file <hf token file> --upload   # build + upload
 ```
 
 It refuses to publish unless every scene is locked and the dataset passes the checks (table references,
@@ -644,7 +735,8 @@ def main():
                 'name': args.branch, 'created': datetime.datetime.now().astimezone().isoformat(timespec='seconds'),
                 'new_logs': sorted({x['log'] for x in mine}), 'new_scenes': sum(len(x['scene_tokens']) for x in mine),
                 'scenes': len(ds['scenes']), 'parser_commit': commit, 'parser_dirty': dirty}]
-            man = {'release': args.branch, 'releases': rels, 'shards': shards, 'channels': ds['channels'], 'logs': ds['log_info'],
+            man = {'release': args.branch, 'profile': ds['profile'], 'releases': rels, 'shards': shards,
+                   'channels': ds['channels'], 'logs': ds['log_info'],
                    'totals': {'scenes': len(ds['scenes']), 'logs': len(ds['by_log']), 'samples': ds['samples'],
                               'sample_data': ds['sample_data'], 'bytes': round(sum(x['bytes'] for x in shards) * 0.86),
                               'raw_bytes': sum(x['bytes'] for x in shards),
@@ -712,7 +804,7 @@ def main():
         'new_logs': sorted({s_['log'] for s_ in mine}), 'new_scenes': sum(len(s_['scene_tokens']) for s_ in mine),
         'scenes': len(ds['scenes']), 'parser_commit': commit, 'parser_dirty': dirty,
         'lock_rounds': [r['stamp'] for r in apply_selection.lock_rounds(os.path.join(root, 'selection'))]}]
-    man = {'dataset': 'T-Car nuScenes', 'version': VERSION, 'layout': LAYOUT, 'release': args.branch,
+    man = {'dataset': 'T-Car nuScenes', 'profile': ds['profile'], 'version': VERSION, 'layout': LAYOUT, 'release': args.branch,
            'totals': {'scenes': len(ds['scenes']), 'logs': len(ds['by_log']), 'samples': ds['samples'],
                       'sample_data': ds['sample_data'], 'bytes': sum(s['bytes'] for s in shards),
                       'raw_bytes': sum(s.get('raw_bytes', s['bytes']) for s in shards), 'seconds': round(ds['seconds'], 1),

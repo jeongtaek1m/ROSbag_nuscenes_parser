@@ -157,9 +157,13 @@ Pose and IMU records are at the receiver's GPS measurement time (see
   diagnostics. `utime` is the header stamp (bag time when there is none), in
   the same microseconds as `sample_data`; each file covers the scene ± 0.5 s.
   `_index.json` lists topic and message type per file. Values are the message
-  fields as recorded (their own units); constants are omitted. Not exported: the
-  `camera_info` topics (placeholder values), `/novatel/oem7/oem7raw` and
-  `/radar/DetectionList` (its valid detections are `RADAR_FRONT`).
+  fields as recorded (their own units); constants are omitted. Also exported: the
+  `camera_info` topics (the driver's placeholder K/D, not a calibration),
+  `/novatel/oem7/oem7raw` (`message_data` is the NovAtel binary log as bytes —
+  concatenated in order it is a log file NovAtel tools read; it carries logs the
+  decoded topics do not, e.g. RAWIMUSX) and `/radar/DetectionList` (all 800 slots as
+  recorded; slots past `list_numofdetections` are not zeroed by the driver). Only the
+  RoboSense packets topic is left out (decoded into `LIDAR_TOP`).
 
 Useful flags (both tools): `--split`, `--sync-ms`, `--scene-dur`,
 `--keyframe-stride`, `--rectify-balance`, `--jpeg-quality`, `--workers`,

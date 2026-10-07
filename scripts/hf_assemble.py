@@ -20,7 +20,7 @@ import sys
 import tarfile
 
 STATE = '.tcar_assembled.json'
-META_DIRS = ('v1.0-trainval', 'can_bus', 'maps', 'curation')   # replaced as a whole by every release's meta
+META_DIRS = ('v1.0-trainval', 'can_bus', 'maps', 'calibration', 'curation')   # replaced as a whole by every release's meta
 
 
 def sha256(path, bufsize=8 << 20):

@@ -100,15 +100,9 @@ LOCK_NAME = ".convert.lock"
 STAGE_EXT = {"camera": ".jpg", "lidar": ".pcd.bin", "radar": ".radar.bin"}
 POINT_TIME_EXT = ".time.bin"
 
-# Not exported as sidecars: payloads that already are sample_data, the
-# camera_info topics (a placeholder K/D, not a calibration), the NovAtel raw
-# binary log, and the ARS548 DetectionList (every detection slot as a nested
-# message: prohibitively slow to deserialize, and /radar/PointCloudDetection
-# already carries its valid detections as RADAR_FRONT).
-SIDECAR_SKIP_TOPICS = (
-    {f"/camera_{i}/camera_info" for i in range(7)}
-    | {"/novatel/oem7/oem7raw", "/radar/DetectionList", LIDAR_PACKETS_TOPIC}
-)
+# Not exported as sidecars: payloads that already are sample_data, and the
+# RoboSense packets (decoded into LIDAR_TOP when a bag has no point cloud).
+SIDECAR_SKIP_TOPICS = {LIDAR_PACKETS_TOPIC}
 
 
 @dataclass(frozen=True)

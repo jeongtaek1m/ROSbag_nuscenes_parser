@@ -103,7 +103,8 @@ def scene_bytes(root, ds):
     out = {}
     for s in ds['scenes']:
         b = (sizes.get(s['token']) or {}).get('bytes')
-        out[s['token']] = b if b else sum(os.path.getsize(os.path.join(root, f)) for f in ds['files'].get(s['token'], []))
+        out[s['token']] = b if b else sum(os.path.getsize(p) for p in (os.path.join(root, f) for f in ds['files'].get(s['token'], []))
+                                          if os.path.exists(p))       # a published scene's files may be dropped
     return out
 
 

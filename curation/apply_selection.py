@@ -375,11 +375,21 @@ def simulate(dataroot, log=print):
     return problems
 
 
+def files_dropped(dataroot):
+    """Scene tokens whose sensor files were deleted after their release (scripts/drop_published_files.py)."""
+    rec = _read(os.path.join(dataroot, 'selection', 'files_dropped.json'), {}) or {}
+    return {t for r in rec.get('rounds') or [] for t in r.get('scenes') or []}
+
+
 def check(dataroot, log=print):
-    """The dataset as it is: every table reference, key-frame files on disk, the devkit and the CAN bus API."""
+    """The dataset as it is: every table reference, key-frame files on disk (not those of scenes whose files were
+    dropped after their release), the devkit and the CAN bus API."""
     T = load_tables(os.path.join(dataroot, VERSION))
     problems = integrity(T)
-    miss = [x['filename'] for x in T['sample_data'] if x['is_key_frame'] and not os.path.isfile(os.path.join(dataroot, x['filename']))]
+    dropped = files_dropped(dataroot)
+    gone = {s['token'] for s in T['sample'] if s['scene_token'] in dropped}
+    miss = [x['filename'] for x in T['sample_data'] if x['is_key_frame'] and x['sample_token'] not in gone
+            and not os.path.isfile(os.path.join(dataroot, x['filename']))]
     if miss:
         problems.append(f'key frame 파일 {len(miss)}개가 없음 (예: {miss[0]})')
     why = devkit_load(dataroot, log=log)

@@ -595,6 +595,8 @@ function banner(sc) {
   $('dLines').innerHTML = x.lines.map(l => `<div>${l}</div>`).join('');
   if (x.cmp) $('dCmp').onclick = () => { const gi = groupIndexOf(n); if (gi >= 0) openReview(gi); };
   if (lockedOf(n)) $('dTitle').innerHTML = '잠김 · 이전 라운드에서 최종 확정된 씬 (삭제·변경 안 됨)';
+  if (S(n).files_dropped) $('dLines').innerHTML += '<div class="muted">이 씬의 사진·LiDAR 파일은 디스크 공간을 위해 로컬 기본 세트에서 지웠습니다 — '
+    + 'Hugging Face 배포본(shchon11/TCar)과 full 세트(parsed/tcar_nuscenes_full)에 같은 프레임이 있습니다. 표·잠금·큐레이션 기록은 그대로입니다.</div>';
   for (const [id, v] of [['dKeep', 'keep'], ['dDrop', 'drop']]) {
     $(id).disabled = lockedOf(n);
     const on = fin === v;

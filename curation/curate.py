@@ -636,7 +636,8 @@ def scene_bytes(db, dataroot, out_dir):
     todo = [s for s in db['scenes'] if s['token'] not in cache]
     for s in todo:
         files = [fn for lst in db['frames'].get(s['name'], {}).values() for _, fn in lst]
-        cache[s['token']] = {'name': s['name'], 'bytes': sum(os.path.getsize(os.path.join(dataroot, fn)) for fn in files),
+        paths = [os.path.join(dataroot, fn) for fn in files]
+        cache[s['token']] = {'name': s['name'], 'bytes': sum(os.path.getsize(p) for p in paths if os.path.exists(p)),
                              'files': len(files)}
     if todo:
         _save_cache(path, 2, cache)
@@ -848,7 +849,8 @@ def main():
                   f"minimum-object rule) -> run {sv.TOOLS}/scene_detect.py")
         members = set()                          # a stop with no same-place partner needs no diff at all
         for log in {s['log'] for s in db['scenes']}:
-            st = [s['name'] for s in db['scenes'] if s['log'] == log and beh[s['name']]['cls'] == 'stopped']
+            st = [s['name'] for s in db['scenes'] if s['log'] == log and beh[s['name']]['cls'] == 'stopped'
+                  and s['token'] not in lock]           # locked scenes are settled: no diff (their files may be gone)
             members |= {m for g in same_place_groups(st, base, PLACE)[0] for m in g}
         act = lidar_diff(db, args.dataroot, [s for s in db['scenes'] if s['name'] in members], out_dir)
     else:
@@ -876,6 +878,8 @@ def main():
              tol_v=10.0, tol_stop=0.2, tol_turn=30.0, tol_acc=1.5, skip=skip, min_overlap=min_overlap,
              locked={s['name'] for s in db['scenes'] if s['token'] in lock})
 
+    dropped = apply_selection.files_dropped(args.dataroot)       # sensor files deleted after their release
+    tok_of = {s['name']: s['token'] for s in db['scenes']}
     res = run_stops(db, feat, P) if stops else run(db, feat, P, labels)
     decisions, corpus = res['decisions'], res['corpus']
     names = sorted(feat)
@@ -955,6 +959,7 @@ def main():
                              pos=[float(feat[n]['place'][0].mean()), float(feat[n]['place'][1].mean())],
                              objects_near=(feat[n]['objects'] or {}).get('near'),
                              step=d.get('step') if d else None, locked=n in P['locked'],
+                             files_dropped=tok_of[n] in dropped,
                              path_cover=round(feat[n]['path_cover'][0], 3) if feat[n].get('path_cover') else None,
                              path_cover_by=feat[n]['path_cover'][1] if feat[n].get('path_cover') else None)
         if d and d['evidence']:

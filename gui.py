@@ -3573,7 +3573,7 @@ class MainWindow(QtWidgets.QMainWindow):
                       key=lambda r: route_key(r["name"]))
         # One read of each bag writes both sets; a bag already in one of them goes into the other only.
         args = [r["path"] for r in todo] + ["--out", self.dataset, "--full-out", self.full_dataset,
-                                            "--split", "train", "--no-validate"]
+                                            "--standard-copies", "--split", "train", "--no-validate"]
         self.run(f"코스 {route} 파싱", [("proc", f"새 녹화 {len(todo)}개 파싱 · 한 번 읽어 기본·full 세트 함께",
                                          self._py("bag2nuscenes.py", *args))],
                  kind="parse", route=route)

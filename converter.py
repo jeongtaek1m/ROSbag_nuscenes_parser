@@ -721,13 +721,14 @@ def materialize(plan: list[tuple[int, str, str]], contents: BagContents,
 
 
 def link_frames(plan: list[tuple[int, str, str]], first: dict, first_name: str,
-                out_root: Path, point_time: bool) -> dict:
+                out_root: Path, point_time: bool, copy: bool = False) -> dict:
     """Give another output the frames the first one already holds.
 
     `first` maps (timestamp, channel) to the file materialize put in place. A
     hard link where the two roots share a filesystem (the same bytes, stored
-    once), else a copy. Images are the same in both, as recorded: --calib (which
-    would rectify them) cannot be combined with a second output.
+    once), else — or with `copy` (--standard-copies) — a copy. Images are the
+    same in both, as recorded: --calib (which would rectify them) cannot be
+    combined with a second output.
     """
     _ensure_placeholder_map(out_root)
     n_linked = n_copied = n_missing = n_time = 0
@@ -748,14 +749,17 @@ def link_frames(plan: list[tuple[int, str, str]], first: dict, first_name: str,
                     target.name.removesuffix(STAGE_EXT["lidar"]) + POINT_TIME_EXT)))
                 n_time += 1
         for a, b in pairs:
-            try:
-                os.link(a, b)
-                n_linked += 1
-            except OSError:
-                shutil.copyfile(a, b)
-                n_copied += 1
+            if not copy:
+                try:
+                    os.link(a, b)
+                    n_linked += 1
+                    continue
+                except OSError:
+                    pass
+            shutil.copyfile(a, b)
+            n_copied += 1
     print(f"  {n_linked} files hard-linked from the {first_name} set"
-          + (f", {n_copied} copied (other filesystem)" if n_copied else "")
+          + (f", {n_copied} copied" if n_copied else "")
           + (f"   [!] {n_missing} frames missing" if n_missing else ""))
     return {"n_files": len(plan) - n_missing, "n_point_time_files": n_time, "n_missing": n_missing,
             "hard_linked": n_linked, "copied": n_copied}
@@ -863,6 +867,10 @@ def _parser(profile: Profile, doc: str) -> argparse.ArgumentParser:
                             "the other only. Not with --calib: both keep the images as "
                             "recorded, and the full set takes its calibration from "
                             "<full-out>/calibration/ (scripts/apply_calibration.py).")
+        p.add_argument("--standard-copies", action="store_true",
+                       help="With --full-out: the standard set gets its own copies of the frames "
+                            "instead of hard links to the full set's (each set stands alone on disk; "
+                            "the shared frames take twice the space).")
     return p
 
 
@@ -1170,7 +1178,7 @@ def _convert(outputs: list[Output], args: argparse.Namespace, bag: Path) -> dict
                 first_files = {(ts, ch): o.root / rel for ts, ch, rel in file_plan}
             else:
                 mat_stats = link_frames(file_plan, first_files, first.profile.name, o.root,
-                                        o.profile.point_time)
+                                        o.profile.point_time, copy=args.standard_copies)
             spans = [(s["name"], s["keyframes"][0]["lidar_ts"], s["keyframes"][-1]["lidar_ts"])
                      for s in scenes]
             for name, a, b in spans:

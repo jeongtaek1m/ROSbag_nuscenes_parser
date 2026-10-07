@@ -57,7 +57,8 @@ timestamp) and turns the identical ones into hard links — about half of the tw
 
 The staged files move into the full set, and the standard set gets hard links to
 the ones it carries (`LIDAR_TOP`, the six cameras: stored once on disk); on
-another filesystem they are copied. Both sets get the same scenes and — while
+another filesystem they are copied. `--standard-copies` copies them anyway, so each set
+stands alone on disk (the app parses this way). Both sets get the same scenes and — while
 they are kept in step (`curation/mirror_full.py`) — the same scene names. A bag
 already in one of them is converted into the other only. Both keep the images as
 recorded, so `--calib` (which rectifies) cannot be combined with it; the full set
@@ -238,8 +239,9 @@ bag is parsed straight from the SSD it was recorded to; tick "데이터 폴더�
 for a copy instead. A linked bag whose SSD is unplugged is listed as "SSD 연결 안
 됨" and left out of a parse until the SSD is back.
 
-**One read, both sets.** "파싱하기" runs `bag2nuscenes.py --full-out`: every new
-bag goes into `parsed/tcar_nuscenes` and `parsed/tcar_nuscenes_full` from one read.
+**One read, both sets.** "파싱하기" runs `bag2nuscenes.py --full-out --standard-copies`: every
+new bag goes into `parsed/tcar_nuscenes` and `parsed/tcar_nuscenes_full` from one read, each set
+with its own files (no hard links between them).
 The sidebar's "full 세트" card shows how the full set stands against the standard
 one and its calibration ("캘리브레이션 넣기…" → `scripts/apply_calibration.py`).
 최종 확정 (and its undo) in the curation tab ends with `curation/mirror_full.py`,

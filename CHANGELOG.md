@@ -12,6 +12,7 @@
 | `curation/mirror_full.py` (신규) | 기본 세트의 큐레이션(삭제 · 잠금 라운드)을 full 세트에 똑같이. 같은 녹화 · 같은 샘플 시각으로 짝, 삭제는 apply_selection으로(미리 검사 · 백업 · 이름 당김), 기본에서 되돌린 라운드는 full도 되돌림, 끝에 이름 대조 + `--check` |
 | `apply_selection` | 지운 LiDAR 프레임의 `.time.bin`도 함께 옮김 |
 | `hf_release` | full 세트: 센서 tar에 `.time.bin`과 `ext/<scene>/`, 메타에 `calibration/`, manifest `profile`, full용 데이터셋 카드. `assemble.py`가 `calibration/`도 교체 |
+| `--standard-copies` | `--full-out`과 함께: 기본 세트가 full 파일의 하드 링크 대신 자기 사본을 가짐(세트마다 독립). 앱은 이렇게 파싱 |
 | 앱 | 가져오기 = SSD의 bag을 `raw/<코스>/`에 링크(복사는 선택). SSD가 빠진 녹화는 "SSD 연결 안 됨"으로 파싱에서 빠짐. 파싱 = `--full-out`으로 두 세트 동시. 사이드바 "full 세트" 카드(기본 세트와 비교, 캘리브레이션 넣기, 큐레이션 반영). 최종 확정 · 되돌리기 끝에 full 동기화 |
 
 ## 2026-09-30 — 데스크톱 GUI(TCAR Parser), 기본 출력 `/data/parsed`

@@ -51,6 +51,10 @@ python bag2nuscenes.py      /path/to/bags/ a.bag b.bag --split val              
 python bag2nuscenes.py /path/to/bags/ --full-out /data/parsed/tcar_nuscenes_full   # + /data/parsed/tcar_nuscenes
 ```
 
+Sets converted separately (before `--full-out`) can be joined the same way afterwards:
+`python scripts/link_twins.py` hashes each standard frame and its full twin (same channel and
+timestamp) and turns the identical ones into hard links — about half of the two sets' disk use.
+
 The staged files move into the full set, and the standard set gets hard links to
 the ones it carries (`LIDAR_TOP`, the six cameras: stored once on disk); on
 another filesystem they are copied. Both sets get the same scenes and — while

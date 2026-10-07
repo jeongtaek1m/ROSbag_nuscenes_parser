@@ -87,6 +87,7 @@ from nuscenes_writer import (
     write_tables,
 )
 from rectify import Rectifier
+import tcar_calib
 
 _HERE = Path(__file__).parent
 sys.path.insert(0, str(_HERE / "packet_decoder" / "scripts"))
@@ -133,6 +134,35 @@ FULL = Profile(
     description="standard + CAM_TRAFFIC, bottom LiDARs, front radar, per-point LiDAR "
                 "time and every other topic as per-scene JSON",
 )
+
+
+
+@dataclass(frozen=True)
+class Output:
+    """One dataset a conversion writes: what it carries, and where."""
+    profile: Profile
+    root: Path
+
+
+def _channels(profile: Profile) -> list[str]:
+    """LIDAR_TOP, the six gating cameras, then the profile's optional channels."""
+    gating = list(NUSCENES_CAMS)
+    return ["LIDAR_TOP", *gating, *[c for c in profile.cameras if c not in gating],
+            *profile.extra_lidars.values(), *profile.radars.values()]
+
+
+def _union(profiles: list[Profile]) -> Profile:
+    """The profile that reads what every one of them needs: one pass over a bag for all."""
+    if len(profiles) == 1:
+        return profiles[0]
+    return Profile(
+        name="+".join(p.name for p in profiles),
+        cameras=tuple(dict.fromkeys(c for p in profiles for c in p.cameras)),
+        extra_lidars={t: c for p in profiles for t, c in p.extra_lidars.items()},
+        radars={t: c for p in profiles for t, c in p.radars.items()},
+        point_time=any(p.point_time for p in profiles), sidecars=any(p.sidecars for p in profiles),
+        default_out=profiles[0].default_out, description=" and ".join(p.name for p in profiles) + " sets")
+
 
 # PointField.datatype -> numpy dtype
 _PF_DTYPE = {
@@ -673,6 +703,47 @@ def materialize(plan: list[tuple[int, str, str]], contents: BagContents,
     return {"n_files": n_moved, "n_point_time_files": n_time, "n_missing": n_missing}
 
 
+def link_frames(plan: list[tuple[int, str, str]], first: dict, first_name: str,
+                out_root: Path, point_time: bool) -> dict:
+    """Give another output the frames the first one already holds.
+
+    `first` maps (timestamp, channel) to the file materialize put in place. A
+    hard link where the two roots share a filesystem (the same bytes, stored
+    once), else a copy. Images are the same in both, as recorded: --calib (which
+    would rectify them) cannot be combined with a second output.
+    """
+    _ensure_placeholder_map(out_root)
+    n_linked = n_copied = n_missing = n_time = 0
+    for ts_ns, channel, rel_target in plan:
+        target = out_root / rel_target
+        if target.exists():
+            continue
+        src = first.get((ts_ns, channel))
+        if src is None or not src.exists():
+            n_missing += 1
+            continue
+        target.parent.mkdir(parents=True, exist_ok=True)
+        pairs = [(src, target)]
+        if point_time and src.name.endswith(STAGE_EXT["lidar"]):
+            t_src = src.with_name(src.name.removesuffix(STAGE_EXT["lidar"]) + POINT_TIME_EXT)
+            if t_src.exists():
+                pairs.append((t_src, target.with_name(
+                    target.name.removesuffix(STAGE_EXT["lidar"]) + POINT_TIME_EXT)))
+                n_time += 1
+        for a, b in pairs:
+            try:
+                os.link(a, b)
+                n_linked += 1
+            except OSError:
+                shutil.copyfile(a, b)
+                n_copied += 1
+    print(f"  {n_linked} files hard-linked from the {first_name} set"
+          + (f", {n_copied} copied (other filesystem)" if n_copied else "")
+          + (f"   [!] {n_missing} frames missing" if n_missing else ""))
+    return {"n_files": len(plan) - n_missing, "n_point_time_files": n_time, "n_missing": n_missing,
+            "hard_linked": n_linked, "copied": n_copied}
+
+
 def export_sidecars(staging: Path, out_root: Path, spans: list[tuple[str, int, int]],
                     topics: dict[str, dict]) -> int:
     """Split every staged sidecar topic into ext/<scene>/<topic>.json.
@@ -759,6 +830,15 @@ def _parser(profile: Profile, doc: str) -> argparse.ArgumentParser:
                    help="Skip the NuScenes(...) / NuScenesCanBus load check at the end.")
     p.add_argument("--keep-staging", action="store_true",
                    help="Leave the staging directory for debugging.")
+    if profile is STANDARD:
+        p.add_argument("--full-out", type=Path, default=None,
+                       help="Also write the full set into this dataroot (e.g. "
+                            f"{FULL.default_out}), from the same single read of each bag. "
+                            "Both sets get the same scenes; the frames both carry are hard "
+                            "links (stored once). A bag already in one set is converted into "
+                            "the other only. Not with --calib: both keep the images as "
+                            "recorded, and the full set takes its calibration from "
+                            "<full-out>/calibration/ (scripts/apply_calibration.py).")
     return p
 
 
@@ -782,12 +862,32 @@ def _imported_logs(json_dir: Path) -> set[str]:
     return logs | {p.name[:-len(".import.json")] for p in json_dir.parent.glob("*.import.json")}
 
 
+def _lock(root: Path, what: str) -> Path:
+    """Take the dataroot's conversion lock (one writer per dataroot)."""
+    root.mkdir(parents=True, exist_ok=True)
+    lock = root / LOCK_NAME
+    try:
+        fd = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+    except FileExistsError:
+        raise SystemExit(
+            f"{lock} exists: another conversion is writing to {root} "
+            f"({lock.read_text().strip() or 'unknown'}). Runs into one dataroot must "
+            "take turns. If none is running — a killed run leaves the file behind — "
+            "delete it.") from None
+    with os.fdopen(fd, "w") as f:
+        f.write(f"pid {os.getpid()} {what}\n")
+    return lock
+
+
 def run(profile: Profile, doc: str, argv: list[str] | None = None) -> None:
     """Parse the CLI and convert each bag into args.out, appending to what is there.
 
     Bags are converted one after another; one that is already in the dataset
     (same file name) is skipped, and one that fails is reported and the rest
     still run. The devkit check runs once, at the end.
+
+    With --full-out (standard tool) every bag is read once and written into both
+    sets; a bag already in one of them goes into the other only.
 
     Runs into one dataroot take turns: the tables are read at the start and
     rewritten at the end of every bag, and the staging directory is shared, so
@@ -798,34 +898,46 @@ def run(profile: Profile, doc: str, argv: list[str] | None = None) -> None:
     for path, label in [*((b, "bag") for b in args.bags), (args.calib, "calib")]:
         if path is not None and not path.exists():
             raise SystemExit(f"{label} not found: {path}")
+    outputs = [Output(profile, args.out)]
+    full_out = getattr(args, "full_out", None)
+    if full_out is not None:
+        if args.calib is not None:
+            raise SystemExit("--calib rectifies the cameras; with --full-out both sets keep the "
+                             "images as recorded (the full set's calibration is "
+                             "<full-out>/calibration/, see scripts/apply_calibration.py)")
+        if full_out.resolve() == args.out.resolve():
+            raise SystemExit("--full-out must be another dataroot than --out")
+        # The full set first: the staged files move into it, the standard set links to them.
+        outputs = [Output(FULL, full_out), *outputs]
     bags = _expand_bags(args.bags)
     if not bags:
         raise SystemExit("no .bag files to convert")
-    args.out.mkdir(parents=True, exist_ok=True)
-    lock = args.out / LOCK_NAME
+    what = f"converting {', '.join(map(str, args.bags))}"
+    locks: list[Path] = []
     try:
-        fd = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-    except FileExistsError:
-        raise SystemExit(
-            f"{lock} exists: another conversion is writing to {args.out} "
-            f"({lock.read_text().strip() or 'unknown'}). Runs into one dataroot must "
-            "take turns. If none is running — a killed run leaves the file behind — "
-            "delete it.") from None
-    with os.fdopen(fd, "w") as f:
-        f.write(f"pid {os.getpid()} converting {', '.join(map(str, args.bags))}\n")
+        for o in outputs:
+            locks.append(_lock(o.root, what))
+    except SystemExit:
+        for lock in locks:
+            lock.unlink(missing_ok=True)
+        raise
 
     results: list[tuple[Path, str, str]] = []    # (bag, status, detail)
-    first_scene = None
+    first_scene: dict[Path, str] = {}            # root -> a scene for the CAN bus check
     try:
         for i, bag in enumerate(bags, 1):
             if len(bags) > 1:
                 print(f"\n{'=' * 78}\n[{i}/{len(bags)}] {bag}")
-            if bag.stem in _imported_logs(args.out / args.version):
+            todo = [o for o in outputs if bag.stem not in _imported_logs(o.root / args.version)]
+            if not todo:
                 print(f"  already imported (log '{bag.stem}') — skipped")
                 results.append((bag, "skipped", "already imported"))
                 continue
+            if len(todo) < len(outputs):
+                print(f"  already in the {', '.join(o.profile.name for o in outputs if o not in todo)} "
+                      f"set — converting into the {', '.join(o.profile.name for o in todo)} set only")
             try:
-                names = _convert(profile, args, bag)
+                names = _convert(todo, args, bag)
             except (Exception, SystemExit) as exc:
                 if len(bags) == 1:
                     raise
@@ -833,22 +945,27 @@ def run(profile: Profile, doc: str, argv: list[str] | None = None) -> None:
                 print(f"  !! {bag.name} failed: {detail}")
                 results.append((bag, "failed", detail))
                 continue
-            first_scene = first_scene or names[0]
-            results.append((bag, "converted", f"{len(names)} scenes "
-                                               f"({names[0]} .. {names[-1]})"))
-        if args.no_validate or first_scene is None:
+            for o in todo:
+                first_scene.setdefault(o.root, names[o.root][0])
+            first = names[todo[0].root]
+            results.append((bag, "converted", f"{len(first)} scenes ({first[0]} .. {first[-1]})"
+                            + (f" into {' + '.join(o.profile.name for o in todo)}"
+                               if len(outputs) > 1 else "")))
+        if args.no_validate or not first_scene:
             print("\n(validation skipped)")
         else:
-            print("\nValidating with nuscenes-devkit...")
-            validate_with_devkit(args.out, args.version)
             from nuscenes.can_bus.can_bus_api import NuScenesCanBus
-            pose = NuScenesCanBus(dataroot=str(args.out)).get_messages(first_scene, "pose")
-            print(f"  ✓ NuScenesCanBus: {first_scene} pose has {len(pose)} messages")
+            for root, scene in first_scene.items():
+                print(f"\nValidating {root} with nuscenes-devkit...")
+                validate_with_devkit(root, args.version)
+                pose = NuScenesCanBus(dataroot=str(root)).get_messages(scene, "pose")
+                print(f"  ✓ NuScenesCanBus: {scene} pose has {len(pose)} messages")
     finally:
-        lock.unlink(missing_ok=True)
+        for lock in locks:
+            lock.unlink(missing_ok=True)
 
     if len(bags) > 1:
-        print(f"\n{'=' * 78}\nSUMMARY  -> {args.out}")
+        print(f"\n{'=' * 78}\nSUMMARY  -> {' + '.join(str(o.root) for o in outputs)}")
         for bag, status, detail in results:
             print(f"  {status:10} {bag.name}  {detail}")
     print("\nDone.")
@@ -856,44 +973,56 @@ def run(profile: Profile, doc: str, argv: list[str] | None = None) -> None:
         raise SystemExit(1)
 
 
-def _convert(profile: Profile, args: argparse.Namespace, bag: Path) -> list[str]:
-    """Convert one bag into args.out; returns the new scene names."""
+def _convert(outputs: list[Output], args: argparse.Namespace, bag: Path) -> dict[Path, list[str]]:
+    """Convert one bag into every output, reading it once; returns each root's new scene names.
+
+    The first output must carry every channel the others do: the staged files
+    are moved into it, and the others hard-link to its files.
+    """
     cv2.setNumThreads(1)   # parallelism comes from the staging pool
 
     log_name = bag.stem
-    json_dir = args.out / args.version
-    existing = load_existing_tables(json_dir)
-    if existing and any(r.get("logfile") == log_name
-                        for r in existing.get("log.json", [])):
-        raise SystemExit(
-            f"log '{log_name}' is already in {json_dir}/log.json — "
-            "remove that log entry first if you mean to re-import it."
-        )
     frame_id = global_frame_id(LOCATION)
-    if existing:
-        frames_in = {r.get("global_frame") or "odom/UTM (before 2026-09-24)"
-                     for r in existing.get("log.json", [])}
-        if frames_in != {frame_id}:
+    existing: dict[Path, dict | None] = {}
+    for o in outputs:
+        json_dir = o.root / args.version
+        ex = load_existing_tables(json_dir)
+        if ex and any(r.get("logfile") == log_name for r in ex.get("log.json", [])):
             raise SystemExit(
-                f"{json_dir} holds ego poses in {', '.join(sorted(frames_in))}; this converter "
-                f"writes {frame_id}. Poses from different frames cannot share a dataset — run "
-                "scripts/rebuild_ego_pose.py on it first, or convert into a new --out.")
+                f"log '{log_name}' is already in {json_dir}/log.json — "
+                "remove that log entry first if you mean to re-import it."
+            )
+        if ex:
+            frames_in = {r.get("global_frame") or "odom/UTM (before 2026-09-24)"
+                         for r in ex.get("log.json", [])}
+            if frames_in != {frame_id}:
+                raise SystemExit(
+                    f"{json_dir} holds ego poses in {', '.join(sorted(frames_in))}; this converter "
+                    f"writes {frame_id}. Poses from different frames cannot share a dataset — run "
+                    "scripts/rebuild_ego_pose.py on it first, or convert into a new --out.")
+        existing[o.root] = ex
 
     # ------------------------------------------------ channels and calibration
+    profile = _union([o.profile for o in outputs])
+    first = outputs[0]
+    for o in outputs[1:]:
+        if set(_channels(o.profile)) - set(_channels(first.profile)):
+            raise SystemExit(f"the {first.profile.name} set must carry every channel of the "
+                             f"{o.profile.name} set (it is written first and the others link to it)")
     gating = list(NUSCENES_CAMS)
-    optional = ([c for c in profile.cameras if c not in gating]
-                + list(profile.extra_lidars.values()) + list(profile.radars.values()))
-    channels = ["LIDAR_TOP", *gating, *optional]
+    channels = _channels(profile)
+    optional = channels[1 + len(gating):]
     calib, defaulted = resolve_calib(args.calib, channels)
     if defaulted:
         print(f"  [!] no calibration{'' if args.calib is None else f' in {args.calib}'} for "
               f"{', '.join(defaulted)} — using defaults: identity extrinsic, 90° pinhole K, "
               "no distortion (not for geometry; these cameras are not rectified)")
 
-    staging = args.out / STAGING_DIRNAME
+    staging = first.root / STAGING_DIRNAME
     if staging.exists():
         shutil.rmtree(staging)
 
+    new_names: dict[Path, list[str]] = {}
     try:
         print(f"[1/5] Reading {bag.name} ({profile.name}: {profile.description}) ...")
         contents = read_bag(bag, staging, profile, channels, calib,
@@ -945,83 +1074,115 @@ def _convert(profile: Profile, args: argparse.Namespace, bag: Path) -> list[str]
         cut, part_stats = partition_scenes(plan["segments"], frames_per_scene)
         if not cut:
             raise SystemExit(f"no unbroken run of {args.scene_dur:g} s — no scenes")
-        used = {s["name"] for s in (existing or {}).get("scene.json", [])}
-        names = official_scene_names(args.split, used, len(cut))
-        scenes = []
-        for name, (seg_k, idx) in zip(names, cut):
+        # Names continue each set's own list; sets kept in step (same scenes,
+        # same curation) give the same names.
+        for o in outputs:
+            used = {s["name"] for s in (existing[o.root] or {}).get("scene.json", [])}
+            new_names[o.root] = official_scene_names(args.split, used, len(cut))
+        base = []
+        for seg_k, idx in cut:
             kf_idx = idx[::args.keyframe_stride]
             t0 = (lidar_ts[idx[0]] - data.bag_start_ns) / 1e9
-            scenes.append({
-                "name": name,
+            base.append({
                 "description": f"{log_name} segment {seg_k}, {t0:.1f}-"
                                f"{t0 + args.scene_dur:.1f} s into the bag",
                 "keyframes": [{"lidar_ts": int(lidar_ts[i]),
                                "cam_ts": {ch: int(plan["cam"][ch][i]) for ch in gating}}
                               for i in kf_idx],
             })
-        print(f"  {len(scenes)} scenes, {len(scenes[0]['keyframes'])} samples each "
+        names = new_names[first.root]
+        print(f"  {len(base)} scenes, {len(base[0]['keyframes'])} samples each "
               f"({names[0]} .. {names[-1]}, official '{args.split}' list); "
               f"{part_stats['frames_unused'] * lidar_period / 1e9:.1f} s of usable "
               f"frames left over in segment remainders")
+        for o in outputs[1:]:
+            if new_names[o.root] != names:
+                print(f"  [!] the {o.profile.name} set names them {new_names[o.root][0]} .. "
+                      f"{new_names[o.root][-1]}: the sets are out of step (different scenes or "
+                      "curation); the same scene has a different name in each")
 
-        print("\n[4/5] Building tables ...")
-        if existing:
-            print(f"  append mode: {len(existing['scene.json'])} existing scenes")
-        kf_tol_ns = {}
-        for ch in optional:
-            if ch not in channels:
-                continue
-            if data.modality[ch] == "camera":
-                kf_tol_ns[ch] = sync_ns
+        first_files: dict[tuple[int, str], Path] = {}
+        for k, o in enumerate(outputs):
+            tag = f" — {o.profile.name} set" if len(outputs) > 1 else ""
+            out_set = set(_channels(o.profile))
+            out_channels = [c for c in channels if c in out_set]
+            ex = existing[o.root]
+            json_dir = o.root / args.version
+            scenes = [dict(b, name=n) for b, n in zip(base, new_names[o.root])]
+
+            print(f"\n[4/5] Building tables{tag} ...")
+            if ex:
+                print(f"  append mode: {len(ex['scene.json'])} existing scenes")
+            kf_tol_ns = {}
+            for ch in optional:
+                if ch not in out_channels:
+                    continue
+                if data.modality[ch] == "camera":
+                    kf_tol_ns[ch] = sync_ns
+                else:
+                    f_ts = data.frames[ch]
+                    kf_tol_ns[ch] = int(np.median(np.diff(f_ts)) / 2) if len(f_ts) > 1 else 0
+            tables, file_plan, attach = build_tables(
+                data, scenes, out_channels, gating, kf_tol_ns,
+                log_token=new_token(), log_name=log_name, existing=ex)
+            for name, v in tables.items():
+                print(f"  + {name:28} {len(v):>8}")
+            n_samples = sum(len(s["keyframes"]) for s in scenes)
+            for ch, n in attach.items():
+                print(f"  {ch}: in {n}/{n_samples} samples")
+            calibration = tcar_calib.dataset_calibration(o.root)
+            if calibration:          # the full set's calibration, on this recording too
+                cal_name, values = calibration
+                channel_of = {r["token"]: r["channel"]
+                              for r in (ex or {}).get("sensor.json", []) + tables["sensor.json"]}
+                n_cal = tcar_calib.apply_values(tables["calibrated_sensor.json"], channel_of,
+                                                values, cal_name)
+                print(f"  calibration: {cal_name} on {', '.join(sorted(n_cal))}")
+
+            print(f"\n[5/5] Writing under {o.root} ...")
+            if k == 0:
+                mat_stats = materialize(file_plan, contents, staging, o.root)
+                first_files = {(ts, ch): o.root / rel for ts, ch, rel in file_plan}
             else:
-                f_ts = data.frames[ch]
-                kf_tol_ns[ch] = int(np.median(np.diff(f_ts)) / 2) if len(f_ts) > 1 else 0
-        tables, file_plan, attach = build_tables(
-            data, scenes, channels, gating, kf_tol_ns,
-            log_token=new_token(), log_name=log_name, existing=existing)
-        for k, v in tables.items():
-            print(f"  + {k:28} {len(v):>8}")
-        n_samples = sum(len(s["keyframes"]) for s in scenes)
-        for ch, n in attach.items():
-            print(f"  {ch}: in {n}/{n_samples} samples")
-
-        print(f"\n[5/5] Writing under {args.out} ...")
-        mat_stats = materialize(file_plan, contents, staging, args.out)
-        spans = [(s["name"], s["keyframes"][0]["lidar_ts"], s["keyframes"][-1]["lidar_ts"])
-                 for s in scenes]
-        for name, a, b in spans:
-            write_scene(args.out / "can_bus", name, scene_messages(contents.ins, a, b))
-        print(f"  can_bus: pose, ms_imu, meta for {len(spans)} scenes")
-        n_sidecar = 0
-        if profile.sidecars:
-            n_sidecar = export_sidecars(staging, args.out, spans, contents.sidecar_topics)
-            print(f"  ext: {len(contents.sidecar_topics)} topics -> {n_sidecar} per-scene files")
-        if existing:
-            tables = merge_tables(existing, tables)
-        write_tables(tables, args.out, args.version)
-        import_record = {
-            "tool": profile.name,
-            "source_bag": str(bag.resolve()),
-            "calib_source": str(args.calib.resolve()) if args.calib else None,
-            "created_at": datetime.now(timezone.utc).isoformat(),
-            "split": args.split,
-            "scenes": [{"name": s["name"], "description": s["description"]} for s in scenes],
-            "channels": channels,
-            "calib_defaulted": defaulted,
-            "coverage_window": window,
-            "frame_plan": plan["stats"],
-            "scene_partition": part_stats,
-            "best_effort_attached": attach,
-            "rectification": {ch: r.describe() for ch, r in contents.rectifiers.items()},
-            "calib": calib,
-            "files": mat_stats,
-            "sidecar_topics": contents.sidecar_topics if profile.sidecars else {},
-            **stats,
-        }
-        (args.out / f"{log_name}.import.json").write_text(json.dumps(import_record, indent=2))
-        print(f"  tables -> {json_dir}")
+                mat_stats = link_frames(file_plan, first_files, first.profile.name, o.root,
+                                        o.profile.point_time)
+            spans = [(s["name"], s["keyframes"][0]["lidar_ts"], s["keyframes"][-1]["lidar_ts"])
+                     for s in scenes]
+            for name, a, b in spans:
+                write_scene(o.root / "can_bus", name, scene_messages(contents.ins, a, b))
+            print(f"  can_bus: pose, ms_imu, meta for {len(spans)} scenes")
+            if o.profile.sidecars:
+                n_sidecar = export_sidecars(staging, o.root, spans, contents.sidecar_topics)
+                print(f"  ext: {len(contents.sidecar_topics)} topics -> {n_sidecar} per-scene files")
+            if ex:
+                tables = merge_tables(ex, tables)
+            write_tables(tables, o.root, args.version)
+            import_record = {
+                "tool": o.profile.name,
+                "source_bag": str(bag.resolve()),
+                "read_once_for": [x.profile.name for x in outputs] if len(outputs) > 1 else None,
+                "calib_source": str(args.calib.resolve()) if args.calib else None,
+                "calibration": calibration[0] if calibration else None,
+                "created_at": datetime.now(timezone.utc).isoformat(),
+                "split": args.split,
+                "scenes": [{"name": s["name"], "description": s["description"]} for s in scenes],
+                "channels": out_channels,
+                "calib_defaulted": [c for c in defaulted if c in out_set],
+                "coverage_window": window,
+                "frame_plan": plan["stats"],
+                "scene_partition": part_stats,
+                "best_effort_attached": attach,
+                "rectification": {ch: r.describe() for ch, r in contents.rectifiers.items()
+                                  if ch in out_set},
+                "calib": {ch: c for ch, c in calib.items() if ch in out_set},
+                "files": mat_stats,
+                "sidecar_topics": contents.sidecar_topics if o.profile.sidecars else {},
+                **stats,
+            }
+            (o.root / f"{log_name}.import.json").write_text(json.dumps(import_record, indent=2))
+            print(f"  tables -> {json_dir}")
     finally:
         if staging.exists() and not args.keep_staging:
             shutil.rmtree(staging, ignore_errors=True)
 
-    return [sc["name"] for sc in scenes]
+    return new_names

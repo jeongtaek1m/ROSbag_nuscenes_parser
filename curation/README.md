@@ -53,6 +53,7 @@ nuScenes 형식으로 변환한 tcar 주행 데이터를 펼쳐 보고, 규칙�
 - **최종 확정**(앱의 큐레이션 탭, 또는 `python curation/apply_selection.py --finalize`)이 한 라운드를 끝냅니다: 버리기 확정 scene을 빼고, 남은 scene을 모두 `selection/locked.json`에 잠급니다(token 기준).
 - 잠긴 scene은 **절대 삭제되지 않고** 다시 후보가 되지 않습니다. 새 녹화를 파싱해 데이터셋에 이어 붙이면 새 scene만 필터·검토·삭제 대상입니다. ③ 경로 겹침에서는 잠긴 scene이 먼저 남긴 쪽이 되어, 새 scene이 기존 길과 겹치면 새 scene이 후보가 됩니다.
 - 확정하지 않은 후보가 남아 있으면 최종 확정할 수 없습니다. 되돌리기: 그 라운드의 백업으로 `--undo`(삭제가 없던 라운드는 `--unlock-last`), 앱에서는 "마지막 최종 확정 되돌리기".
+- **full 세트도 같이**: 큐레이션은 기본 세트(`parsed/tcar_nuscenes`)에서 하고, `python curation/mirror_full.py`가 그 결과를 full 세트(`parsed/tcar_nuscenes_full`)에 똑같이 옮깁니다. 두 세트의 씬은 같은 녹화 · 같은 샘플 시각으로 짝을 짓고(token은 다름), 기본 세트에서 빠진 씬은 full에서도 같은 삭제 도구로 빼며(미리 검사 → `_removed/` → 이름 당김), `locked.json`의 라운드를 full의 token으로 옮깁니다. 기본 세트에서 되돌린 라운드는 full에서도 되돌립니다. 끝나면 짝마다 이름이 같은지와 `--check`로 확인합니다. 앱의 최종 확정 · 되돌리기는 마지막에 이것을 자동으로 실행합니다(사이드바 "기본 세트 큐레이션 반영"은 따로 실행).
 
 ## 데이터 위치
 

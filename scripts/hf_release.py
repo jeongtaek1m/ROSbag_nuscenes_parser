@@ -49,7 +49,7 @@ import apply_selection  # noqa: E402
 VERSION = 'v1.0-trainval'
 META_PATH = 'meta/TCar_meta.tar.gz'
 GZ_LEVEL = 3                                      # LiDAR shrinks ~37 %, JPEG not at all; pigz keeps up with the HDD
-CURATION_FILES = ('locked.json', 'keep.txt', 'drop.txt', 'deleted.txt', 'filters.json', 'result.json')
+CURATION_FILES = ('locked.json', 'keep.txt', 'drop.txt', 'deleted.txt', 'filters.json', 'result.json', 'mirror.json')
 LAYOUT = 1
 
 

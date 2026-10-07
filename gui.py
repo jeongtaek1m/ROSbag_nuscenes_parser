@@ -46,6 +46,7 @@ COURSE_RE = re.compile(r"[A-Z][A-Z0-9]*")
 BAG_RE = re.compile(r"(?P<course>[A-Z][A-Z0-9]*)-(?P<num>\d+)_(?P<ts>\d{4}(?:-\d\d){5})$")
 SIDECARS = ("_integrity.csv", "_recorder.log")      # written next to every bag by the recorder
 DATASET = "tcar_nuscenes"                           # parsed/<DATASET>: every course, one dataset
+FULL_DATASET = "tcar_nuscenes_full"                 # parsed/<FULL_DATASET>: the same scenes, every sensor and topic
 VERSION = "v1.0-trainval"
 DEFAULT_ROOT = Path("/data")
 ASSETS = HERE / "assets"
@@ -140,7 +141,8 @@ def human_size(n: float) -> str:
 
 
 def is_recording(p: Path) -> bool:
-    return p.is_file() and p.suffix == ".bag" and not p.name.startswith(".")
+    """A .bag under raw/: a copy, or a link to the bag on the SSD it was recorded to (maybe unplugged now)."""
+    return (p.is_file() or p.is_symlink()) and p.suffix == ".bag" and not p.name.startswith(".")
 
 
 def route_key(name: str) -> tuple:
@@ -238,7 +240,9 @@ def recording_info(p: Path) -> dict:
     return {"name": p.stem, "path": str(p), "files": [str(f) for f in files],
             "label": f"{m['course']}-{m['num']}" if m else "",
             "date": f"{when:%Y-%m-%d}" if when else "", "when": f"{when:%Y-%m-%d %H:%M}" if when else "",
-            "duration": bag_span(p), "size": size, "route": detect_route(p), "raw": True}
+            "duration": bag_span(p), "size": size, "route": detect_route(p), "raw": p.exists(),
+            "linked": p.is_symlink(), "offline": p.is_symlink() and not p.exists(),
+            "target": os.readlink(p) if p.is_symlink() else ""}
 
 
 def parsed_status(dataroot: Path) -> dict:
@@ -267,6 +271,14 @@ def parsed_status(dataroot: Path) -> dict:
                 "imported": imported, "error": ""}
     except (OSError, ValueError, KeyError, TypeError):
         return dict(empty, error="데이터셋 목록을 읽을 수 없습니다. 검증 로그를 확인하세요.")
+
+
+def full_calibration(dataroot: Path) -> str | None:
+    """The calibration the full set carries (<full>/calibration/applied.json, scripts/apply_calibration.py)."""
+    try:
+        return json.loads((dataroot / "calibration" / "applied.json").read_text())["calibration"]
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
 
 
 def course_status(status: dict, course: str) -> dict:
@@ -549,7 +561,7 @@ def save_validation(data_root: Path, stamp: tuple, log: Path | None) -> None:
 
 
 class Job(QtCore.QObject):
-    """One queue of subprocess, copy and move steps; no conversion code in the UI."""
+    """One queue of subprocess, copy, link and move steps; no conversion code in the UI."""
     progress = Signal(float, str)
     output = Signal(str)
     finished = Signal(bool, str)
@@ -672,11 +684,13 @@ class Job(QtCore.QObject):
         try:
             if self.cancelled:
                 raise InterruptedError
-            if dst.exists():
+            if dst.exists() or dst.is_symlink():
                 raise FileExistsError(f"대상에 같은 이름이 있습니다: {dst}")
             dst.parent.mkdir(parents=True, exist_ok=True)
             if kind == "move":
                 shutil.move(str(src), str(dst))
+            elif kind == "link":            # parse straight from the SSD: raw/ holds a link, not a copy
+                dst.symlink_to(src.resolve())
             else:
                 if src.resolve() == dst.resolve():
                     raise ValueError("원본 위치로 복사할 수 없습니다")
@@ -1291,7 +1305,7 @@ def setup_table(table, headers):
 
 
 class ImportDialog(QtWidgets.QDialog):
-    """Choose a source, review destinations, then copy; scanning never writes data."""
+    """Choose a source, review destinations, then link (or copy); scanning never writes data."""
     def __init__(self, parent, data_root: Path, routes: list[str], parsed_logs: set[str],
                  source: Path | None = None):
         super().__init__(parent)
@@ -1304,7 +1318,8 @@ class ImportDialog(QtWidgets.QDialog):
         layout.setContentsMargins(28, 26, 28, 24)
         layout.setSpacing(12)
         layout.addWidget(label("녹화 가져오기", "title"))
-        layout.addWidget(label("원본은 그대로 두고 데이터 폴더로 복사합니다. bag 옆의 integrity·recorder 기록도 함께 복사합니다.", "sub", True))
+        layout.addWidget(label("bag은 SSD에 그대로 두고 데이터 폴더(raw/)에 링크로 등록합니다. 파싱은 SSD에서 바로 읽으니 파싱할 때 SSD를 "
+                               "연결해 두세요. bag 옆의 integrity·recorder 기록도 함께 등록합니다.", "sub", True))
         layout.addSpacing(8)
         source_row = QtWidgets.QHBoxLayout()
         self.src = QtWidgets.QLineEdit(str(source) if source else str(SETTINGS.value("last_source", "")))
@@ -1347,7 +1362,11 @@ class ImportDialog(QtWidgets.QDialog):
         header.setSectionResizeMode(1, QtWidgets.QHeaderView.ResizeMode.Stretch)
         self.stack.addWidget(self.table)
         layout.addWidget(self.stack, 1)
-        self.destination = label(f"{data_root}/raw/<코스>/ 로 복사합니다. 코스는 bag 이름의 알파벳(A-1 → A)으로 채웁니다.", "faint", True)
+        self.copy_box = QtWidgets.QCheckBox("데이터 폴더로 복사 (SSD 없이도 파싱하려면)")
+        self.copy_box.setChecked(str(SETTINGS.value("import_copy", "false")).lower() == "true")
+        self.copy_box.toggled.connect(self._update)
+        layout.addWidget(self.copy_box)
+        self.destination = label("", "faint", True)
         layout.addWidget(self.destination)
         self.summary = label("폴더를 선택하고 가져올 녹화를 확인하세요.", "sub", True)
         layout.addWidget(self.summary)
@@ -1443,7 +1462,10 @@ class ImportDialog(QtWidgets.QDialog):
         self._update()
 
     def _exists(self, route, name):
-        return any((self.data_root / "raw" / prefix / route / f"{name}.bag").exists() for prefix in ("", "_excluded"))
+        return any(os.path.lexists(self.data_root / "raw" / prefix / route / f"{name}.bag") for prefix in ("", "_excluded"))
+
+    def copying(self) -> bool:
+        return self.copy_box.isChecked()
 
     def _select_all(self, checked):
         for check, *_ in self.rows:
@@ -1485,13 +1507,20 @@ class ImportDialog(QtWidgets.QDialog):
         self.select_all.blockSignals(True)
         self.select_all.setChecked(bool(self.rows) and selected == len(self.rows))
         self.select_all.blockSignals(False)
+        SETTINGS.setValue("import_copy", "true" if self.copying() else "false")
+        self.destination.setText(
+            f"{self.data_root}/raw/<코스>/ 로 " + ("복사합니다. " if self.copying() else "링크를 만듭니다 (복사 없음, 원본은 SSD). ")
+            + "코스는 bag 이름의 알파벳(A-1 → A)으로 채웁니다.")
+        space = ""
         try:
-            free = shutil.disk_usage(self.data_root).free
-            space = f" · 여유 {human_size(free)}"
-            if total >= free:
-                errors.append("저장 공간이 부족합니다")
+            if self.copying():
+                free = shutil.disk_usage(self.data_root).free
+                space = f" · 여유 {human_size(free)}"
+                if total >= free:
+                    errors.append("저장 공간이 부족합니다")
+            elif not os.access(self.data_root, os.W_OK):
+                errors.append("데이터 폴더에 쓸 수 없습니다")
         except OSError:
-            space = ""
             errors.append("데이터 폴더에 접근할 수 없습니다")
         summary = f"{len(self.rows)}개 발견 · {selected}개 선택 ({human_size(total)}){space}"
         if errors:
@@ -1687,6 +1716,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.recs, self.active_recs = [], []
         self.status = {"logs": {}, "scenes": 0, "samples": 0, "error": ""}
         self.status_all = parsed_status(Path("/nonexistent"))
+        self.full_status = parsed_status(Path("/nonexistent"))
         self.validated = {}
         self.next_action = "root"
         self._job_kind, self._job_route = "", None
@@ -1738,6 +1768,10 @@ class MainWindow(QtWidgets.QMainWindow):
     @property
     def dataset(self) -> Path:
         return self.data_root / "parsed" / DATASET
+
+    @property
+    def full_dataset(self) -> Path:
+        return self.data_root / "parsed" / FULL_DATASET
 
     def _sidebar(self):
         widget = self.sidebar = QtWidgets.QWidget()
@@ -1813,6 +1847,20 @@ class MainWindow(QtWidgets.QMainWindow):
         self.ov_rows.setColumnStretch(1, 1)
         ov.addLayout(self.ov_rows)
         layout.addWidget(self.ov)
+        self.full_card = QtWidgets.QWidget()
+        fc = QtWidgets.QVBoxLayout(self.full_card)
+        fc.setContentsMargins(0, 12, 0, 0)
+        fc.setSpacing(6)
+        fc.addWidget(label("full 세트", "section"))
+        self.full_text = label("", "faint", True)
+        fc.addWidget(self.full_text)
+        self.sync_btn = button("기본 세트 큐레이션 반영", self._sync_full, "quiet")
+        self.sync_btn.setToolTip("기본 세트에서 최종 확정한 삭제 · 잠금을 full 세트에 똑같이 적용합니다")
+        fc.addWidget(self.sync_btn)
+        self.calib_btn = button("캘리브레이션 넣기…", self._add_calibration, "quiet")
+        self.calib_btn.setToolTip("tcar_calib_<날짜>.zip (또는 그 폴더)의 카메라 7대 · 상단 LiDAR 캘리브레이션을 full 세트에만 넣습니다")
+        fc.addWidget(self.calib_btn)
+        layout.addWidget(self.full_card)
         layout.addStretch(1)
         self.sidebar_hint = label("가져온 녹화가 코스별로 여기에 표시됩니다.", "faint", True)
         layout.addWidget(self.sidebar_hint)
@@ -2298,15 +2346,22 @@ class MainWindow(QtWidgets.QMainWindow):
         active = [r for r in recs if not r["excluded"] and r["raw"]]
         if status["error"]:
             return "validate", "데이터셋 확인 필요"
-        pending = sum(r["name"] not in status["imported"] for r in active)
+        pending = sum(self._needs_parse(r["name"], status) for r in active)
+        offline = sum(bool(r.get("offline")) and self._needs_parse(r["name"], status) for r in recs if not r["excluded"])
         if pending:
-            return "parse", f"{pending}개 파싱 대기"
+            return "parse", f"{pending}개 파싱 대기" + (f" · {offline}개 SSD 연결 필요" if offline else "")
+        if offline:
+            return "connect", f"SSD 연결 필요 · {offline}개"
         if status["logs"]:
             stamp = dataset_stamp(self.dataset)
             if stamp and self.validated.get(DATASET) == stamp:
                 return "done", "모두 완료"
             return "validate", "검증 대기"
         return "import", "녹화 가져오기"
+
+    def _needs_parse(self, name, status) -> bool:
+        """Not yet in the standard set, or not yet in the full set (one read fills both)."""
+        return name not in status.get("imported", ()) or name not in self.full_status["imported"]
 
     def refresh(self):
         if self.job:
@@ -2320,6 +2375,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._route_cache = {}
         try:
             self.status_all = parsed_status(self.dataset) if self.data_root else parsed_status(Path("/nonexistent"))
+            self.full_status = parsed_status(self.full_dataset) if self.data_root else parsed_status(Path("/nonexistent"))
             self.cdata = curation_data(self.dataset) if self.data_root else curation_data(Path("/nonexistent"))
             if self.data_root and DATASET not in self.validated:
                 saved = load_validation(self.data_root)     # a check from an earlier run
@@ -2356,6 +2412,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.sidebar_hint.setVisible(self.route_list.count() == 0)
         self.route_list.setFixedHeight(min(max(self.route_list.count(), 1), 7) * 54 + 6)
         self._show_overview()
+        self._show_full()
         saved = str(SETTINGS.value("detect_python", ""))
         self.cur_detector.setText(f"검출 환경: {Path(saved).parent.parent.name or saved}" if saved else
                                   "검출 환경: 처음 검출할 때 찾아 기억합니다")
@@ -2418,6 +2475,66 @@ class MainWindow(QtWidgets.QMainWindow):
             pct.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
             pct.setMinimumWidth(34)
             self.ov_rows.addWidget(pct, row, 2)
+
+    def _show_full(self):
+        """The sidebar's full-set card: what it holds against the standard set, and its calibration."""
+        show = self.mode == "parser" and bool(self.data_root)
+        self.full_card.setVisible(show)
+        if not show:
+            return
+        fs, ss = self.full_status, self.status_all
+        cal = full_calibration(self.full_dataset)
+        missing = sorted(ss["imported"] - fs["imported"])
+        if not fs["imported"]:
+            lines = ["아직 없습니다. 파싱하면 기본 세트와 함께 만들어집니다 (bag은 한 번만 읽음)."]
+        else:
+            lines = [f"parsed/{FULL_DATASET} · 씬 {fs['scenes']:,}개 · 녹화 {len(fs['logs'])}개"]
+            if missing:
+                lines.append(f"기본 세트에만 있는 녹화 {len(missing)}개")
+            elif fs["scenes"] != ss["scenes"]:
+                lines.append(f"기본 세트(씬 {ss['scenes']:,}개)와 큐레이션이 다릅니다")
+            else:
+                lines.append("기본 세트와 같은 씬")
+            lines.append(f"캘리브레이션: {cal}" if cal else "캘리브레이션: 없음")
+        self.full_text.setText("\n".join(lines))
+        self.sync_btn.setVisible(bool(fs["imported"]) and not missing and fs["scenes"] != ss["scenes"])
+        self.calib_btn.setVisible(bool(fs["imported"]))
+        self.calib_btn.setText("캘리브레이션 바꾸기…" if cal else "캘리브레이션 넣기…")
+
+    def _add_calibration(self):
+        """Put a calibration into the full set (never the standard set): tables and calibration/ only, images untouched."""
+        if self.job or not self.data_root:
+            return
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self, "캘리브레이션 선택 · tcar_calib_<날짜>.zip 또는 그 폴더의 README.md", str(Path.home() / "Downloads"),
+            "캘리브레이션 (*.zip README.md);;모든 파일 (*)")
+        if not path:
+            return
+        src = Path(path) if path.lower().endswith(".zip") else Path(path).parent
+        cal = full_calibration(self.full_dataset)
+        text = (f"{src.name}을 parsed/{FULL_DATASET}에 넣습니다.\n\n"
+                "· 카메라 7대(Kannala-Brandt 렌즈 계수, 윈드실드 굴절 필드, 노출 시간 모델)와 상단 LiDAR의 값을 모든 녹화의 "
+                "calibrated_sensor에 씁니다. 영상은 녹화 그대로 둡니다(보정 안 함).\n"
+                "· calibration/ 폴더(README, project.py 포함)를 데이터셋에 둡니다. 앞으로 파싱하는 녹화에도 같은 값이 들어갑니다.\n"
+                "· 하단 LiDAR와 레이더는 값이 없어 그대로(미보정) 둡니다. 기본 세트에는 넣지 않습니다."
+                + (f"\n\n지금 들어 있는 {cal}을 바꿉니다." if cal else ""))
+        if not self._confirm("full 세트에 캘리브레이션 넣기", text, "캘리브레이션 넣기"):
+            return
+        tool = lambda *a: self._py("scripts/apply_calibration.py", "--calib", src, "--dataroot", self.full_dataset, *a)
+        self.run("full 세트 캘리브레이션", [("proc", "캘리브레이션 파일 확인 (아직 바꾸지 않음)", tool("--dry-run")),
+                                          ("proc", "calibrated_sensor에 쓰고 calibration/ 복사", tool())], kind="calib")
+
+    def _mirror_step(self):
+        """The full set takes the standard set's curation (same scenes deleted and locked), when it exists."""
+        if not (self.full_dataset / VERSION).is_dir():
+            return []
+        return [("proc", f"full 세트에 같은 큐레이션 반영: 같은 씬 삭제 · 잠금, 점검 (parsed/{FULL_DATASET})",
+                 self._py("curation/mirror_full.py", "--standard", self.dataset, "--full", self.full_dataset))]
+
+    def _sync_full(self):
+        if self.job or not self.data_root:
+            return
+        self.run("full 세트에 큐레이션 반영", self._mirror_step(), kind="mirror")
 
     def _set_mode(self, mode):
         if self.job or mode == self.mode:
@@ -2748,7 +2865,9 @@ class MainWindow(QtWidgets.QMainWindow):
                   "새로 파싱한 녹화의 씬만 필터·검토·삭제 대상이 됩니다."
                 + ("\n\n지우기 전에 표에만 먼저 적용해 모든 참조(scene · sample · sample_data · ego_pose · prev/next · log/map)와 "
                    "devkit 불러오기를 확인하고, 문제가 있으면 아무것도 지우지 않습니다. 지운 뒤에도 devkit · CAN bus로 다시 확인합니다."
-                   if k else ""))
+                   if k else "")
+                + (f"\n\nfull 세트(parsed/{FULL_DATASET})에도 같은 씬을 빼고 같은 씬을 잠급니다."
+                   if (self.full_dataset / VERSION).is_dir() else ""))
         if not self._confirm("최종 확정할까요?", text, f"최종 확정 · {k}개 삭제" if k else "최종 확정", True):
             return
         tool = lambda *a: self._py("curation/apply_selection.py", "--dataroot", self.dataset, *a)
@@ -2756,6 +2875,7 @@ class MainWindow(QtWidgets.QMainWindow):
                    tool("--simulate"))] if k else [])
         steps += [("proc", "버리기 확정 씬 옮기고 남은 씬 잠그기", tool("--finalize", "--no-precheck"))]
         steps += ([("proc", "삭제 후 점검: 표 참조 · key frame 파일 · devkit · CAN bus", tool("--check"))] if k else [])
+        steps += self._mirror_step()
         steps += [("proc", "필터 다시 실행 (잠긴 씬 제외)", self._py("curation/curate.py", "--dataroot", self.dataset))]
         self.run(f"최종 확정 · 버리기 {k}개 삭제, 새 씬 {new}개 잠금", steps, kind="apply")
 
@@ -2778,6 +2898,7 @@ class MainWindow(QtWidgets.QMainWindow):
              self._py("curation/apply_selection.py", "--dataroot", self.dataset, *step))]
             + ([("proc", "되돌린 뒤 점검: 표 참조 · key frame 파일 · devkit · CAN bus",
                  self._py("curation/apply_selection.py", "--dataroot", self.dataset, "--check"))] if backup else [])
+            + self._mirror_step()
             + [("proc", "필터 다시 실행", self._py("curation/curate.py", "--dataroot", self.dataset))], kind="undo")
 
     # ---- the dataset map, and the curation state as it changes ----
@@ -3135,7 +3256,11 @@ class MainWindow(QtWidgets.QMainWindow):
                     state, color = "큐레이션으로 모두 제외", C["muted"]
                 else:
                     state, color = "파싱 대기", C["accent"]
-                if not rec["raw"]:
+                if rec.get("offline"):
+                    detail += f" · SSD 연결 안 됨 ({rec['target']})"
+                elif rec.get("linked"):
+                    detail += " · SSD에서 바로 읽음"
+                elif not rec["raw"]:
                     detail += " · 원본은 데이터 폴더에 없음"
                 orig = st["orig_s"] if st else rec["duration"]
                 rate = 100 * st["used_s"] / st["orig_s"] if st and st["orig_s"] else None
@@ -3212,20 +3337,20 @@ class MainWindow(QtWidgets.QMainWindow):
                          f"({100 * u / o:.1f}%), 씬 {self.status_all['scenes']:,}개")
         self.stats_note.setText("\n".join(notes))
 
-    def _calib_dir(self) -> Path | None:
-        calib = self.data_root / "calib" if self.data_root else None
-        return calib if calib and calib.is_dir() else None
-
     def _show_next_action(self):
         action = self.next_action
-        pending = sum(r["name"] not in self.status["logs"] for r in self.active_recs)
-        calib = self._calib_dir()
-        calib_note = (f" 보정값은 {calib}을 씁니다." if calib else
-                      " 데이터 폴더에 calib/이 없어 기본 보정값(카메라 비보정)으로 변환합니다.")
+        pending = sum(self._needs_parse(r["name"], self.status) for r in self.active_recs)
+        offline = [r["label"] or r["name"] for r in self.recs if r.get("offline") and self._needs_parse(r["name"], self.status)]
+        cal = full_calibration(self.full_dataset) if self.data_root else None
+        calib_note = (" bag은 한 번만 읽어 기본 세트와 full 세트(모든 센서·토픽)를 함께 만듭니다. 영상은 녹화 그대로 두고, "
+                      + (f"full 세트에는 캘리브레이션 {cal}을 넣습니다." if cal else "full 세트의 캘리브레이션은 사이드바에서 넣을 수 있습니다."))
         copy = {
             "root": ("먼저 데이터 폴더를 선택하세요", "녹화 사본, 파싱 결과, 작업 로그를 함께 보관할 폴더입니다. 선택한 위치는 다음 실행에도 기억합니다.", "데이터 폴더 선택…"),
             "import": ("녹화를 가져오세요", "외장 SSD 같은 원본 폴더를 고르면 bag을 코스별로 데이터 폴더에 복사합니다.", "녹화 가져오기…"),
-            "parse": (f"녹화 {pending}개를 데이터셋에 추가하세요", f"새 녹화만 파싱해 통합 데이터셋 parsed/{DATASET}에 이어 붙입니다." + calib_note, f"{pending}개 파싱하기"),
+            "parse": (f"녹화 {pending}개를 데이터셋에 추가하세요", f"새 녹화만 파싱해 통합 데이터셋 parsed/{DATASET}과 parsed/{FULL_DATASET}에 이어 붙입니다." + calib_note
+                      + (f" SSD가 연결되지 않은 {len(offline)}개({', '.join(offline[:4])})는 빼고 합니다." if offline else ""), f"{pending}개 파싱하기"),
+            "connect": ("녹화가 있는 SSD를 연결하세요", f"링크로 등록한 녹화 {len(offline)}개({', '.join(offline[:4])})의 SSD가 연결되어 있지 않습니다. "
+                        "연결한 뒤 다시 확인하면 파싱할 수 있습니다.", "다시 확인"),
             "validate": ("데이터셋을 검증하세요", self.status["error"] or "nuScenes devkit으로 통합 데이터셋 전체를 열어 구조를 확인합니다. 통과하면 이 코스는 끝입니다.", "검증하기"),
             "done": ("데이터셋 준비가 끝났습니다", f"이 코스 씬 {self.status['scenes']:,}개 · 샘플 {self.status['samples']:,}개, 검증 통과. 새 녹화는 언제든 추가할 수 있습니다.", "모두 완료"),
         }
@@ -3235,7 +3360,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.action_title.setText(title)
         self.action_desc.setText(description)
         self.primary_btn.setText(primary)
-        active_step = {"root": 0, "import": 0, "parse": 1, "validate": 2, "done": -1}[action]
+        active_step = {"root": 0, "import": 0, "connect": 1, "parse": 1, "validate": 2, "done": -1}[action]
         self.stepper.set_state(active_step, len(Stepper.NAMES) if action == "done" else max(active_step, 0))
         self.primary_btn.setVisible(action != "done")
 
@@ -3251,6 +3376,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.refresh_btn.setEnabled(not busy and bool(self.data_root))
         self.route_list.setEnabled(not busy)
         self.import_btn.setEnabled(not busy and bool(self.data_root))
+        self.calib_btn.setEnabled(not busy)
+        self.sync_btn.setEnabled(not busy)
         self.primary_btn.setEnabled(not busy and self.next_action != "done")
         self.val_btn.setVisible(bool(self.status["logs"]) and self.next_action != "validate")
         self.val_btn.setEnabled(not busy)
@@ -3288,7 +3415,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.cur_detector_btn.setEnabled(not busy)
 
     def _primary(self):
-        actions = {"root": self._change_root, "import": self._import,
+        actions = {"root": self._change_root, "import": self._import, "connect": self.refresh,
                    "parse": self._parse, "validate": self._validate}
         if not self.job and self.next_action in actions:
             actions[self.next_action]()
@@ -3416,15 +3543,16 @@ class MainWindow(QtWidgets.QMainWindow):
         if (dialog.exec() if hasattr(dialog, "exec") else dialog.exec_()) != QtWidgets.QDialog.DialogCode.Accepted:
             return
         steps, copies = [], 0
+        kind, verb = ("copy", "복사") if dialog.copying() else ("link", "링크")
         for src, route in dialog.selection():
             if not COURSE_RE.fullmatch(route):
                 return self._message("코스를 확인하세요", "코스 이름은 A, B처럼 대문자로 시작해야 합니다.")
             for f in [src, *companions(src)]:
                 dst = self.data_root / "raw" / route / f.name
                 excluded = self.data_root / "raw" / "_excluded" / route / f.name
-                if dst.exists() or excluded.exists():
+                if os.path.lexists(dst) or os.path.lexists(excluded):
                     return self._message("이미 있는 녹화입니다", f"{f.name}\n목록을 새로 확인하세요. 제외된 녹화는 복원할 수 있습니다.")
-                steps.append(("copy", f"복사 · {f.name}", str(f), str(dst)))
+                steps.append((kind, f"{verb} · {f.name}", str(f), str(dst)))
             copies += 1
         self.run(f"녹화 {copies}개 가져오기", steps, kind="import")
 
@@ -3432,13 +3560,13 @@ class MainWindow(QtWidgets.QMainWindow):
         route = self.current_route()
         if self.job or not route or self.next_action != "parse":
             return
-        todo = sorted((r for r in self.active_recs if r["name"] not in self.status["logs"]),
+        todo = sorted((r for r in self.active_recs if self._needs_parse(r["name"], self.status)),
                       key=lambda r: route_key(r["name"]))
-        args = [r["path"] for r in todo] + ["--out", self.dataset, "--split", "train", "--no-validate"]
-        calib = self._calib_dir()
-        if calib:
-            args += ["--calib", calib]
-        self.run(f"코스 {route} 파싱", [("proc", f"새 녹화 {len(todo)}개 파싱", self._py("bag2nuscenes.py", *args))],
+        # One read of each bag writes both sets; a bag already in one of them goes into the other only.
+        args = [r["path"] for r in todo] + ["--out", self.dataset, "--full-out", self.full_dataset,
+                                            "--split", "train", "--no-validate"]
+        self.run(f"코스 {route} 파싱", [("proc", f"새 녹화 {len(todo)}개 파싱 · 한 번 읽어 기본·full 세트 함께",
+                                         self._py("bag2nuscenes.py", *args))],
                  kind="parse", route=route)
 
     def _yield_file(self, name: str) -> Path:

@@ -44,6 +44,22 @@ python bag2nuscenes.py      /path/to.bag --out /tmp/try                         
 python bag2nuscenes.py      /path/to/bags/ a.bag b.bag --split val              # several bags in one go
 ```
 
+**Both sets from one read** — the standard tool writes the full set too with
+`--full-out`, reading each bag once (about the time of the full conversion alone):
+
+```bash
+python bag2nuscenes.py /path/to/bags/ --full-out /data/parsed/tcar_nuscenes_full   # + /data/parsed/tcar_nuscenes
+```
+
+The staged files move into the full set, and the standard set gets hard links to
+the ones it carries (`LIDAR_TOP`, the six cameras: stored once on disk); on
+another filesystem they are copied. Both sets get the same scenes and — while
+they are kept in step (`curation/mirror_full.py`) — the same scene names. A bag
+already in one of them is converted into the other only. Both keep the images as
+recorded, so `--calib` (which rectifies) cannot be combined with it; the full set
+takes the T-Car calibration from its `calibration/` folder (see
+[Calibration](#calibration)). The app parses this way.
+
 Without `--out` a dataset goes to `<data root>/parsed/`, the layout the
 [desktop GUI](#desktop-gui) keeps; the data root is `/data` unless
 `$TCAR_DATA_ROOT` says otherwise.
@@ -207,14 +223,28 @@ converter. It uses the checkout's `.venv` versions when there is one, with
 `opencv-python-headless` in place of `opencv-python` (whose own Qt would sit next
 to PyQt5's).
 
+**Importing links, not copies.** "녹화 가져오기" registers each bag (and its
+`_integrity.csv`, `_recorder.log`) as a symbolic link in `raw/<course>/`, so the
+bag is parsed straight from the SSD it was recorded to; tick "데이터 폴더로 복사"
+for a copy instead. A linked bag whose SSD is unplugged is listed as "SSD 연결 안
+됨" and left out of a parse until the SSD is back.
+
+**One read, both sets.** "파싱하기" runs `bag2nuscenes.py --full-out`: every new
+bag goes into `parsed/tcar_nuscenes` and `parsed/tcar_nuscenes_full` from one read.
+The sidebar's "full 세트" card shows how the full set stands against the standard
+one and its calibration ("캘리브레이션 넣기…" → `scripts/apply_calibration.py`).
+최종 확정 (and its undo) in the curation tab ends with `curation/mirror_full.py`,
+so the full set loses and locks the same scenes ("기본 세트 큐레이션 반영" runs it
+alone).
+
 It keeps a data root laid out as
 
 ```
-<data root>/raw/<course>/<bag> (+ its _integrity.csv, _recorder.log)
+<data root>/raw/<course>/<bag> (+ its _integrity.csv, _recorder.log; links to the SSD, or copies)
 <data root>/raw/_excluded/<course>/<bag>
 <data root>/parsed/tcar_nuscenes/       # one dataset for every course
+<data root>/parsed/tcar_nuscenes_full/  # the same scenes, every sensor and topic (+ calibration/)
 <data root>/logs/                       # job logs, logs/yield/ results
-<data root>/calib/                      # optional: passed to the converter as --calib
 ```
 
 A course is the letter of the bag name (`A-1_2026-09-28-14-40-58.bag` → `A`).
@@ -452,7 +482,27 @@ recorded before then were not re-checked; run `extract_cam_viz.py` on one first.
 
 ## Calibration
 
-**Calibration is not shipped with this repository.** Intrinsics and extrinsics
+**The full set carries the T-Car calibration** (`tcar_calib_<date>/`: Kannala-Brandt
+intrinsics, windshield refraction fields, `T_ego_cam`, `T_ego_lidar`), the standard
+set none:
+
+```bash
+python scripts/apply_calibration.py --calib ~/Downloads/tcar_calib_20260923.zip \
+    --dataroot /data/parsed/tcar_nuscenes_full        # or the app: sidebar, "캘리브레이션 넣기…"
+```
+
+It copies the folder to `<full>/calibration/` and writes its values into every
+`calibrated_sensor` record of the seven cameras and `LIDAR_TOP` — sensor → ego
+`translation` / `rotation`, `camera_intrinsic` = fx, fy, cx, cy of the raw image,
+and extra keys `camera_model` (`kannala_brandt`), `camera_distortion` (k1…k4),
+`image_size`, `time_offset_s`, `rolling_shutter_readout_s`, `windshield` (file);
+`calibration` names it (`null` on the bottom LiDARs and the radar, which keep the
+identity placeholder). The images are not touched (not rectified). Recordings
+converted into the full set later get the same values from `calibration/`
+(`tcar_calib.py`). It refuses a dataset without `ext/` (the standard set).
+
+**The `--calib` snapshot below is the converter's older calibration input.**
+It is not shipped with this repository. Intrinsics and extrinsics
 are specific to one vehicle build; `--calib` points at a snapshot you supply.
 The `camera_info` topics in the bags carry a placeholder (`K` = 960/540, `D` = 0)
 and are not used.

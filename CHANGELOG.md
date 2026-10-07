@@ -1,5 +1,19 @@
 # Changelog
 
+## 2026-10-07 — full 세트: 한 번 읽어 기본·full 동시, 모든 토픽, 캘리브레이션, 큐레이션 동기화
+
+### 요약
+
+| 항목 | 내용 |
+|---|---|
+| `bag2nuscenes.py --full-out DIR` | bag을 한 번만 읽어 기본 세트와 full 세트를 함께 씀. 프레임 선택·씬 자르기는 한 번, 표는 세트마다. staging 파일은 full로 옮기고, 기본 세트는 그 파일에 하드 링크(같은 디스크면 저장 한 번, 아니면 복사). 한쪽에만 있는 bag은 다른 쪽에만 변환. `--calib`(영상 보정)과는 같이 못 씀 |
+| full 세트 토픽 | `camera_info` 7개, `/novatel/oem7/oem7raw`(NovAtel 바이너리 로그, RAWIMUSX 등), `/radar/DetectionList`(800칸 그대로)도 `ext/`에. 빠지는 건 RoboSense 패킷 토픽뿐(LIDAR_TOP으로 디코딩) |
+| `scripts/apply_calibration.py`, `tcar_calib.py` (신규) | `tcar_calib_<날짜>`(zip/폴더)를 full 세트의 `calibrated_sensor`(카메라 7대 KB 내부 · 왜곡 · 시간 모델 · 윈드실드 파일, 상단 LiDAR 외부)와 `calibration/`에. 영상은 그대로. 기본 세트(ext/ 없음)는 거부. 이후 full로 변환하는 녹화에는 변환기가 같은 값을 자동으로 넣음 |
+| `curation/mirror_full.py` (신규) | 기본 세트의 큐레이션(삭제 · 잠금 라운드)을 full 세트에 똑같이. 같은 녹화 · 같은 샘플 시각으로 짝, 삭제는 apply_selection으로(미리 검사 · 백업 · 이름 당김), 기본에서 되돌린 라운드는 full도 되돌림, 끝에 이름 대조 + `--check` |
+| `apply_selection` | 지운 LiDAR 프레임의 `.time.bin`도 함께 옮김 |
+| `hf_release` | full 세트: 센서 tar에 `.time.bin`과 `ext/<scene>/`, 메타에 `calibration/`, manifest `profile`, full용 데이터셋 카드. `assemble.py`가 `calibration/`도 교체 |
+| 앱 | 가져오기 = SSD의 bag을 `raw/<코스>/`에 링크(복사는 선택). SSD가 빠진 녹화는 "SSD 연결 안 됨"으로 파싱에서 빠짐. 파싱 = `--full-out`으로 두 세트 동시. 사이드바 "full 세트" 카드(기본 세트와 비교, 캘리브레이션 넣기, 큐레이션 반영). 최종 확정 · 되돌리기 끝에 full 동기화 |
+
 ## 2026-09-30 — 데스크톱 GUI(TCAR Parser), 기본 출력 `/data/parsed`
 
 IRCV-DM-Ops `parser` 브랜치의 DM Parser GUI를 같은 디자인·기능으로 티카(ROS 1 bag)에 옮겼다.

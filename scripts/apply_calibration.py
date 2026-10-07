@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Put a T-Car calibration (tcar_calib_<date>/) into a converted dataset, without touching an image.
+"""Put a T-Car calibration (tcar_calib_<date>/) into a full-set dataset, without touching an image.
 
     python scripts/apply_calibration.py --calib ~/Downloads/tcar_calib_20260923.zip \\
         --dataroot /data/parsed/tcar_nuscenes_full
@@ -18,78 +18,27 @@ LIDAR_TOP) takes its values, in every recording:
                           which keep the converter's identity placeholder
 
 Only the full-data converter's dataset (it has ext/) takes it; the standard set is published without
-calibration. The images stay as recorded (not rectified): K and the distortion describe the raw JPEGs. Running it again,
-e.g. after more recordings were appended, sets the same values on every record again.
+calibration. The images stay as recorded (not rectified): K and the distortion describe the raw JPEGs.
+Recordings the converter appends later get the same values from <dataroot>/calibration/ (tcar_calib.py);
+running this again with a newer calibration replaces it on every record.
 """
 import argparse
 import datetime
 import json
-import os
 import shutil
 import sys
 import tempfile
 import zipfile
 from pathlib import Path
 
-import numpy as np
-
 HERE = Path(__file__).resolve().parent
+sys.path.insert(0, str(HERE.parent))
 sys.path.insert(0, str(HERE.parent / 'curation'))
 import apply_selection  # noqa: E402  (the converter's dataset lock)
+import tcar_calib  # noqa: E402
 
 VERSION = 'v1.0-trainval'
 CALIB_DIRS = ('intrinsic', 'windshield', 'extrinsic')
-
-
-def quat_wxyz(R):
-    """Rotation matrix -> unit quaternion (w, x, y, z), w >= 0."""
-    R = np.asarray(R, dtype=np.float64)
-    t = np.trace(R)
-    if t > 0:
-        s = 2.0 * np.sqrt(1.0 + t)
-        q = [0.25 * s, (R[2, 1] - R[1, 2]) / s, (R[0, 2] - R[2, 0]) / s, (R[1, 0] - R[0, 1]) / s]
-    else:
-        i = int(np.argmax(np.diag(R)))
-        j, k = (i + 1) % 3, (i + 2) % 3
-        s = 2.0 * np.sqrt(1.0 + R[i, i] - R[j, j] - R[k, k])
-        q = [0.0] * 4
-        q[0] = (R[k, j] - R[j, k]) / s
-        q[1 + i] = 0.25 * s
-        q[1 + j] = (R[j, i] + R[i, j]) / s
-        q[1 + k] = (R[k, i] + R[i, k]) / s
-    q = np.array(q) / np.linalg.norm(q)
-    return (q if q[0] >= 0 else -q).tolist()
-
-
-def load(calib):
-    """{channel: record fields} from a calibration folder."""
-    out = {}
-    for p in sorted((calib / 'extrinsic').glob('*.json')):
-        ch = p.stem
-        e = json.loads(p.read_text())
-        T = np.asarray(e['T_ego_lidar' if ch.startswith('LIDAR') else 'T_ego_cam'], dtype=np.float64)
-        if T.shape != (4, 4) or abs(np.linalg.det(T[:3, :3]) - 1) > 1e-4:
-            sys.exit(f'{p}: not a rigid 4x4 transform')
-        rec = {'translation': T[:3, 3].tolist(), 'rotation': quat_wxyz(T[:3, :3]), 'camera_intrinsic': []}
-        if ch.startswith('CAM'):
-            i = json.loads((calib / 'intrinsic' / f'{ch}.json').read_text())
-            if i.get('model') != 'kannala_brandt':
-                sys.exit(f'{ch}: intrinsic model {i.get("model")!r}, expected kannala_brandt')
-            if not (calib / 'windshield' / f'{ch}.json').is_file():
-                sys.exit(f'{ch}: windshield/{ch}.json missing')
-            rec.update({
-                'camera_intrinsic': [[i['fx'], 0.0, i['cx']], [0.0, i['fy'], i['cy']], [0.0, 0.0, 1.0]],
-                'camera_model': 'kannala_brandt',
-                'camera_distortion': [i['k1'], i['k2'], i['k3'], i['k4']],
-                'image_size': [i['image_width'], i['image_height']],
-                'time_offset_s': i['time_offset_s'],
-                'rolling_shutter_readout_s': i['rolling_shutter_readout_s'],
-                'windshield': f'calibration/windshield/{ch}.json',
-            })
-        out[ch] = rec
-    if not out:
-        sys.exit(f'{calib}: no extrinsic/*.json')
-    return out
 
 
 def find_calib(path, tmp):
@@ -124,8 +73,11 @@ def main():
     with tempfile.TemporaryDirectory() as tmp:
         calib = find_calib(args.calib, tmp)
         name = args.name or calib.name
-        values = load(calib)
-        sensors = {s['token']: s for s in json.loads((tdir / 'sensor.json').read_text())}
+        try:
+            values = tcar_calib.load_values(calib)
+        except (ValueError, KeyError, OSError) as e:
+            sys.exit(f'{calib}: {e}')
+        channel_of = {s['token']: s['channel'] for s in json.loads((tdir / 'sensor.json').read_text())}
         cs = json.loads((tdir / 'calibrated_sensor.json').read_text())
         sizes = {}                                  # channel -> {(w, h)} of its sample_data
         for sd in json.loads((tdir / 'sample_data.json').read_text()):
@@ -134,28 +86,19 @@ def main():
         for ch, v in values.items():
             if 'image_size' in v and sizes.get(ch, {tuple(v['image_size'])}) != {tuple(v['image_size'])}:
                 sys.exit(f'{ch}: images are {sorted(sizes[ch])}, the calibration is for {v["image_size"]}')
-        n = {}
-        for r in cs:
-            ch = sensors[r['sensor_token']]['channel']
-            keep = {'token': r['token'], 'sensor_token': r['sensor_token']}
-            if ch in values:
-                r.clear()
-                r.update(keep, **values[ch], calibration=name)
-                n[ch] = n.get(ch, 0) + 1
-            else:
-                r['calibration'] = None
+        n = tcar_calib.apply_values(cs, channel_of, values, name)
         missing = sorted(set(values) - set(n))
         print(f'{name}: {sum(n.values())} calibrated_sensor records of {len(cs)} '
               f'({", ".join(f"{ch} {k}" for ch, k in sorted(n.items()))})'
               + (f'; not in the dataset: {", ".join(missing)}' if missing else ''))
-        uncal = sorted({sensors[r['sensor_token']]['channel'] for r in cs} - set(values))
+        uncal = sorted({channel_of[r['sensor_token']] for r in cs} - set(values))
         if uncal:
             print(f'  no calibration (identity kept): {", ".join(uncal)}')
         if args.dry_run:
             return
         with apply_selection._Locked(str(root), f'apply_calibration {name}'):
-            dst = root / 'calibration'
-            tmpdst = root / '.calibration.tmp'
+            dst = root / tcar_calib.DIRNAME
+            tmpdst = root / f'.{tcar_calib.DIRNAME}.tmp'
             shutil.rmtree(tmpdst, ignore_errors=True)
             tmpdst.mkdir()
             for f in ('README.md', 'project.py'):
@@ -163,7 +106,7 @@ def main():
                     shutil.copy2(calib / f, tmpdst / f)
             for d in CALIB_DIRS:
                 shutil.copytree(calib / d, tmpdst / d)
-            (tmpdst / 'applied.json').write_text(json.dumps({
+            (tmpdst / tcar_calib.APPLIED).write_text(json.dumps({
                 'calibration': name, 'applied': datetime.datetime.now().astimezone().isoformat(timespec='seconds'),
                 'channels': sorted(values), 'records': n, 'uncalibrated': uncal,
                 'images': 'as recorded (not rectified)'}, indent=1))

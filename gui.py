@@ -2888,6 +2888,8 @@ class MainWindow(QtWidgets.QMainWindow):
         backup = Path(last["backup"]) if last and last.get("backup") else (self.cdata["backups"][-1] if not last and self.cdata["backups"] else None)
         if last is None and backup is None:
             return
+        if backup and (backup / "FILES_DELETED").exists():
+            return self._message("되돌릴 수 없습니다", f"{backup.name}의 백업 파일은 정리(삭제)해서 이 최종 확정은 되돌릴 수 없습니다.")
         what = (f"{last['stamp']}의 최종 확정을 되돌립니다: " if last else f"{backup.name}의 삭제를 되돌립니다: ") + (
             "옮긴 파일, 표, 이름, 확정 기록이 그때로 돌아가고 " if backup else "") + ("그때 잠근 씬이 다시 풀립니다." if last else "")
         if not self._confirm("최종 확정 되돌리기", what, "되돌리기", True):

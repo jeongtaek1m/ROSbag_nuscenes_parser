@@ -585,6 +585,36 @@ def _apply(dataroot, log, logs=None):
     return dict(p, backup=B)
 
 
+FILES_GONE = 'FILES_DELETED'               # in a backup whose moved files were deleted for good (--prune-backup)
+
+
+def prune_backup(backup, dataroot, log=print):
+    """Free a finished round's backup: the sensor files, CAN bus and ext/ it moved out go for good. Its manifest,
+    tables, import records and selection/ copy stay, so deleted.txt and the app keep the history; it can no
+    longer be undone (_undo refuses it)."""
+    with _Locked(dataroot, 'apply_selection --prune-backup'):
+        man = _read(os.path.join(backup, 'manifest.json'))
+        if not man or not man.get('done'):
+            raise ValueError(f'{backup}: 끝난 최종 삭제의 백업이 아닙니다 (manifest.json)')
+        if os.path.exists(os.path.join(backup, 'UNDONE')):
+            raise ValueError(f'{backup}: 이미 되돌린 백업입니다')
+        if os.path.realpath(os.path.dirname(backup)) != os.path.realpath(os.path.join(dataroot, '_removed')):
+            raise ValueError(f'{backup}: {dataroot}/_removed/ 안의 백업이 아닙니다')
+        gone = 0
+        for sub in ('files', 'can_bus', 'ext'):
+            d = os.path.join(backup, sub)
+            if os.path.isdir(d):
+                for _, _, names in os.walk(d):
+                    gone += len(names)
+                shutil.rmtree(d)
+        with open(os.path.join(backup, FILES_GONE), 'w', encoding='utf-8') as f:
+            f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')}  파일 {gone}개 삭제 (--prune-backup): 이 백업으로는 되돌릴 수 없습니다\n")
+        with open(os.path.join(dataroot, 'selection', 'decisions_log.txt'), 'a', encoding='utf-8') as f:
+            f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')}  === 백업 파일 삭제: {backup} ({gone}개, 되돌리기 불가) ===\n")
+        log(f'[prune] {backup}: {gone} files deleted; manifest and tables kept')
+        return gone
+
+
 def undo(backup, dataroot, log=print):
     """Put the dataset back as it was before the --apply that wrote `backup`."""
     with _Locked(dataroot, 'apply_selection --undo'):
@@ -592,6 +622,8 @@ def undo(backup, dataroot, log=print):
 
 
 def _undo(backup, dataroot, log):
+    if os.path.exists(os.path.join(backup, FILES_GONE)):
+        raise ValueError(f'{backup}: 이 백업의 파일은 지웠습니다 (--prune-backup) — 되돌릴 수 없습니다')
     man = _read(os.path.join(backup, 'manifest.json'))
     if not man:
         raise ValueError(f'{backup}/manifest.json 없음')
@@ -628,6 +660,8 @@ def main():
     ap.add_argument('--dataroot', default=None, help='dataset folder (default: sample_viewer.default_dataroot())')
     ap.add_argument('--apply', action='store_true', help='move the confirmed 버리기 scenes out and renumber (default: plan only)')
     ap.add_argument('--undo', metavar='BACKUP_DIR', help='restore from a backup written by --apply')
+    ap.add_argument('--prune-backup', metavar='BACKUP_DIR',
+                    help="delete a finished round's moved files for good (keeps manifest/tables: history stays, no undo)")
     ap.add_argument('--finalize', action='store_true',
                     help='end the round: delete the confirmed 버리기 scenes, then lock every scene left (never deleted later)')
     ap.add_argument('--unlock-last', action='store_true', help="take back the last round's lock (a round that deleted nothing)")
@@ -648,6 +682,9 @@ def main():
         pass
     if args.undo:
         return undo(args.undo, args.dataroot)
+    if args.prune_backup:
+        prune_backup(args.prune_backup, args.dataroot)
+        return 0
     if args.unlock_last:
         return unlock_last(args.dataroot)
     if args.check:

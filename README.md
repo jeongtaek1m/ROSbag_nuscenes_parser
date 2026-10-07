@@ -185,6 +185,11 @@ Pose and IMU records are at the receiver's GPS measurement time (see
   recorded; slots past `list_numofdetections` are not zeroed by the driver). Only the
   RoboSense packets topic is left out (decoded into `LIDAR_TOP`).
 
+`--deskew` motion-compensates every LiDAR point to its sweep's timestamp with the ego
+motion (as nuScenes' clouds are). It is off by default: the datasets so far store sweeps as
+measured, and one dataset should not mix the two. `--max-seconds N` reads only the start of a
+bag, for tests.
+
 Useful flags (both tools): `--split`, `--sync-ms`, `--scene-dur`,
 `--keyframe-stride`, `--rectify-balance`, `--jpeg-quality`, `--workers`,
 `--no-validate`, `--keep-staging`.

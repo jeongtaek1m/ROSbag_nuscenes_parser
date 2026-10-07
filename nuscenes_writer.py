@@ -368,6 +368,37 @@ def interp_pose(query_ns: np.ndarray, data: SensorData) -> tuple[np.ndarray, np.
     return trans, quats_wxyz
 
 
+def deskew_points(pts: np.ndarray, rel_t_s: np.ndarray, frame_ns: int, data: SensorData,
+                  lidar_calib: dict) -> np.ndarray:
+    """Motion-compensate one LiDAR sweep to its frame time, as nuScenes' clouds are.
+
+    `pts` (N, >=3) are in the LiDAR frame, each measured at frame_ns + rel_t_s; they
+    are moved with the ego pose of their own time into the global frame and back into
+    the LiDAR frame at frame_ns:  x_ref = T_LE T_E(t_ref)^-1 T_E(t_i) T_EL x_i.
+    `lidar_calib` is the LIDAR_TOP calibration (OpenCV convention, P_lidar = R P_ego
+    + t; identity when uncalibrated). Poses are evaluated once per microsecond of
+    point time; times past the pose coverage are held at its ends. Only x, y, z change.
+    """
+    R_le = quat_wxyz_to_R(lidar_calib["rotation"])
+    t_le = np.asarray(lidar_calib["translation"], dtype=np.float64)
+    t_abs = frame_ns + np.round(rel_t_s.astype(np.float64) * 1e6).astype(np.int64) * 1000
+    t_abs = np.clip(t_abs, data.pose_ts[0], data.pose_ts[-1])
+    uniq, inv = np.unique(t_abs, return_inverse=True)
+    ref = np.clip(np.array([frame_ns], dtype=np.int64), data.pose_ts[0], data.pose_ts[-1])
+    tr_u, q_u = interp_pose(uniq, data)
+    tr_r, q_r = interp_pose(ref, data)
+    R_u = Rotation.from_quat(q_u[:, [1, 2, 3, 0]]).as_matrix()
+    R_r = quat_wxyz_to_R(q_r[0])
+    M = np.einsum("ji,njk->nik", R_r, R_u)                      # R_ref^T R_i
+    c = (tr_u - tr_r[0]) @ R_r                                  # R_ref^T (t_i - t_ref)
+    x = pts[:, :3].astype(np.float64)
+    p_ego = (x - t_le) @ R_le                                   # T_EL x  (R_le^T (x - t_le))
+    e_ref = np.einsum("nij,nj->ni", M[inv], p_ego) + c[inv]
+    out = pts.copy()
+    out[:, :3] = e_ref @ R_le.T + t_le                          # T_LE e_ref
+    return out
+
+
 def assign_to_following_sample(target_ts: np.ndarray, sample_ts: np.ndarray) -> np.ndarray:
     """For each target ts, the index of the first sample at or after it.
 

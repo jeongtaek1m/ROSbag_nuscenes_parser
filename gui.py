@@ -1927,6 +1927,9 @@ class MainWindow(QtWidgets.QMainWindow):
         heading.addWidget(self.yield_btn, alignment=Qt.AlignmentFlag.AlignTop)
         self.val_btn = button("다시 검증", self._validate, "quiet")
         heading.addWidget(self.val_btn, alignment=Qt.AlignmentFlag.AlignTop)
+        self.parse_all_btn = button("전체 파싱", self._parse_all, "quiet")
+        self.parse_all_btn.setToolTip("모든 코스의 파싱 대기 녹화를 한 작업으로 차례대로 파싱합니다 (코스 이름 · 번호 순)")
+        heading.addWidget(self.parse_all_btn, alignment=Qt.AlignmentFlag.AlignTop)
         layout.addLayout(heading)
         # original recording time vs what made it into the dataset, for the parsed bags
         self.stats = QtWidgets.QWidget()
@@ -3464,6 +3467,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self.val_btn.setEnabled(not busy)
         route = self.current_route()
         self.yield_btn.setVisible(bool(self.active_recs))
+        n_all = len(self._pending_all()) if self.data_root else 0
+        self.parse_all_btn.setVisible(n_all > 0)
+        self.parse_all_btn.setEnabled(not busy)
+        self.parse_all_btn.setText(f"전체 파싱 · {n_all}개")
         self.yield_btn.setEnabled(not busy)
         self.yield_last_btn.setVisible(bool(route and self._yield_file(route).exists()))
         self.yield_folder_btn.setEnabled(not busy and bool(self.data_root))
@@ -3643,6 +3650,30 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         todo = sorted((r for r in self.active_recs if self._needs_parse(r["name"], self.status)),
                       key=lambda r: route_key(r["name"]))
+        self._start_parse(todo, f"코스 {route} 파싱", route)
+
+    def _pending_all(self) -> list[dict]:
+        """Every course's recordings waiting for a parse (bag reachable, not excluded), in course · number order."""
+        out = []
+        for recs, status in self._route_cache.values():
+            out += [r for r in recs if not r["excluded"] and r["raw"] and self._needs_parse(r["name"], status)]
+        return sorted(out, key=lambda r: route_key(r["name"]))
+
+    def _parse_all(self):
+        if self.job or not self.data_root:
+            return
+        todo = self._pending_all()
+        if not todo:
+            return
+        courses = sorted({r["route"] for r in todo if r["route"]})
+        if not self._confirm("전체 파싱", f"코스 {', '.join(courses)}의 녹화 {len(todo)}개를 한 작업으로 차례대로 파싱합니다 "
+                             f"(원본 {human_size(sum(r['size'] or 0 for r in todo))}). 끝난 녹화는 그대로 남으니, 중간에 취소하고 "
+                             "다시 눌러도 남은 것부터 이어집니다.", f"{len(todo)}개 파싱"):
+            return
+        self._start_parse(todo, f"전체 파싱 · 코스 {', '.join(courses)}", None)
+
+    def _start_parse(self, todo: list[dict], title: str, route):
+        """Parse these recordings in one converter run (one read of each bag for both sets), after making room."""
         # One read of each bag writes both sets; a bag already in one of them goes into the other only.
         args = [r["path"] for r in todo] + ["--out", self.dataset, "--full-out", self.full_dataset,
                                             "--standard-copies", "--split", "train", "--no-validate"]
@@ -3666,7 +3697,7 @@ class MainWindow(QtWidgets.QMainWindow):
                                    + ". 그래도 파싱할까요? 공간이 다 차면 그 녹화에서 멈춥니다.", "그래도 파싱", True):
                 return
         steps.append(("proc", f"새 녹화 {len(todo)}개 파싱 · 한 번 읽어 기본·full 세트 함께", self._py("bag2nuscenes.py", *args)))
-        self.run(f"코스 {route} 파싱", steps, kind="parse", route=route)
+        self.run(title, steps, kind="parse", route=route)
 
     def _yield_file(self, name: str) -> Path:
         return self.data_root / "logs" / "yield" / f"{name}.json"

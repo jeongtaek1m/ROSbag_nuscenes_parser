@@ -239,6 +239,12 @@ bag is parsed straight from the SSD it was recorded to; tick "데이터 폴더�
 for a copy instead. A linked bag whose SSD is unplugged is listed as "SSD 연결 안
 됨" and left out of a parse until the SSD is back.
 
+**Every course at once.** "전체 파싱 · N개" (top right) parses every course's waiting recordings in one
+job, in course and number order. A cancelled job keeps the recordings it finished; pressing it again goes on
+with the rest (the lock a cancelled run leaves behind is cleared once its process is gone). Before a parse
+that would not fit, the app offers to drop the standard set's released files first ("배포된 파일 정리",
+`scripts/drop_published_files.py`; also a button by 라운드 · 배포 in the curation tab).
+
 **One read, both sets.** "파싱하기" runs `bag2nuscenes.py --full-out --standard-copies`: every
 new bag goes into `parsed/tcar_nuscenes` and `parsed/tcar_nuscenes_full` from one read, each set
 with its own files (no hard links between them).

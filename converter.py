@@ -894,10 +894,30 @@ def _imported_logs(json_dir: Path) -> set[str]:
     return logs | {p.name[:-len(".import.json")] for p in json_dir.parent.glob("*.import.json")}
 
 
+def _stale_lock(lock: Path) -> bool:
+    """A lock whose writer is gone (a cancelled or killed run): its "pid N" no longer runs."""
+    try:
+        words = lock.read_text().split()
+        pid = int(words[words.index("pid") + 1])
+    except (OSError, ValueError, IndexError):
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return True
+    except PermissionError:
+        return False
+    return False
+
+
 def _lock(root: Path, what: str) -> Path:
-    """Take the dataroot's conversion lock (one writer per dataroot)."""
+    """Take the dataroot's conversion lock (one writer per dataroot). A lock left by a run that is
+    gone (cancelled in the app, killed) is cleared."""
     root.mkdir(parents=True, exist_ok=True)
     lock = root / LOCK_NAME
+    if lock.exists() and _stale_lock(lock):
+        print(f"  [!] {lock} was left by a run that has ended ({lock.read_text().strip()}): cleared")
+        lock.unlink(missing_ok=True)
     try:
         fd = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
     except FileExistsError:

@@ -44,12 +44,27 @@ VERSION = 'v1.0-trainval'
 LOCK_NAME = '.convert.lock'          # converter.LOCK_NAME: one writer per dataroot (conversion, remove_log, this)
 
 
+def _stale(path):
+    """The lock's "pid N" no longer runs."""
+    try:
+        with open(path, encoding='utf-8', errors='replace') as f:
+            words = f.read().split()
+        os.kill(int(words[words.index('pid') + 1]), 0)
+    except ProcessLookupError:
+        return True
+    except (OSError, ValueError, IndexError):
+        return False
+    return False
+
+
 class _Locked:
     """Hold the converter's lock on dataroot, so a parse and an apply never write the tables at once."""
     def __init__(self, dataroot, what):
         self.path, self.what = os.path.join(dataroot, LOCK_NAME), what
 
     def __enter__(self):
+        if os.path.exists(self.path) and _stale(self.path):      # left by a run that has ended (cancelled, killed)
+            os.remove(self.path)
         try:
             fd = os.open(self.path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
         except FileExistsError:

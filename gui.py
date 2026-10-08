@@ -47,6 +47,7 @@ BAG_RE = re.compile(r"(?P<course>[A-Z][A-Z0-9]*)-(?P<num>\d+)_(?P<ts>\d{4}(?:-\d
 SIDECARS = ("_integrity.csv", "_recorder.log")      # written next to every bag by the recorder
 DATASET = "tcar_nuscenes"                           # parsed/<DATASET>: every course, one dataset
 FULL_DATASET = "tcar_nuscenes_full"                 # parsed/<FULL_DATASET>: the same scenes, every sensor and topic
+PARSE_SPACE_FACTOR = 1.25                           # both sets of a parsed bag, as a multiple of its size (with margin)
 VERSION = "v1.0-trainval"
 DEFAULT_ROOT = Path("/data")
 ASSETS = HERE / "assets"
@@ -754,7 +755,7 @@ def button(text, callback, name=""):
 
 ACTION_COLOR = {"done": C["ok"], "import": C["faint"]}
 # jobs that change the tables or selection/, after which the review viewer must reload
-DATASET_WRITERS = ("parse", "exclude", "restore", "detect", "curate", "apply", "undo")
+DATASET_WRITERS = ("parse", "exclude", "restore", "detect", "curate", "apply", "undo", "drop")
 SUB_ROLE = Qt.ItemDataRole.UserRole + 1         # second, dimmer line of a cell
 DOT_ROLE = Qt.ItemDataRole.UserRole + 2         # colour of a status dot before the text
 
@@ -2095,6 +2096,10 @@ class MainWindow(QtWidgets.QMainWindow):
         head.addSpacing(10)
         self.stage_note = label("", "faint", True)
         head.addWidget(self.stage_note, 1)
+        self.drop_btn = button("배포된 파일 정리…", self._drop_published, "quiet")
+        self.drop_btn.setToolTip("허깅페이스에 배포되고 잠긴 씬의 사진·LiDAR 파일을 기본 세트에서 지워 공간을 비웁니다 "
+                                 "(같은 프레임이 배포본과 full 세트에 있음; 표·잠금·큐레이션은 그대로)")
+        head.addWidget(self.drop_btn)
         stage_layout.addLayout(head)
         self.stage_table = QtWidgets.QTableWidget(0, 6)
         setup_table(self.stage_table, ["구분", "최종 확정", "녹화", "남긴 씬", "지운 씬", "허깅페이스 배포"])
@@ -2758,6 +2763,48 @@ class MainWindow(QtWidgets.QMainWindow):
         self._style_map()
         self._update_buttons()
 
+    def _droppable_count(self) -> int:
+        """Released scenes whose files have not been dropped yet (cheap; the full check runs on click)."""
+        released = set((self.cdata.get("release") or {}).get("scene_tokens") or [])
+        dropped = {t for r in self.cdata.get("dropped") or [] for t in r.get("scenes") or []}
+        return len(released - dropped)
+
+    def _drop_plan(self) -> dict | None:
+        """scripts/drop_published_files.plan for this data root (small tables only, a few seconds)."""
+        try:
+            import importlib.util
+            spec = importlib.util.spec_from_file_location("drop_published_files", HERE / "scripts" / "drop_published_files.py")
+            mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mod)
+            return mod.plan(str(self.dataset), str(self.full_dataset))
+        except Exception as error:                      # noqa: BLE001 - shown to the user
+            self._message("정리 계획을 만들 수 없습니다", str(error))
+            return None
+
+    def _drop_step(self, plan: dict):
+        return ("proc", f"배포된 기본 세트 씬 {len(plan['scenes'])}개의 사진·LiDAR 파일 정리 (최대 {plan['bytes'] / 1e9:.0f} GB · "
+                        f"배포본({plan['repo']} {plan['release']})과 full 세트에 같은 프레임)",
+                self._py("scripts/drop_published_files.py", "--dataroot", self.dataset, "--full", self.full_dataset))
+
+    def _drop_text(self, plan: dict) -> str:
+        return (f"허깅페이스 {plan['repo']} {plan['release']}에 배포되고 잠긴 씬 {len(plan['scenes'])}개의 사진·LiDAR 파일을 "
+                f"기본 세트(parsed/{DATASET})에서 지웁니다 (최대 {plan['bytes'] / 1e9:.0f} GB).\n\n"
+                "· 같은 프레임이 배포본과 full 세트(parsed/" + FULL_DATASET + ")에 있습니다.\n"
+                "· 표 · CAN bus · 잠금 · 큐레이션 기록은 그대로라, 씬 이름 · 다음 배포 · 새 데이터 큐레이션은 지금처럼 됩니다.\n"
+                "· 검토 화면에서 그 씬은 이미지 대신 안내가 보입니다. 되돌리려면 배포본을 다시 받아야 합니다.")
+
+    def _drop_published(self):
+        if self.job or not self.data_root:
+            return
+        plan = self._drop_plan()
+        if not plan:
+            return
+        if not plan["scenes"]:
+            return self._message("정리할 것이 없습니다", "배포되고 잠기고 full 세트에 짝이 있는 씬 중 파일이 남은 씬이 없습니다.")
+        if not self._confirm("배포된 파일 정리", self._drop_text(plan), f"정리 · 씬 {len(plan['scenes'])}개", True):
+            return
+        self.run("배포된 파일 정리", [self._drop_step(plan)], kind="drop")
+
     def _show_stages(self):
         """The 라운드 · 배포 table: each curation round (what its 최종 확정 locked and deleted, and the release it went
         out in), then the recordings not finalized yet."""
@@ -2795,6 +2842,9 @@ class MainWindow(QtWidgets.QMainWindow):
                 self.stage_table.setItem(i, j, item)
         self.stage_table.setFixedHeight(len(rows) * 52 + 40)
         latest = rel.get("latest")
+        n_drop = self._droppable_count()
+        self.drop_btn.setVisible(n_drop > 0)
+        self.drop_btn.setText(f"배포된 파일 정리… · 씬 {n_drop}개")
         self.stage_note.setText((f"허깅페이스 {rel.get('repo')} · main = 최신 배포 {latest}" if latest else "아직 허깅페이스에 올린 배포가 없습니다")
                                 + " · 새 녹화는 파싱 → 검토 → 최종 확정 → scripts/hf_release.py 순서로 새 배포가 됩니다")
 
@@ -3596,9 +3646,27 @@ class MainWindow(QtWidgets.QMainWindow):
         # One read of each bag writes both sets; a bag already in one of them goes into the other only.
         args = [r["path"] for r in todo] + ["--out", self.dataset, "--full-out", self.full_dataset,
                                             "--standard-copies", "--split", "train", "--no-validate"]
-        self.run(f"코스 {route} 파싱", [("proc", f"새 녹화 {len(todo)}개 파싱 · 한 번 읽어 기본·full 세트 함께",
-                                         self._py("bag2nuscenes.py", *args))],
-                 kind="parse", route=route)
+        steps = []
+        # both sets of a bag take ~1.2x its size (full ~0.8x, the standard copies ~0.4x)
+        need = int(sum(r["size"] or 0 for r in todo) * PARSE_SPACE_FACTOR)
+        free = shutil.disk_usage(self.data_root).free
+        if need > free:
+            plan = self._drop_plan() or {"scenes": [], "bytes": 0}
+            gain = plan["bytes"] if plan["scenes"] else 0
+            if gain and need <= free + gain:
+                if not self._confirm("저장 공간이 부족합니다",
+                                     f"새 녹화 {len(todo)}개를 파싱하려면 약 {human_size(need)}가 필요한데 여유는 {human_size(free)}입니다. "
+                                     "배포된 파일을 먼저 정리하고 파싱합니다.\n\n" + self._drop_text(plan),
+                                     "정리하고 파싱", True):
+                    return
+                steps.append(self._drop_step(plan))
+            elif not self._confirm("저장 공간이 부족합니다",
+                                   f"새 녹화 {len(todo)}개를 파싱하려면 약 {human_size(need)}가 필요한데 여유는 {human_size(free)}입니다"
+                                   + (f" (배포된 파일을 정리해도 {human_size(free + gain)})" if gain else "")
+                                   + ". 그래도 파싱할까요? 공간이 다 차면 그 녹화에서 멈춥니다.", "그래도 파싱", True):
+                return
+        steps.append(("proc", f"새 녹화 {len(todo)}개 파싱 · 한 번 읽어 기본·full 세트 함께", self._py("bag2nuscenes.py", *args)))
+        self.run(f"코스 {route} 파싱", steps, kind="parse", route=route)
 
     def _yield_file(self, name: str) -> Path:
         return self.data_root / "logs" / "yield" / f"{name}.json"

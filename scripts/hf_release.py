@@ -389,7 +389,9 @@ the NovAtel INSPVA solution (100 Hz, RTK), placed at the receiver's GPS measurem
 
 STANDARD_NOTES = """Key frames (`samples/`) are 2 Hz, synchronised across the seven sensors as in nuScenes; every other frame
 is a sweep (`sweeps/`). LiDAR files hold five float32 per point (x, y, z, intensity, ring), as in nuScenes.
-`calibrated_sensor` holds the intrinsics and extrinsics, one set per recording.
+This set carries no calibration: `calibrated_sensor` holds placeholders (identity extrinsics, a 90° pinhole
+`camera_intrinsic`, one record per sensor and recording) and the images are as recorded, so projecting between
+sensors with these values is not meaningful.
 """
 
 FULL_NOTES = """Key frames (`samples/`) are 2 Hz, chosen where `LIDAR_TOP` and the six standard cameras are synchronised

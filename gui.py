@@ -2752,8 +2752,8 @@ class MainWindow(QtWidgets.QMainWindow):
                                    f"최종 삭제 백업: {self.dataset / '_removed'}\n"
                                    + (f"같은 목록과 human_decisions.json을 {copy}에도 복사합니다.\n" if copy else "")
                                    + "".join(f"배포된 씬 {len(r['scenes']):,}개의 사진·LiDAR 파일은 디스크 공간을 위해 지웠습니다 "
-                                             f"({r.get('when', '')[:10]}, {(r.get('bytes') or 0) / 1e9:.0f} GB): {r.get('repo')} "
-                                             f"{r.get('release')}과 full 세트에 같은 프레임이 있고, 표·잠금·큐레이션 기록은 그대로입니다. "
+                                             f"({r.get('when', '')[:10]}, {(r.get('bytes') or 0) / 1e9:.0f} GB): 배포본({r.get('repo')} "
+                                             f"{r.get('release')})과 full 세트에 같은 프레임이 있고, 표·잠금·큐레이션 기록은 그대로입니다. "
                                              "검토 화면에서 그 씬은 이미지 대신 안내가 보입니다.\n"
                                              for r in self.cdata.get("dropped") or [])
                                    + "루트를 고르면(여러 개: Ctrl/Shift) 검토·검출이 그 루트에만, 고르지 않으면 데이터셋 전체에 "

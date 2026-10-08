@@ -1826,8 +1826,15 @@ class MainWindow(QtWidgets.QMainWindow):
         self.route_list.setMouseTracking(True)
         self.route_list.currentItemChanged.connect(self._select_route)
         self.route_list.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
-        layout.addWidget(self.route_list)
-        layout.addSpacing(18)
+        # The course list, the time overview and the full-set card scroll as one: with many courses they do not
+        # fit the window's height, and a layout that cannot fit draws them over each other.
+        middle = QtWidgets.QWidget()
+        middle.setObjectName("sidebarMiddle")
+        mid = QtWidgets.QVBoxLayout(middle)
+        mid.setContentsMargins(0, 0, 0, 0)
+        mid.setSpacing(6)
+        mid.addWidget(self.route_list)
+        mid.addSpacing(18)
         self.ov = QtWidgets.QWidget()
         ov = QtWidgets.QVBoxLayout(self.ov)
         ov.setContentsMargins(0, 0, 0, 0)
@@ -1848,7 +1855,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.ov_rows.setVerticalSpacing(8)
         self.ov_rows.setColumnStretch(1, 1)
         ov.addLayout(self.ov_rows)
-        layout.addWidget(self.ov)
+        mid.addWidget(self.ov)
         self.full_card = QtWidgets.QWidget()
         fc = QtWidgets.QVBoxLayout(self.full_card)
         fc.setContentsMargins(0, 12, 0, 0)
@@ -1862,8 +1869,17 @@ class MainWindow(QtWidgets.QMainWindow):
         self.calib_btn = button("캘리브레이션 넣기…", self._add_calibration, "quiet")
         self.calib_btn.setToolTip("tcar_calib_<날짜>.zip (또는 그 폴더)의 카메라 7대 · 상단 LiDAR 캘리브레이션을 full 세트에만 넣습니다")
         fc.addWidget(self.calib_btn)
-        layout.addWidget(self.full_card)
-        layout.addStretch(1)
+        mid.addWidget(self.full_card)
+        mid.addStretch(1)
+        self.side_scroll = QtWidgets.QScrollArea()
+        self.side_scroll.setObjectName("sidebarScroll")
+        self.side_scroll.setWidget(middle)
+        self.side_scroll.setWidgetResizable(True)
+        self.side_scroll.setFrameShape(QtWidgets.QFrame.Shape.NoFrame)
+        self.side_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.side_scroll.setStyleSheet("#sidebarScroll, #sidebarScroll > QWidget > QWidget#sidebarMiddle { background: transparent; }")
+        self.side_scroll.viewport().setAutoFillBackground(False)
+        layout.addWidget(self.side_scroll, 1)
         self.sidebar_hint = label("가져온 녹화가 코스별로 여기에 표시됩니다.", "faint", True)
         layout.addWidget(self.sidebar_hint)
         self.import_btn = button("＋  녹화 가져오기", self._import)
@@ -1966,7 +1982,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.table.setMinimumHeight(180)
         header = self.table.horizontalHeader()
         header.setSectionResizeMode(1, QtWidgets.QHeaderView.ResizeMode.Stretch)
-        for column, width in ((0, 290), (2, 72), (3, 80), (4, 72), (5, 200)):
+        for column, width in ((0, 290), (2, 72), (3, 80), (4, 72), (5, 280)):
             header.setSectionResizeMode(column, QtWidgets.QHeaderView.ResizeMode.Fixed)
             self.table.setColumnWidth(column, width)
         self.table.itemSelectionChanged.connect(self._update_buttons)
@@ -2463,6 +2479,7 @@ class MainWindow(QtWidgets.QMainWindow):
         while self.ov_rows.count():
             w = self.ov_rows.takeAt(0).widget()
             if w:
+                w.hide()                # deleteLater waits for the event loop: hidden now, or old rows show through
                 w.deleteLater()
         for row, (route, c) in enumerate(sorted(per.items())):
             if not c["total"]:
@@ -3261,14 +3278,18 @@ class MainWindow(QtWidgets.QMainWindow):
                 elif rec["name"] in self.status["logs"]:
                     st_text, _ = stage_text(self.cdata, rec["name"], self.status_all["names_by_log"].get(rec["name"], []))
                     state, color = f"데이터셋에 포함 ({self.status['logs'][rec['name']]}씬) · {st_text}", C["ok"]
+                    if self.full_status["imported"] and rec["name"] not in self.full_status["imported"]:
+                        state, color = state + " · full 세트에 없음", C["accent"]
                 elif rec["name"] in self.status["imported"]:
                     state, color = "큐레이션으로 모두 제외", C["muted"]
+                elif rec.get("offline"):
+                    state, color = "SSD 연결 필요 · 파싱 대기", C["warn"]
                 else:
                     state, color = "파싱 대기", C["accent"]
                 if rec.get("offline"):
-                    detail += f" · SSD 연결 안 됨 ({rec['target']})"
+                    detail += " · SSD 연결 안 됨"
                 elif rec.get("linked"):
-                    detail += " · SSD에서 바로 읽음"
+                    detail += " · SSD"
                 elif not rec["raw"]:
                     detail += " · 원본은 데이터 폴더에 없음"
                 orig = st["orig_s"] if st else rec["duration"]
@@ -3284,7 +3305,8 @@ class MainWindow(QtWidgets.QMainWindow):
                 parts = [(seg[k], C["line2"] if rec["excluded"] else col) for k, _, col in OV_PARSER]
                 for column, text in enumerate(cells):
                     item = QtWidgets.QTableWidgetItem(text)
-                    item.setToolTip((rec["path"] or rec["name"]) if column == 0 else
+                    item.setToolTip(((rec["path"] or rec["name"]) + (f"\n→ {rec['target']}" if rec.get("target") else ""))
+                                    if column == 0 else
                                     loss_text(st) if st and column in (1, 2, 3, 4) else text)
                     if column == 0:
                         item.setData(SUB_ROLE, detail)

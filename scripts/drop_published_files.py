@@ -1,17 +1,20 @@
 #!/usr/bin/env python3
-"""Free the standard set's disk: delete the sensor files of the scenes a Hugging Face release already holds.
+"""Free disk: delete the sensor files of the scenes a Hugging Face release already holds.
 
     python scripts/drop_published_files.py --plan        # what would go (fast: no file is touched or listed)
     python scripts/drop_published_files.py               # /data/parsed/tcar_nuscenes, twins in .._full
+    python scripts/drop_published_files.py --dataroot /data/parsed/tcar_nuscenes_full   # the full set's own
 
 A scene loses its samples/ and sweeps/ files only when it is
   - published: in selection/hf_release.json (the release record hf_release.py keeps),
   - locked: an earlier round's 최종 확정 (it never changes again), and
   - in the full set too: a twin with the same name and sample timestamps (the same frames, kept locally).
+    The full set itself (--dataroot = --full) has no local twin: its own release (TCar_hyu) is the copy, and
+    its .time.bin and ext/<scene>/ sidecar files go along with the frames.
 Its tables, can_bus/ files and the curation state stay, so scene names keep continuing after it, the locks hold
 and the next release still finds it. selection/files_dropped.json records which scenes (by token); the check
 (apply_selection --check) does not ask for their files and the review shows a note instead of their images.
-Get them back with `hf download` of the release, or read the full set.
+Get them back with `hf download` of the release, or read the full set (while it still has them).
 
 Files go in inode order: on the /data SMR disk deleting in table order (random inodes) ran at ~40 GB/h. A round
 that stopped before it finished (done: false) is taken up again. Progress lines read "deleted (k/n)".
@@ -45,6 +48,10 @@ def _keys(root):
     return key, {key[s['token']]: s['name'] for s in scenes}, scenes
 
 
+def is_full(dataroot, full):
+    return os.path.realpath(dataroot) == os.path.realpath(full)
+
+
 def plan(dataroot, full):
     """What a run would delete, from the small tables only: {scenes, bytes, open_round, why_not, repo, release}.
     `bytes` is an upper bound for a round left unfinished (some of its files are gone already)."""
@@ -55,8 +62,11 @@ def plan(dataroot, full):
     rounds = (A._read(os.path.join(sel, 'files_dropped.json'), {}) or {}).get('rounds') or []
     done = {t for r in rounds if r.get('done') for t in r.get('scenes') or []}
     open_round = next((r for r in reversed(rounds) if not r.get('done')), None)
-    key, _, scenes = _keys(dataroot)
-    _, full_name, _ = _keys(full) if os.path.isdir(os.path.join(full, VERSION)) else ({}, {}, [])
+    key, own_name, scenes = _keys(dataroot)
+    if is_full(dataroot, full):
+        full_name = own_name                    # the full set's own release is the copy
+    else:
+        _, full_name, _ = _keys(full) if os.path.isdir(os.path.join(full, VERSION)) else ({}, {}, [])
     why_not = {'not published': 0, 'not locked': 0, 'no twin in the full set': 0, 'dropped already': 0}
     go = []
     for s in scenes:
@@ -103,12 +113,20 @@ def main():
         tokens = set(p['scenes'])
         # an unfinished round is replaced by this one (it covers the same scenes and more)
         rounds = [r for r in rounds if r.get('done')]
+        own = is_full(a.dataroot, a.full)
         entry = {'when': datetime.datetime.now().astimezone().isoformat(timespec='seconds'),
-                 'repo': p['repo'], 'release': p['release'], 'full_set': os.path.realpath(a.full),
+                 'repo': p['repo'], 'release': p['release'],
+                 'full_set': 'the release itself' if own else os.path.realpath(a.full),
                  'scenes': sorted(tokens), 'done': False}
         A._write(path, {'version': 1, 'rounds': rounds + [entry]}, indent=1)
         samples = {s['token'] for s in _rd(a.dataroot, 'sample') if s['scene_token'] in tokens}
         files = [x['filename'] for x in _rd(a.dataroot, 'sample_data') if x['sample_token'] in samples]
+        if own:                                 # the full set: per-point times and the scenes' sidecar files
+            files += [f[:-len('.pcd.bin')] + '.time.bin' for f in files if f.endswith('.pcd.bin')]
+            for sc in _rd(a.dataroot, 'scene'):
+                d = os.path.join(a.dataroot, 'ext', sc['name'])
+                if sc['token'] in tokens and os.path.isdir(d):
+                    files += [os.path.join('ext', sc['name'], f) for f in os.listdir(d)]
         ents = []
         for fn in files:
             q = os.path.join(a.dataroot, fn)
@@ -129,9 +147,17 @@ def main():
                 print(f'deleted ({k}/{len(ents)})  {freed / 1e9:.0f} GB', flush=True)
         entry.update(done=True, files=len(files), removed=len(ents), bytes=freed)
         A._write(path, {'version': 1, 'rounds': rounds + [entry]}, indent=1)
+        if own:
+            for sc in _rd(a.dataroot, 'scene'):
+                if sc['token'] in tokens:
+                    try:
+                        os.rmdir(os.path.join(a.dataroot, 'ext', sc['name']))
+                    except OSError:
+                        pass
         with open(os.path.join(sel, 'decisions_log.txt'), 'a', encoding='utf-8') as f:
+            where = f"배포본({p['repo']} {p['release']})" + ('에 있음' if own else '과 full 세트에 있음')
             f.write(f"{datetime.datetime.now():%Y-%m-%d %H:%M:%S}  === 배포된 씬 {len(tokens)}개의 센서 파일 삭제 "
-                    f"({len(ents)}개, {freed / 1e9:.0f} GB; 배포본({p['repo']} {p['release']})과 full 세트에 있음) ===\n")
+                    f"({len(ents)}개, {freed / 1e9:.0f} GB; {where}) ===\n")
     print(f'done: {len(ents):,} files, {freed / 1e9:.1f} GB freed; selection/files_dropped.json', flush=True)
 
 

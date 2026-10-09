@@ -1870,6 +1870,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self.calib_btn = button("캘리브레이션 넣기…", self._add_calibration, "quiet")
         self.calib_btn.setToolTip("tcar_calib_<날짜>.zip (또는 그 폴더)의 카메라 7대 · 상단 LiDAR 캘리브레이션을 full 세트에만 넣습니다")
         fc.addWidget(self.calib_btn)
+        self.drop_full_btn = button("배포된 full 파일 정리…", self._drop_full, "quiet")
+        self.drop_full_btn.setToolTip("허깅페이스(full 배포본)에 배포되고 잠긴 씬의 사진 · LiDAR · 레이더 · sidecar 파일을 full 세트에서 "
+                                      "지워 공간을 비웁니다 (표 · 큐레이션 기록은 그대로)")
+        fc.addWidget(self.drop_full_btn)
         mid.addWidget(self.full_card)
         mid.addStretch(1)
         self.side_scroll = QtWidgets.QScrollArea()
@@ -2527,6 +2531,14 @@ class MainWindow(QtWidgets.QMainWindow):
         self.sync_btn.setVisible(bool(fs["imported"]) and not missing and fs["scenes"] != ss["scenes"])
         self.calib_btn.setVisible(bool(fs["imported"]))
         self.calib_btn.setText("캘리브레이션 바꾸기…" if cal else "캘리브레이션 넣기…")
+        fd = curation_data(self.full_dataset) if fs["imported"] else {}
+        rel = (fd.get("release") or {})
+        dropped = {t for r in fd.get("dropped") or [] for t in r.get("scenes") or []}
+        n_drop = len(set(rel.get("scene_tokens") or []) - dropped)
+        if dropped:
+            self.full_text.setText(self.full_text.text() + f"\n배포된 씬 {len(dropped):,}개는 파일을 지움 ({rel.get('repo')}에 있음)")
+        self.drop_full_btn.setVisible(n_drop > 0)
+        self.drop_full_btn.setText(f"배포된 full 파일 정리… · 씬 {n_drop}개")
 
     def _add_calibration(self):
         """Put a calibration into the full set (never the standard set): tables and calibration/ only, images untouched."""
@@ -2772,27 +2784,29 @@ class MainWindow(QtWidgets.QMainWindow):
         dropped = {t for r in self.cdata.get("dropped") or [] for t in r.get("scenes") or []}
         return len(released - dropped)
 
-    def _drop_plan(self) -> dict | None:
-        """scripts/drop_published_files.plan for this data root (small tables only, a few seconds)."""
+    def _drop_plan(self, root: Path | None = None) -> dict | None:
+        """scripts/drop_published_files.plan for the standard set (or `root`; small tables only, a few seconds)."""
         try:
             import importlib.util
             spec = importlib.util.spec_from_file_location("drop_published_files", HERE / "scripts" / "drop_published_files.py")
             mod = importlib.util.module_from_spec(spec)
             spec.loader.exec_module(mod)
-            return mod.plan(str(self.dataset), str(self.full_dataset))
+            return mod.plan(str(root or self.dataset), str(self.full_dataset))
         except Exception as error:                      # noqa: BLE001 - shown to the user
             self._message("정리 계획을 만들 수 없습니다", str(error))
             return None
 
     def _drop_step(self, plan: dict):
         return ("proc", f"배포된 기본 세트 씬 {len(plan['scenes'])}개의 사진·LiDAR 파일 정리 (최대 {plan['bytes'] / 1e9:.0f} GB · "
-                        f"배포본({plan['repo']} {plan['release']})과 full 세트에 같은 프레임)",
+                        f"배포본({plan['repo']} {plan['release']})에 같은 프레임)",
                 self._py("scripts/drop_published_files.py", "--dataroot", self.dataset, "--full", self.full_dataset))
 
     def _drop_text(self, plan: dict) -> str:
+        frames = ("· 같은 프레임이 배포본에 있습니다 (full 세트는 배포된 씬 파일을 이미 지웠습니다).\n"
+                  if curation_data(self.full_dataset).get("dropped") else
+                  "· 같은 프레임이 배포본과 full 세트(parsed/" + FULL_DATASET + ")에 있습니다.\n")
         return (f"허깅페이스 {plan['repo']} {plan['release']}에 배포되고 잠긴 씬 {len(plan['scenes'])}개의 사진·LiDAR 파일을 "
-                f"기본 세트(parsed/{DATASET})에서 지웁니다 (최대 {plan['bytes'] / 1e9:.0f} GB).\n\n"
-                "· 같은 프레임이 배포본과 full 세트(parsed/" + FULL_DATASET + ")에 있습니다.\n"
+                f"기본 세트(parsed/{DATASET})에서 지웁니다 (최대 {plan['bytes'] / 1e9:.0f} GB).\n\n" + frames +
                 "· 표 · CAN bus · 잠금 · 큐레이션 기록은 그대로라, 씬 이름 · 다음 배포 · 새 데이터 큐레이션은 지금처럼 됩니다.\n"
                 "· 검토 화면에서 그 씬은 이미지 대신 안내가 보입니다. 되돌리려면 배포본을 다시 받아야 합니다.")
 
@@ -2807,6 +2821,27 @@ class MainWindow(QtWidgets.QMainWindow):
         if not self._confirm("배포된 파일 정리", self._drop_text(plan), f"정리 · 씬 {len(plan['scenes'])}개", True):
             return
         self.run("배포된 파일 정리", [self._drop_step(plan)], kind="drop")
+
+    def _drop_full(self):
+        """The full set's own released scenes: their files go, its release on the Hub is the copy."""
+        if self.job or not self.data_root:
+            return
+        plan = self._drop_plan(self.full_dataset)
+        if not plan:
+            return
+        if not plan["scenes"]:
+            return self._message("정리할 것이 없습니다", "full 세트에서 배포되고 잠긴 씬 중 파일이 남은 씬이 없습니다.")
+        text = (f"허깅페이스 {plan['repo']} {plan['release']}에 배포되고 잠긴 씬 {len(plan['scenes'])}개의 사진 · LiDAR · 레이더 · "
+                f"포인트 시간 · sidecar 파일을 full 세트(parsed/{FULL_DATASET})에서 지웁니다.\n\n"
+                "· 이 PC에는 사본이 남지 않습니다: 되돌리려면 배포본을 다시 받아야 합니다.\n"
+                "· 표 · CAN bus · 캘리브레이션 · 잠금 · 큐레이션 기록은 그대로라, 다음 배포와 새 데이터는 지금처럼 됩니다.\n"
+                "· 배포 안 된 씬(새 녹화)은 그대로입니다.")
+        if not self._confirm("배포된 full 파일 정리", text, f"정리 · 씬 {len(plan['scenes'])}개", True):
+            return
+        self.run("배포된 full 파일 정리", [("proc", f"배포된 full 세트 씬 {len(plan['scenes'])}개의 센서 파일 정리 "
+                                              f"(배포본 {plan['repo']} {plan['release']}에 있음)",
+                                      self._py("scripts/drop_published_files.py", "--dataroot", self.full_dataset,
+                                               "--full", self.full_dataset))], kind="drop")
 
     def _show_stages(self):
         """The 라운드 · 배포 table: each curation round (what its 최종 확정 locked and deleted, and the release it went

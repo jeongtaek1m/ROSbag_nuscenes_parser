@@ -244,6 +244,10 @@ job, in course and number order. A cancelled job keeps the recordings it finishe
 with the rest (the lock a cancelled run leaves behind is cleared once its process is gone). Before a parse
 that would not fit, the app offers to drop the standard set's released files first ("배포된 파일 정리",
 `scripts/drop_published_files.py`; also a button by 라운드 · 배포 in the curation tab).
+Once the full set has its own release (TCar_hyu), "배포된 full 파일 정리" on the full-set card drops its
+released scenes' files too (`drop_published_files.py --dataroot parsed/tcar_nuscenes_full`: frames,
+`.time.bin`, `ext/<scene>/`; tables, CAN bus, calibration and curation stay). Its only copy is then the
+release, and an HDD without TRIM (the /data SMR disk) does not get faster from the freed space.
 
 **One read, both sets.** "파싱하기" runs `bag2nuscenes.py --full-out --standard-copies`: every
 new bag goes into `parsed/tcar_nuscenes` and `parsed/tcar_nuscenes_full` from one read, each set

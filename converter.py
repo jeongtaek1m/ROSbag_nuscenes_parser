@@ -738,6 +738,24 @@ def disk_offset(path) -> int:
     return struct.unpack_from("=Q", buf, 40)[0] if struct.unpack_from("=I", buf, 20)[0] else 0
 
 
+def copy_noatime(src, dst) -> None:
+    """shutil.copyfile without touching the source's access time (O_NOATIME, which the file's owner may use).
+    Under relatime the first read of a just-written file rewrites its inode: one more seek per file on an HDD."""
+    try:
+        fi = os.open(src, os.O_RDONLY | os.O_NOATIME)
+    except PermissionError:
+        fi = os.open(src, os.O_RDONLY)
+    try:
+        fo = os.open(dst, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o666)
+        try:
+            while os.sendfile(fo, fi, None, 1 << 30):
+                pass
+        finally:
+            os.close(fo)
+    finally:
+        os.close(fi)
+
+
 def link_frames(plan: list[tuple[int, str, str]], first: dict, first_name: str,
                 out_root: Path, point_time: bool, copy: bool = False) -> dict:
     """Give another output the frames the first one already holds.
@@ -770,7 +788,7 @@ def link_frames(plan: list[tuple[int, str, str]], first: dict, first_name: str,
     if copy:
         # Copies go in the order the sources lie on the disk. In plan order (channel by channel) every file
         # was a seek on an HDD: ~9 MB/s on /data2, where a sample of C-2's files read in disk order seeked
-        # 1/125 as far (inode order: no better than plan order).
+        # 1/125 as far (inode order: no better than plan order); in disk order C-2 copied at ~18 MB/s.
         jobs.sort(key=lambda j: disk_offset(j[0]))
     for a, b in jobs:
         if not copy:
@@ -780,7 +798,7 @@ def link_frames(plan: list[tuple[int, str, str]], first: dict, first_name: str,
                 continue
             except OSError:
                 pass
-        shutil.copyfile(a, b)
+        copy_noatime(a, b)
         n_copied += 1
     print(f"  {n_linked} files hard-linked from the {first_name} set"
           + (f", {n_copied} copied" if n_copied else "")

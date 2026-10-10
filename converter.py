@@ -23,9 +23,11 @@ from __future__ import annotations
 
 import argparse
 import dataclasses
+import fcntl
 import json
 import os
 import shutil
+import struct
 import sys
 import threading
 from collections import deque
@@ -720,6 +722,22 @@ def materialize(plan: list[tuple[int, str, str]], contents: BagContents,
             "n_lidar_deskewed": n_deskewed}
 
 
+FS_IOC_FIEMAP = 0xC020660B
+
+
+def disk_offset(path) -> int:
+    """Where the file's data starts on the disk (FIEMAP, first extent; no root needed), so files can be read
+    in the order they lie on an HDD. Delayed writes are flushed first. 0 when the filesystem does not say."""
+    buf = bytearray(32 + 56)                    # struct fiemap + one struct fiemap_extent
+    struct.pack_into("=QQIIII", buf, 0, 0, 0xFFFFFFFFFFFFFFFF, 1, 0, 1, 0)    # FIEMAP_FLAG_SYNC, 1 extent
+    try:
+        with open(path, "rb") as f:
+            fcntl.ioctl(f, FS_IOC_FIEMAP, buf)
+    except OSError:
+        return 0
+    return struct.unpack_from("=Q", buf, 40)[0] if struct.unpack_from("=I", buf, 20)[0] else 0
+
+
 def link_frames(plan: list[tuple[int, str, str]], first: dict, first_name: str,
                 out_root: Path, point_time: bool, copy: bool = False) -> dict:
     """Give another output the frames the first one already holds.
@@ -732,6 +750,7 @@ def link_frames(plan: list[tuple[int, str, str]], first: dict, first_name: str,
     """
     _ensure_placeholder_map(out_root)
     n_linked = n_copied = n_missing = n_time = 0
+    jobs = []                                   # (source's place on the disk, source, target)
     for ts_ns, channel, rel_target in plan:
         target = out_root / rel_target
         if target.exists():
@@ -741,23 +760,28 @@ def link_frames(plan: list[tuple[int, str, str]], first: dict, first_name: str,
             n_missing += 1
             continue
         target.parent.mkdir(parents=True, exist_ok=True)
-        pairs = [(src, target)]
+        jobs.append((src, target))
         if point_time and src.name.endswith(STAGE_EXT["lidar"]):
             t_src = src.with_name(src.name.removesuffix(STAGE_EXT["lidar"]) + POINT_TIME_EXT)
             if t_src.exists():
-                pairs.append((t_src, target.with_name(
+                jobs.append((t_src, target.with_name(
                     target.name.removesuffix(STAGE_EXT["lidar"]) + POINT_TIME_EXT)))
                 n_time += 1
-        for a, b in pairs:
-            if not copy:
-                try:
-                    os.link(a, b)
-                    n_linked += 1
-                    continue
-                except OSError:
-                    pass
-            shutil.copyfile(a, b)
-            n_copied += 1
+    if copy:
+        # Copies go in the order the sources lie on the disk. In plan order (channel by channel) every file
+        # was a seek on an HDD: ~9 MB/s on /data2, where a sample of C-2's files read in disk order seeked
+        # 1/125 as far (inode order: no better than plan order).
+        jobs.sort(key=lambda j: disk_offset(j[0]))
+    for a, b in jobs:
+        if not copy:
+            try:
+                os.link(a, b)
+                n_linked += 1
+                continue
+            except OSError:
+                pass
+        shutil.copyfile(a, b)
+        n_copied += 1
     print(f"  {n_linked} files hard-linked from the {first_name} set"
           + (f", {n_copied} copied" if n_copied else "")
           + (f"   [!] {n_missing} frames missing" if n_missing else ""))

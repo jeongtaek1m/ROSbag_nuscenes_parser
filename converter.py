@@ -756,6 +756,44 @@ def copy_noatime(src, dst) -> None:
         os.close(fi)
 
 
+COPY_BATCH = 1 << 30                            # bytes read into memory before writing them out
+
+
+def read_noatime(path) -> bytes:
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOATIME)
+    except PermissionError:
+        fd = os.open(path, os.O_RDONLY)
+    with os.fdopen(fd, "rb") as f:
+        return f.read()
+
+
+def copy_in_batches(jobs: list[tuple[Path, Path]]) -> None:
+    """Copy (source, target) pairs, the sources sorted by their place on the disk: ~1 GiB is read into memory,
+    then written out (grouped by target folder) and flushed before the next read. Reading and writing at the
+    same time kept an HDD's head going back and forth (C-3 on /data2: 12-23 MB/s)."""
+    def flush(batch):
+        for b, data in sorted(batch, key=lambda x: str(x[0])):
+            fd = os.open(b, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o666)
+            try:
+                view = memoryview(data)
+                while view:
+                    view = view[os.write(fd, view):]
+            finally:
+                os.close(fd)
+        os.sync()
+    batch, size = [], 0
+    for a, b in jobs:
+        data = read_noatime(a)
+        batch.append((b, data))
+        size += len(data)
+        if size >= COPY_BATCH:
+            flush(batch)
+            batch, size = [], 0
+    if batch:
+        flush(batch)
+
+
 def link_frames(plan: list[tuple[int, str, str]], first: dict, first_name: str,
                 out_root: Path, point_time: bool, copy: bool = False) -> dict:
     """Give another output the frames the first one already holds.
@@ -790,16 +828,18 @@ def link_frames(plan: list[tuple[int, str, str]], first: dict, first_name: str,
         # was a seek on an HDD: ~9 MB/s on /data2, where a sample of C-2's files read in disk order seeked
         # 1/125 as far (inode order: no better than plan order); in disk order C-2 copied at ~18 MB/s.
         jobs.sort(key=lambda j: disk_offset(j[0]))
-    for a, b in jobs:
-        if not copy:
+        copy_in_batches(jobs)
+        n_copied = len(jobs)
+    else:
+        for a, b in jobs:
             try:
                 os.link(a, b)
                 n_linked += 1
                 continue
             except OSError:
                 pass
-        copy_noatime(a, b)
-        n_copied += 1
+            copy_noatime(a, b)
+            n_copied += 1
     print(f"  {n_linked} files hard-linked from the {first_name} set"
           + (f", {n_copied} copied" if n_copied else "")
           + (f"   [!] {n_missing} frames missing" if n_missing else ""))

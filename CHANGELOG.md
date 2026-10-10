@@ -4,6 +4,7 @@
 
 | 항목 | 내용 |
 |---|---|
+| `--standard-copies` 묶음 | 원본 ~1 GiB를 메모리로 읽은 뒤 (대상 폴더별로) 쓰고 sync, 다음 묶음. 읽기와 쓰기가 섞이면 HDD 헤드가 왕복했음 (C-3: 12-23 MB/s) |
 | `--standard-copies` atime | 사본을 만들 때 원본을 O_NOATIME으로 읽음: relatime에서는 방금 쓴 파일을 처음 읽을 때 inode를 다시 써서 파일마다 HDD 탐색이 하나 더 생겼음 |
 | `--standard-copies` 속도 | 기본 세트 사본을 원본이 디스크에 놓인 순서(FIEMAP 첫 extent)대로 복사. 표 순서(채널별)로는 파일마다 HDD 탐색이라 /data2에서 ~9 MB/s였음 (C-2 표본: 디스크 순서의 탐색 거리 1/125, inode 순서는 효과 없음) |
 | `scripts/drop_published_files.py` | `--dataroot`가 full 세트(= `--full`)면 그 세트의 배포본(TCar_hyu)이 사본: 짝 검사 없이, 프레임과 함께 `.time.bin` · `ext/<scene>/`도 지움. 표 · CAN bus · 캘리브레이션 · 큐레이션은 그대로 |

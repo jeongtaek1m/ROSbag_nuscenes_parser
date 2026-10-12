@@ -248,6 +248,9 @@ Once the full set has its own release (TCar_hyu), "배포된 full 파일 정리"
 released scenes' files too (`drop_published_files.py --dataroot parsed/tcar_nuscenes_full`: frames,
 `.time.bin`, `ext/<scene>/`; tables, CAN bus, calibration and curation stay). Its only copy is then the
 release, and an HDD without TRIM (the /data SMR disk) does not get faster from the freed space.
+A dropped scene's files come back with `scripts/restore_dropped_files.py --from <another copy of the set>`
+(`--compared`: the earlier-round scenes that the new removal candidates are compared with, so the review can
+show both sides; `--scenes a,b`: by name). Run the rules (`curate.py`) afterwards to refresh the review.
 
 **One read, both sets.** "파싱하기" runs `bag2nuscenes.py --full-out --standard-copies`: every
 new bag goes into `parsed/tcar_nuscenes` and `parsed/tcar_nuscenes_full` from one read, each set

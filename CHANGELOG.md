@@ -1,5 +1,11 @@
 # Changelog
 
+## 2026-10-12 — 지웠던 씬 파일 복원
+
+| 항목 | 내용 |
+|---|---|
+| `scripts/restore_dropped_files.py` (신규) | 배포 뒤 파일을 지운 씬(`files_dropped.json`)의 센서 파일을 같은 세트의 다른 사본에서 다시 복사. `--compared`: 새 삭제 후보가 비교되는 이전 라운드 씬(검토 화면에 양쪽이 보이도록), `--scenes`: 이름으로. 복원한 씬은 `files_dropped.json`에서 빠지고 `restored`에 기록. 이후 `curate.py`로 검토 안내 갱신 |
+
 ## 2026-10-09 — full 세트의 배포된 파일 정리
 
 | 항목 | 내용 |

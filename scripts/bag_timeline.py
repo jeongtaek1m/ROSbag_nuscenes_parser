@@ -378,6 +378,7 @@ def gui(path: str | None) -> None:
 
     class Timeline(QtWidgets.QWidget):
         hover = Signal(str)
+        changed = Signal()                                  # the view moved (zoom, pan, rows): the scroll bars follow
 
         def __init__(self):
             super().__init__()
@@ -416,13 +417,27 @@ def gui(path: str | None) -> None:
                                     "max_gap": 0.0, "group": last})
                     out.append(r)
                 self.shown = out
-            self.scroll = min(self.scroll, max(0, len(self.shown) * ROW - (self.height() - TOP)))
+            self.scroll = min(self.scroll, self.max_scroll())
             self.update()
+            self.changed.emit()
+
+        def max_scroll(self):
+            return max(0, len(self.shown) * ROW - (self.height() - TOP))
+
+        def extent(self):
+            """The time range the horizontal bar covers: the bag (with a margin), stretched to where the view is."""
+            pad = max((self.hi - self.lo) * 0.01, 1e6)
+            return min(self.lo - pad, self.t0), max(self.hi + pad, self.t1)
 
         def fit(self):
             pad = max((self.hi - self.lo) * 0.01, 1e6)
             self.t0, self.t1 = self.lo - pad, self.hi + pad
             self.update()
+            self.changed.emit()
+
+        def resizeEvent(self, _):
+            self.scroll = min(self.scroll, self.max_scroll())
+            self.changed.emit()
 
         def x_of(self, t):
             return LABEL + (t - self.t0) / (self.t1 - self.t0) * (self.width() - LABEL)
@@ -545,6 +560,7 @@ def gui(path: str | None) -> None:
             if self.drag is not None:
                 dx = (x - self.drag[0]) / max(self.width() - LABEL, 1) * (self.drag[2] - self.drag[1])
                 self.t0, self.t1 = self.drag[1] - dx, self.drag[2] - dx
+                self.changed.emit()
             self.cursor = x
             k = (y - TOP + self.scroll) // ROW
             text = ""
@@ -587,7 +603,7 @@ def gui(path: str | None) -> None:
             mods = e.modifiers()
             shift = Qt.KeyboardModifier.ShiftModifier if hasattr(Qt, "KeyboardModifier") else Qt.ShiftModifier
             if x < LABEL or mods & shift:                    # over the names: scroll the rows
-                self.scroll = int(np.clip(self.scroll - d / 120 * ROW * 3, 0, max(0, len(self.shown) * ROW - (self.height() - TOP))))
+                self.scroll = int(np.clip(self.scroll - d / 120 * ROW * 3, 0, self.max_scroll()))
             else:
                 t = self.t_of(x)
                 k = 0.8 ** (d / 120)
@@ -595,6 +611,7 @@ def gui(path: str | None) -> None:
                 a = (t - self.t0) / (self.t1 - self.t0)
                 self.t0, self.t1 = t - a * span, t + (1 - a) * span
             self.update()
+            self.changed.emit()
 
         def keyPressEvent(self, e):
             if e.key() == (Qt.Key.Key_F if hasattr(Qt, "Key") else Qt.Key_F):
@@ -628,7 +645,23 @@ def gui(path: str | None) -> None:
             fit = bar.addAction("전체 보기 (F)")
             fit.triggered.connect(lambda: self.tl.fit())
             self.tl = Timeline()
-            self.setCentralWidget(self.tl)
+            hor = Qt.Orientation.Horizontal if hasattr(Qt, "Orientation") else Qt.Horizontal
+            ver = Qt.Orientation.Vertical if hasattr(Qt, "Orientation") else Qt.Vertical
+            self.vbar, self.hbar = QtWidgets.QScrollBar(ver), QtWidgets.QScrollBar(hor)
+            self.vbar.valueChanged.connect(self.on_vbar)
+            self.hbar.valueChanged.connect(self.on_hbar)
+            box = QtWidgets.QWidget()
+            grid = QtWidgets.QGridLayout(box)
+            grid.setContentsMargins(0, 0, 0, 0)
+            grid.setSpacing(0)
+            grid.addWidget(self.tl, 0, 0)
+            grid.addWidget(self.vbar, 0, 1)
+            under = QtWidgets.QHBoxLayout()                 # the horizontal bar under the time axis, not the names
+            under.setContentsMargins(LABEL, 0, 0, 0)
+            under.addWidget(self.hbar)
+            grid.addLayout(under, 1, 0)
+            self.setCentralWidget(box)
+            self.tl.changed.connect(self.sync_bars)
             self.note = QtWidgets.QLabel("휠: 확대 · 드래그: 이동 · 더블클릭: 전체 · 이름 위에서 휠: 토픽 스크롤")
             self.bar_p = QtWidgets.QProgressBar()
             self.bar_p.setFixedWidth(220)
@@ -637,6 +670,39 @@ def gui(path: str | None) -> None:
             self.statusBar().addPermanentWidget(self.bar_p)
             self.tl.hover.connect(lambda s: self.note.setText(s or self.summary))
             self.summary = self.note.text()
+
+        HSTEPS = 1_000_000                                  # the horizontal bar's resolution over its time range
+
+        def sync_bars(self):
+            tl = self.tl
+            for bar in (self.vbar, self.hbar):
+                bar.blockSignals(True)
+            page = max(tl.height() - TOP, ROW)
+            self.vbar.setRange(0, tl.max_scroll())
+            self.vbar.setPageStep(page)
+            self.vbar.setSingleStep(ROW)
+            self.vbar.setValue(tl.scroll)
+            lo, hi = tl.extent()
+            total, span = max(hi - lo, 1.0), tl.t1 - tl.t0
+            page_h = int(min(span / total, 1.0) * self.HSTEPS)
+            self.hbar.setRange(0, self.HSTEPS - page_h)
+            self.hbar.setPageStep(max(page_h, 1))
+            self.hbar.setSingleStep(max(page_h // 10, 1))
+            self.hbar.setValue(int((tl.t0 - lo) / total * self.HSTEPS))
+            for bar in (self.vbar, self.hbar):
+                bar.blockSignals(False)
+
+        def on_vbar(self, v):
+            self.tl.scroll = v
+            self.tl.update()
+
+        def on_hbar(self, v):
+            tl = self.tl
+            lo, hi = tl.extent()
+            span = tl.t1 - tl.t0
+            tl.t0 = lo + v / self.HSTEPS * max(hi - lo, 1.0)
+            tl.t1 = tl.t0 + span
+            tl.update()
 
         def dragEnterEvent(self, e):
             if e.mimeData().hasUrls():
@@ -695,6 +761,11 @@ def gui(path: str | None) -> None:
                 if view:
                     a, b = map(float, view.split(","))
                     self.tl.t0, self.tl.t1 = self.tl.lo + a * 1e9, self.tl.lo + b * 1e9
+                    self.tl.changed.emit()
+                if os.environ.get("BAGVIEW_SHOT_BARS"):     # "v,h": set the bars as a user would
+                    v, h = map(int, os.environ["BAGVIEW_SHOT_BARS"].split(","))
+                    self.vbar.setValue(v)
+                    self.hbar.setValue(h)
                 QtCore.QTimer.singleShot(400, lambda: (self.grab().save(shot), QtWidgets.QApplication.quit()))
 
         def show_rows(self, keep=True, how=None):

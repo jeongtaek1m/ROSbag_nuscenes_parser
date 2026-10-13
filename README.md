@@ -262,6 +262,12 @@ A dropped scene's files come back with `scripts/restore_dropped_files.py --from 
 (`--compared`: the earlier-round scenes that the new removal candidates are compared with, so the review can
 show both sides; `--scenes a,b`: by name). Run the rules (`curate.py`) afterwards to refresh the review.
 
+**Volumes.** Once the official scene names of the first volume are used up, a parse continues in
+`parsed/tcar_nuscenes_2` (and `tcar_nuscenes_full_2`) by itself. The parser page shows every volume as one
+dataset (a recording's row names its volume); the curation page gets a volume picker, since scene names start
+again in each volume: rules, review, 최종 확정 and its undo work on the picked volume and its full twin. 검증하기,
+캘리브레이션 넣기 and "기본 세트 큐레이션 반영" cover every volume.
+
 **One read, both sets.** "파싱하기" runs `bag2nuscenes.py --full-out --standard-copies`: every
 new bag goes into `parsed/tcar_nuscenes` and `parsed/tcar_nuscenes_full` from one read, each set
 with its own files (no hard links between them).

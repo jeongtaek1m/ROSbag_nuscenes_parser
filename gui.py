@@ -45,6 +45,8 @@ SETTINGS = QtCore.QSettings("IRCV", "TCAR Parser")
 COURSE_RE = re.compile(r"[A-Z][A-Z0-9]*")
 BAG_RE = re.compile(r"(?P<course>[A-Z][A-Z0-9]*)-(?P<num>\d+)_(?P<ts>\d{4}(?:-\d\d){5})$")
 SIDECARS = ("_integrity.csv", "_recorder.log")      # written next to every bag by the recorder
+import volumes  # noqa: E402  (tcar_nuscenes, tcar_nuscenes_2, ...: see volumes.py)
+
 DATASET = "tcar_nuscenes"                           # parsed/<DATASET>: every course, one dataset
 FULL_DATASET = "tcar_nuscenes_full"                 # parsed/<FULL_DATASET>: the same scenes, every sensor and topic
 PARSE_SPACE_FACTOR = 1.25                           # both sets of a parsed bag, as a multiple of its size (with margin)
@@ -289,6 +291,22 @@ def course_status(status: dict, course: str) -> dict:
             "samples": sum(status["samples_by_log"].get(n, 0) for n in logs),
             "imported": {n for n in status["imported"] if detect_route(Path(n)) == course},
             "error": status["error"]}
+
+
+def merge_status(parts: list[dict]) -> dict:
+    """The volumes of a set as one: recording names are unique across them. Scene names are not (they start again
+    in every volume), so "names" is left empty and the curation page looks at one volume at a time."""
+    out = {"logs": {}, "samples_by_log": {}, "scenes": 0, "samples": 0, "names": [], "names_by_log": {},
+           "imported": set(), "error": ""}
+    for st in parts:
+        out["logs"].update(st["logs"])
+        out["samples_by_log"].update(st["samples_by_log"])
+        out["names_by_log"].update(st["names_by_log"])
+        out["scenes"] += st["scenes"]
+        out["samples"] += st["samples"]
+        out["imported"] |= st["imported"]
+        out["error"] = out["error"] or st["error"]
+    return out
 
 
 _IMPORT_CACHE: dict[tuple, dict | None] = {}
@@ -1718,8 +1736,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self.job = None
         self.recs, self.active_recs = [], []
         self.status = {"logs": {}, "scenes": 0, "samples": 0, "error": ""}
-        self.status_all = parsed_status(Path("/nonexistent"))
-        self.full_status = parsed_status(Path("/nonexistent"))
+        self.status_all = parsed_status(Path("/nonexistent"))        # the picked volume (curation page)
+        self.status_family = parsed_status(Path("/nonexistent"))     # every volume as one (parser page)
+        self.full_status = parsed_status(Path("/nonexistent"))       # the full set, every volume
+        self._vols, self.log_vol, self.vol_status, self.vol_cdata = None, {}, {}, {}
         self.validated = {}
         self.next_action = "root"
         self._job_kind, self._job_route = "", None
@@ -1769,12 +1789,37 @@ class MainWindow(QtWidgets.QMainWindow):
         self._live.start()
 
     @property
-    def dataset(self) -> Path:
+    def base_dataset(self) -> Path:
         return self.data_root / "parsed" / DATASET
 
     @property
-    def full_dataset(self) -> Path:
+    def base_full(self) -> Path:
         return self.data_root / "parsed" / FULL_DATASET
+
+    def volume_dirs(self, fresh: bool = False) -> list[Path]:
+        """The standard set's volumes that hold tables (tcar_nuscenes, tcar_nuscenes_2, ...); the first always."""
+        if fresh or self._vols is None or self._vols[0] != self.base_dataset:
+            vs = volumes.volumes(self.base_dataset)
+            self._vols = [vs[0]] + [v for v in vs[1:] if (v / VERSION).is_dir()]
+        return self._vols
+
+    @property
+    def dataset(self) -> Path:
+        """The volume the curation page works on: the picked one, else the newest (new recordings go there)."""
+        vs, name = self.volume_dirs(), str(SETTINGS.value("volume", ""))
+        return next((v for v in vs if v.name == name), vs[-1])
+
+    @property
+    def full_dataset(self) -> Path:
+        return self.full_of(self.dataset)
+
+    def full_of(self, volume: Path) -> Path:
+        """The full set's twin of a standard volume."""
+        return volumes.volume(self.base_full, volumes.index_of(volume))
+
+    def vol_of(self, recording: str) -> Path:
+        """The volume a recording is in (the newest for one not parsed yet)."""
+        return self.log_vol.get(recording) or self.volume_dirs()[-1]
 
     def _sidebar(self):
         widget = self.sidebar = QtWidgets.QWidget()
@@ -2031,6 +2076,13 @@ class MainWindow(QtWidgets.QMainWindow):
         self.cur_subtitle = label("", "sub", True)
         titles.addWidget(self.cur_subtitle)
         heading.addLayout(titles, 1)
+        self.vol_picker = QtWidgets.QComboBox()
+        self.vol_picker.setToolTip("큐레이션할 볼륨. 공식 씬 이름(train 685개)이 다 차면 새 녹화는 tcar_nuscenes_2, _3 …에 들어갑니다. "
+                                   "씬 이름이 볼륨마다 다시 시작하므로 큐레이션 · 검토 · 최종 확정은 볼륨별로 합니다")
+        self.vol_picker.setVisible(False)
+        self.vol_picker.activated.connect(self._pick_volume)
+        heading.addWidget(self.vol_picker, alignment=Qt.AlignmentFlag.AlignTop)
+        heading.addSpacing(6)
         self.cur_review_btn = button("전체 검토", self._review_all, "primary")
         self.cur_review_btn.setToolTip("데이터셋의 모든 씬을 한 목록으로 검토합니다 (카메라 6대·LiDAR·지도, 남기기 / 버리기 확정). "
                                        "루트만 보려면 표에서 루트를 고르고 ‘고른 루트 검토’")
@@ -2345,7 +2397,7 @@ class MainWindow(QtWidgets.QMainWindow):
     def route_dirs(self) -> list[str]:
         if not self.data_root:
             return []
-        names = {detect_route(Path(n)) for n in self.status_all["imported"]} - {None}
+        names = {detect_route(Path(n)) for n in self.status_family["imported"]} - {None}
         for base in (self.data_root / "raw", self.data_root / "raw" / "_excluded"):
             if base.is_dir():
                 names.update(p.name for p in base.iterdir() if p.is_dir() and not p.name.startswith(("_", ".")))
@@ -2361,14 +2413,14 @@ class MainWindow(QtWidgets.QMainWindow):
                                (True, self.data_root / "raw" / "_excluded" / route)):
             if base.is_dir():
                 recs.extend(dict(recording_info(p), excluded=excluded) for p in base.iterdir() if is_recording(p))
-        status = course_status(self.status_all, route)
+        status = course_status(self.status_family, route)
         have = {r["name"] for r in recs}
         # parsed before this data folder held its bag (or the bag was deleted): still listed
-        recs.extend(dict(dataset_only_info(self.dataset, name), excluded=False)
+        recs.extend(dict(dataset_only_info(self.vol_of(name), name), excluded=False)
                     for name in status["imported"] if name not in have)
         recs.sort(key=lambda r: route_key(r["name"]))
         for r in recs:
-            r["stats"] = (log_time(self.dataset, r["name"], status["logs"].get(r["name"], 0))
+            r["stats"] = (log_time(self.vol_of(r["name"]), r["name"], status["logs"].get(r["name"], 0))
                           if r["name"] in status["imported"] else None)
         return recs, status
 
@@ -2383,11 +2435,37 @@ class MainWindow(QtWidgets.QMainWindow):
         if offline:
             return "connect", f"SSD 연결 필요 · {offline}개"
         if status["logs"]:
-            stamp = dataset_stamp(self.dataset)
+            stamp = self._stamp_all()
             if stamp and self.validated.get(DATASET) == stamp:
                 return "done", "모두 완료"
             return "validate", "검증 대기"
         return "import", "녹화 가져오기"
+
+    def _stamp_all(self) -> tuple:
+        """Validation evidence of every volume (see dataset_stamp)."""
+        return tuple((d.name, dataset_stamp(d)) for d in self.volume_dirs() if (d / VERSION).is_dir())
+
+    def _fill_volume_picker(self):
+        """The curation page's volume picker: shown once the set has a second volume."""
+        vols = self.volume_dirs() if self.data_root else []
+        self.vol_picker.blockSignals(True)
+        self.vol_picker.clear()
+        for d in vols:
+            st = self.vol_status.get(d) or {}
+            self.vol_picker.addItem(f"{d.name} · 씬 {st.get('scenes', 0):,}개", d.name)
+        if vols:
+            self.vol_picker.setCurrentIndex(vols.index(self.dataset))
+        self.vol_picker.blockSignals(False)
+        self.vol_picker.setVisible(len(vols) > 1)
+        self.vol_picker.setEnabled(self.job is None)
+
+    def _pick_volume(self, index):
+        name = self.vol_picker.itemData(index)
+        if self.job or not name or name == self.dataset.name:
+            return
+        SETTINGS.setValue("volume", name)
+        self._stop_viewer()                      # it serves the volume it was started on
+        self.refresh()
 
     def _needs_parse(self, name, status) -> bool:
         """Not yet in the standard set, or not yet in the full set (one read fills both)."""
@@ -2404,9 +2482,23 @@ class MainWindow(QtWidgets.QMainWindow):
         self.route_list.clear()
         self._route_cache = {}
         try:
-            self.status_all = parsed_status(self.dataset) if self.data_root else parsed_status(Path("/nonexistent"))
-            self.full_status = parsed_status(self.full_dataset) if self.data_root else parsed_status(Path("/nonexistent"))
-            self.cdata = curation_data(self.dataset) if self.data_root else curation_data(Path("/nonexistent"))
+            if self.data_root:
+                before = len(self._vols or [])
+                vols = self.volume_dirs(fresh=True)
+                if before and len(vols) > before:            # a parse moved on to a new volume: curate that one
+                    SETTINGS.setValue("volume", vols[-1].name)
+                self.vol_status = {d: parsed_status(d) for d in vols}
+                self.status_family = merge_status(list(self.vol_status.values()))
+                self.log_vol = {lg: d for d, st in self.vol_status.items() for lg in st["imported"]}
+                self.status_all = self.vol_status[self.dataset]
+                self.full_status = merge_status([parsed_status(self.full_of(d)) for d in vols])
+                self.cdata = curation_data(self.dataset)
+                self.vol_cdata = {d: (self.cdata if d == self.dataset else curation_data(d)) for d in vols}
+            else:
+                self._vols, self.log_vol, self.vol_status, self.vol_cdata = None, {}, {}, {}
+                self.status_all = self.status_family = self.full_status = parsed_status(Path("/nonexistent"))
+                self.cdata = curation_data(Path("/nonexistent"))
+            self._fill_volume_picker()
             if self.data_root and DATASET not in self.validated:
                 saved = load_validation(self.data_root)     # a check from an earlier run
                 if saved:
@@ -2513,13 +2605,15 @@ class MainWindow(QtWidgets.QMainWindow):
         self.full_card.setVisible(show)
         if not show:
             return
-        fs, ss = self.full_status, self.status_all
+        fs, ss = self.full_status, self.status_family
         cal = full_calibration(self.full_dataset)
         missing = sorted(ss["imported"] - fs["imported"])
         if not fs["imported"]:
             lines = ["아직 없습니다. 파싱하면 기본 세트와 함께 만들어집니다 (bag은 한 번만 읽음)."]
         else:
-            lines = [f"parsed/{FULL_DATASET} · 씬 {fs['scenes']:,}개 · 녹화 {len(fs['logs'])}개"]
+            nv = len(self.volume_dirs())
+            lines = [f"parsed/{FULL_DATASET}" + (f" (볼륨 {nv}개)" if nv > 1 else "")
+                     + f" · 씬 {fs['scenes']:,}개 · 녹화 {len(fs['logs'])}개"]
             if missing:
                 lines.append(f"기본 세트에만 있는 녹화 {len(missing)}개")
             elif fs["scenes"] != ss["scenes"]:
@@ -2559,9 +2653,11 @@ class MainWindow(QtWidgets.QMainWindow):
                 + (f"\n\n지금 들어 있는 {cal}을 바꿉니다." if cal else ""))
         if not self._confirm("full 세트에 캘리브레이션 넣기", text, "캘리브레이션 넣기"):
             return
-        tool = lambda *a: self._py("scripts/apply_calibration.py", "--calib", src, "--dataroot", self.full_dataset, *a)
-        self.run("full 세트 캘리브레이션", [("proc", "캘리브레이션 파일 확인 (아직 바꾸지 않음)", tool("--dry-run")),
-                                          ("proc", "calibrated_sensor에 쓰고 calibration/ 복사", tool())], kind="calib")
+        fulls = [f for f in map(self.full_of, self.volume_dirs()) if (f / VERSION).is_dir()]
+        tool = lambda f, *a: self._py("scripts/apply_calibration.py", "--calib", src, "--dataroot", f, *a)
+        steps = [("proc", "캘리브레이션 파일 확인 (아직 바꾸지 않음)", tool(fulls[0], "--dry-run"))] if fulls else []
+        steps += [("proc", f"calibrated_sensor에 쓰고 calibration/ 복사 · {f.name}", tool(f)) for f in fulls]
+        self.run("full 세트 캘리브레이션", steps, kind="calib")
 
     def _mirror_step(self):
         """The full set takes the standard set's curation (same scenes deleted and locked), when it exists."""
@@ -2573,7 +2669,10 @@ class MainWindow(QtWidgets.QMainWindow):
     def _sync_full(self):
         if self.job or not self.data_root:
             return
-        self.run("full 세트에 큐레이션 반영", self._mirror_step(), kind="mirror")
+        steps = [("proc", f"full 세트에 같은 큐레이션 반영: 같은 씬 삭제 · 잠금, 점검 ({self.full_of(d).name})",
+                  self._py("curation/mirror_full.py", "--standard", d, "--full", self.full_of(d)))
+                 for d in self.volume_dirs() if (self.full_of(d) / VERSION).is_dir()]
+        self.run("full 세트에 큐레이션 반영", steps, kind="mirror")
 
     def _set_mode(self, mode):
         if self.job or mode == self.mode:
@@ -3206,6 +3305,8 @@ class MainWindow(QtWidgets.QMainWindow):
     def _poll_curation(self):
         """Confirmations made in a review (in this window or a browser) show on the curation page as they happen;
         while the review fills the window only the 최종 삭제 count follows (a light read, playback stays smooth)."""
+        if not self.job and self._viewer_stale():       # the tables changed behind the review server's back
+            self._restart_viewer()
         if self.mode != "curation" or self.job or not self.data_root:
             return
         sig = self._curation_signature()
@@ -3244,11 +3345,35 @@ class MainWindow(QtWidgets.QMainWindow):
         proc.readyReadStandardOutput.connect(self._viewer_output)
         proc.finished.connect(self._viewer_finished)
         self.viewer = proc
+        self._viewer_stamp = dataset_stamp(self.dataset)     # the tables it reads now (see _viewer_stale)
         wait = max(10, round(self.status_all["scenes"] * 0.23 / 10) * 10)     # 334 scenes: 76 s from the /data HDD
         self.review_status.setText(f"검토 화면을 준비하는 중… 데이터셋 표를 읽습니다 (씬 {self.status_all['scenes']}개, "
                                    f"약 {wait}초). 한 번 띄우면 데이터셋이 바뀔 때까지 그대로 씁니다.")
         proc.start(sys.executable, ["-u", str(CURATION / "sample_viewer.py"), "--dataroot", str(self.dataset),
                                     "--port", str(port), "--no-browser", "--fill"])    # the cache fills while idle
+
+    def _viewer_stale(self, settled=True) -> bool:
+        """The review server reads the tables once, when it starts. A parse or a deletion run outside this app (a
+        batch script, another session) changes them without it knowing, and the review then lists the scenes of
+        before (2026-10-12: 314 of 602 scenes shown for a day). settled: not while a conversion holds the dataset's
+        lock or the tables changed in the last minute (a batch rewrites them after every recording)."""
+        if self.viewer is None or not self.data_root:
+            return False
+        stamp = dataset_stamp(self.dataset)
+        if not stamp or stamp == getattr(self, "_viewer_stamp", None):
+            return False
+        if settled and ((self.dataset / ".convert.lock").exists() or time.time() - max(x[1] for x in stamp) / 1e9 < 60):
+            return False
+        return True
+
+    def _restart_viewer(self):
+        """Start the review server again on the tables as they are now; an open review loads again once it is up."""
+        self._stop_viewer()
+        if self.reviewing:
+            self._start_viewer()
+            self.review_status.setText("데이터셋이 바뀌어 검토 화면을 다시 불러옵니다 (확정한 것은 저장돼 있습니다)…")
+        else:
+            self._warm_viewer()
 
     def _warm_viewer(self):
         """In curation mode the review server starts in the background, so opening a review is instant."""
@@ -3304,6 +3429,8 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         self._review_logs, self._review_scene = logs, scene
         self.review_title.setText(f"검토 · {scope_name}")
+        if self._viewer_stale(settled=False):     # opened by hand: never the scenes of before
+            self._stop_viewer()
         self._start_viewer()
         if self.web is None:
             if self._viewer_ready:
@@ -3364,8 +3491,11 @@ class MainWindow(QtWidgets.QMainWindow):
                 elif self.status["error"]:
                     state, color = "데이터셋 확인 필요", C["warn"]
                 elif rec["name"] in self.status["logs"]:
-                    st_text, _ = stage_text(self.cdata, rec["name"], self.status_all["names_by_log"].get(rec["name"], []))
-                    state, color = f"데이터셋에 포함 ({self.status['logs'][rec['name']]}씬) · {st_text}", C["ok"]
+                    vol = self.vol_of(rec["name"])
+                    st_text, _ = stage_text(self.vol_cdata.get(vol, self.cdata), rec["name"],
+                                            self.vol_status.get(vol, self.status_all)["names_by_log"].get(rec["name"], []))
+                    where = f" · {vol.name}" if len(self.volume_dirs()) > 1 else ""
+                    state, color = f"데이터셋에 포함 ({self.status['logs'][rec['name']]}씬){where} · {st_text}", C["ok"]
                     if self.full_status["imported"] and rec["name"] not in self.full_status["imported"]:
                         state, color = state + " · full 세트에 없음", C["accent"]
                 elif rec["name"] in self.status["imported"]:
@@ -3448,12 +3578,12 @@ class MainWindow(QtWidgets.QMainWindow):
         pending = sum(not r["excluded"] and r["raw"] and not r["stats"] for r in all_recs)
         if pending:
             notes.append(f"파싱 대기 {pending}개는 빼고 셌습니다")
-        every = [s for s in (log_time(self.dataset, n, self.status_all["logs"].get(n, 0))
-                             for n in self.status_all["imported"]) if s]
+        every = [s for s in (log_time(self.vol_of(n), n, self.status_family["logs"].get(n, 0))
+                             for n in self.status_family["imported"]) if s]
         if len(every) > len(parsed):
             o, u = sum(s["orig_s"] for s in every), sum(s["used_s"] for s in every)
             notes.append(f"데이터셋 전체 {len(every)}개 녹화: 원본 {o / 60:.1f}분 중 {u / 60:.1f}분 "
-                         f"({100 * u / o:.1f}%), 씬 {self.status_all['scenes']:,}개")
+                         f"({100 * u / o:.1f}%), 씬 {self.status_family['scenes']:,}개")
         self.stats_note.setText("\n".join(notes))
 
     def _show_next_action(self):
@@ -3560,7 +3690,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self.validated.pop(DATASET, None)
         if kind in DATASET_WRITERS:
             self._stop_viewer()             # it serves the tables it read at start; restarted on the next review
-        self._validation_stamp = dataset_stamp(self.dataset) if kind == "validate" else ()
+        self._validation_stamp = self._stamp_all() if kind == "validate" else ()
         self._last_log = job.log_path
         job.progress.connect(self._on_progress)
         job.output.connect(self.log_view.appendPlainText)
@@ -3595,7 +3725,7 @@ class MainWindow(QtWidgets.QMainWindow):
     def _on_finished(self, ok, message):
         job = self.job
         if ok and self._job_kind == "validate":
-            stamp = dataset_stamp(self.dataset)
+            stamp = self._stamp_all()
             if stamp and stamp == self._validation_stamp:
                 self.validated[DATASET] = stamp
                 save_validation(self.data_root, stamp, job.log_path)
@@ -3662,7 +3792,7 @@ class MainWindow(QtWidgets.QMainWindow):
     def _import(self, _checked=False, source=None):
         if self.job or not self.data_root:
             return
-        dialog = ImportDialog(self, self.data_root, self.route_dirs(), set(self.status_all["imported"]), source=source)
+        dialog = ImportDialog(self, self.data_root, self.route_dirs(), set(self.status_family["imported"]), source=source)
         if (dialog.exec() if hasattr(dialog, "exec") else dialog.exec_()) != QtWidgets.QDialog.DialogCode.Accepted:
             return
         steps, copies = [], 0
@@ -3710,7 +3840,9 @@ class MainWindow(QtWidgets.QMainWindow):
     def _start_parse(self, todo: list[dict], title: str, route):
         """Parse these recordings in one converter run (one read of each bag for both sets), after making room."""
         # One read of each bag writes both sets; a bag already in one of them goes into the other only.
-        args = [r["path"] for r in todo] + ["--out", self.dataset, "--full-out", self.full_dataset,
+        # --out / --full-out name the first volumes: the converter writes into the newest one and, when the
+        # official scene names run out, moves on to the next (tcar_nuscenes_2, ...; volumes.py)
+        args = [r["path"] for r in todo] + ["--out", self.base_dataset, "--full-out", self.base_full,
                                             "--standard-copies", "--split", "train", "--no-validate"]
         steps = []
         # both sets of a bag take ~1.2x its size (full ~0.8x, the standard copies ~0.4x)
@@ -3776,7 +3908,7 @@ class MainWindow(QtWidgets.QMainWindow):
         dialog.exec() if hasattr(dialog, "exec") else dialog.exec_()
 
     def _validate(self):
-        if self.job or not self.data_root or not self.status_all["logs"] and not self.status_all["error"]:
+        if self.job or not self.data_root or not self.status_family["logs"] and not self.status_family["error"]:
             return
         # The existing helper skips missing devkit; require it here so a skip is
         # never presented to an operator as a successful validation.
@@ -3785,7 +3917,8 @@ class MainWindow(QtWidgets.QMainWindow):
                 f"sys.path.insert(0, {str(HERE)!r}); "
                 "from nuscenes_writer import validate_with_devkit; "
                 f"validate_with_devkit(Path(sys.argv[1]), {VERSION!r})")
-        self.run("데이터셋 검증", [("proc", "nuScenes 데이터셋 로드 확인", [sys.executable, "-u", "-c", code, str(self.dataset)])],
+        self.run("데이터셋 검증", [("proc", f"nuScenes 데이터셋 로드 확인 · {d.name}", [sys.executable, "-u", "-c", code, str(d)])
+                                  for d in self.volume_dirs() if (d / VERSION).is_dir()],
                  kind="validate", route=self.current_route())
 
     def _exclude(self):
@@ -3809,7 +3942,7 @@ class MainWindow(QtWidgets.QMainWindow):
             if included:
                 if not self._confirm("녹화 복원", "남아 있는 데이터셋 항목을 제거한 뒤 녹화를 복원합니다.\n복원 후 다시 파싱하면 데이터셋에 포함됩니다.", "녹화 복원"):
                     return
-                steps.append(("proc", "남아 있는 데이터셋 항목 제거", self._py("remove_log.py", self.dataset, rec["name"])))
+                steps.append(("proc", "남아 있는 데이터셋 항목 제거", self._py("remove_log.py", self.vol_of(rec["name"]), rec["name"])))
             steps += [("move", f"사용할 녹화로 복원 · {src.name}", str(src), str(dst)) for src, dst in moves]
         else:
             message = f"{rec['name']}\n\nbag 사본과 기록 파일을 raw/_excluded/{route}/로 옮깁니다. 외부 원본은 변경하지 않습니다."
@@ -3823,7 +3956,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 return
             title = f"{rec['name']} 제외"
             if included:
-                steps.append(("proc", "데이터셋에서 녹화 제거", self._py("remove_log.py", self.dataset, rec["name"])))
+                steps.append(("proc", "데이터셋에서 녹화 제거", self._py("remove_log.py", self.vol_of(rec["name"]), rec["name"])))
             steps += [("move", f"제외 폴더로 이동 · {src.name}", str(src), str(dst)) for src, dst in moves]
         self.run(title, steps, kind="restore" if rec["excluded"] else "exclude", route=route)
 

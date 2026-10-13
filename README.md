@@ -268,6 +268,10 @@ dataset (a recording's row names its volume); the curation page gets a volume pi
 again in each volume: rules, review, 최종 확정 and its undo work on the picked volume and its full twin. 검증하기,
 캘리브레이션 넣기 and "기본 세트 큐레이션 반영" cover every volume.
 
+**Bag timeline.** "bag 타임라인" under the recordings opens the selected recording's bag in
+`scripts/bag_timeline.py` (its own window): per topic, where its header stamps are and where messages are
+missing. Without a selection it asks for a bag file.
+
 **One read, both sets.** "파싱하기" runs `bag2nuscenes.py --full-out --standard-copies`: every
 new bag goes into `parsed/tcar_nuscenes` and `parsed/tcar_nuscenes_full` from one read, each set
 with its own files (no hard links between them).

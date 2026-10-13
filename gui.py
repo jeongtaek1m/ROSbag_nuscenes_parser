@@ -2057,8 +2057,12 @@ class MainWindow(QtWidgets.QMainWindow):
         footer = QtWidgets.QHBoxLayout()
         self.selection_hint = label("", "faint", True)
         footer.addWidget(self.selection_hint, 1)
+        self.timeline_btn = button("bag 타임라인", self._open_timeline, "quiet")
+        self.timeline_btn.setToolTip("고른 녹화의 bag을 타임라인 창으로 엽니다: 토픽마다 header stamp가 언제 있는지, 빠진 구간은 빨강 "
+                                     "(scripts/bag_timeline.py). 녹화를 고르지 않으면 bag 파일을 고르는 창이 뜹니다")
         self.open_btn = button("폴더 열기", self._open_folder, "quiet")
         self.excl_btn = button("녹화 제외…", self._exclude, "danger")
+        footer.addWidget(self.timeline_btn)
         footer.addWidget(self.open_btn)
         footer.addWidget(self.excl_btn)
         layout.addLayout(footer)
@@ -3666,7 +3670,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.selection_hint.setText("복원한 뒤 파싱하면 데이터셋에 다시 들어갑니다." if restore else
                                     "제외하면 데이터셋에서도 빠집니다. 실행 전에 한 번 더 묻습니다." if raw else
                                     "원본 bag이 데이터 폴더에 없는 녹화입니다. 원본을 가져오면 제외·복원할 수 있습니다." if rec else
-                                    "녹화를 선택하면 폴더 열기와 제외를 할 수 있습니다.")
+                                    "녹화를 선택하면 폴더 열기와 제외를 할 수 있습니다. bag 타임라인은 고른 녹화의 bag을 엽니다.")
         self.open_btn.setVisible(raw)
         self.excl_btn.setVisible(raw)
         for b in self.mode_btns.values():
@@ -3976,6 +3980,17 @@ class MainWindow(QtWidgets.QMainWindow):
                 steps.append(("proc", "데이터셋에서 녹화 제거", self._py("remove_log.py", self.vol_of(rec["name"]), rec["name"])))
             steps += [("move", f"제외 폴더로 이동 · {src.name}", str(src), str(dst)) for src, dst in moves]
         self.run(title, steps, kind="restore" if rec["excluded"] else "exclude", route=route)
+
+    def _open_timeline(self):
+        """The selected recording's bag in the timeline viewer (its own window and process); no selection: its dialog."""
+        rec = self.selected_rec()
+        bag = Path(rec["path"]) if rec and rec["path"] else None
+        if bag is not None and not bag.exists():
+            return self._message("bag을 열 수 없습니다", f"{bag}\n\n파일이 없습니다. bag이 있는 SSD가 연결돼 있는지 확인하세요.")
+        args = ["-u", str(HERE / "scripts" / "bag_timeline.py")] + ([str(bag.resolve())] if bag else [])
+        ok = QtCore.QProcess.startDetached(sys.executable, args)
+        if not (ok[0] if isinstance(ok, tuple) else ok):
+            self._message("타임라인을 열 수 없습니다", "scripts/bag_timeline.py를 실행하지 못했습니다.")
 
     def _open_folder(self):
         rec = self.selected_rec()

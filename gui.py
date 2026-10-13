@@ -2435,11 +2435,27 @@ class MainWindow(QtWidgets.QMainWindow):
         if offline:
             return "connect", f"SSD 연결 필요 · {offline}개"
         if status["logs"]:
+            # A course whose scenes are all locked went through 최종 확정's checks (references, key-frame files,
+            # devkit, CAN bus): it is done, whatever was parsed into the dataset afterwards.
+            if self._all_locked(status["logs"]):
+                return "done", "모두 완료 · 잠김"
             stamp = self._stamp_all()
             if stamp and self.validated.get(DATASET) == stamp:
                 return "done", "모두 완료"
             return "validate", "검증 대기"
         return "import", "녹화 가져오기"
+
+    def _all_locked(self, recordings) -> bool:
+        """Every scene of these recordings is locked by a 최종 확정 (in the volume it lives in)."""
+        seen = False
+        for rec in recordings:
+            vol = self.vol_of(rec)
+            names = (self.vol_status.get(vol) or {}).get("names_by_log", {}).get(rec, [])
+            locked = (self.vol_cdata.get(vol) or {}).get("locked", ())
+            if any(n not in locked for n in names):
+                return False
+            seen = seen or bool(names)
+        return seen
 
     def _stamp_all(self) -> tuple:
         """Validation evidence of every volume (see dataset_stamp)."""
@@ -3085,7 +3101,8 @@ class MainWindow(QtWidgets.QMainWindow):
         steps = ([("proc", "미리 검사: 표에만 삭제를 적용해 모든 참조와 devkit 불러오기 확인 (문제가 있으면 여기서 멈춤)",
                    tool("--simulate"))] if k else [])
         steps += [("proc", "버리기 확정 씬 옮기고 남은 씬 잠그기", tool("--finalize", "--no-precheck"))]
-        steps += ([("proc", "삭제 후 점검: 표 참조 · key frame 파일 · devkit · CAN bus", tool("--check"))] if k else [])
+        # always checked, deletions or not: a locked scene is a validated one (the parser page counts on it)
+        steps += [("proc", ("삭제 후 점검" if k else "잠근 뒤 점검") + ": 표 참조 · key frame 파일 · devkit · CAN bus", tool("--check"))]
         steps += self._mirror_step()
         steps += [("proc", "필터 다시 실행 (잠긴 씬 제외)", self._py("curation/curate.py", "--dataroot", self.dataset))]
         self.run(f"최종 확정 · 버리기 {k}개 삭제, 새 씬 {new}개 잠금", steps, kind="apply")

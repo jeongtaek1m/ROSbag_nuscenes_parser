@@ -78,6 +78,7 @@ from nuscenes_writer import (
     coverage_window,
     format_coverage,
     format_plan,
+    free_scene_names,
     load_existing_tables,
     merge_tables,
     new_token,
@@ -91,6 +92,7 @@ from nuscenes_writer import (
 )
 from rectify import Rectifier
 import tcar_calib
+import volumes
 
 _HERE = Path(__file__).parent
 sys.path.insert(0, str(_HERE / "packet_decoder" / "scripts"))
@@ -140,9 +142,10 @@ FULL = Profile(
 
 
 
-@dataclass(frozen=True)
+@dataclass(eq=False)
 class Output:
-    """One dataset a conversion writes: what it carries, and where."""
+    """One dataset a conversion writes: what it carries, and where. `root` moves on to the next volume
+    (volumes.py) when the set's official scene names run out."""
     profile: Profile
     root: Path
 
@@ -1046,8 +1049,31 @@ def run(profile: Profile, doc: str, argv: list[str] | None = None) -> None:
     bags = _expand_bags(args.bags)
     if not bags:
         raise SystemExit("no .bag files to convert")
+    # New recordings go into the newest volume of each set (tcar_nuscenes_2, ...: volumes.py); the sets'
+    # volumes are twins, so they must stand at the same one.
+    at = {volumes.index_of(volumes.newest(o.root)) for o in outputs}
+    if len(at) > 1:
+        raise SystemExit("the sets are at different volumes ("
+                         + ", ".join(str(volumes.newest(o.root)) for o in outputs)
+                         + "): volume N of the one is the twin of volume N of the other")
+    for o in outputs:
+        if volumes.newest(o.root) != o.root:
+            print(f"  {o.root.name}: new recordings go into its newest volume {volumes.newest(o.root).name}")
+            o.root = volumes.newest(o.root)
     what = f"converting {', '.join(map(str, args.bags))}"
     locks: list[Path] = []
+
+    def roll(o: Output) -> None:
+        """Move an output on to a new, empty volume (the full set's calibration goes along)."""
+        new = volumes.next_volume(o.root)
+        if (new / args.version / "scene.json").exists():
+            raise SystemExit(f"{new} already holds a dataset")
+        new.mkdir(parents=True, exist_ok=True)
+        locks.append(_lock(new, what))
+        cal = o.root / tcar_calib.DIRNAME
+        if cal.is_dir() and not (new / tcar_calib.DIRNAME).exists():
+            shutil.copytree(cal, new / tcar_calib.DIRNAME)
+        o.root = new
     try:
         for o in outputs:
             locks.append(_lock(o.root, what))
@@ -1062,7 +1088,8 @@ def run(profile: Profile, doc: str, argv: list[str] | None = None) -> None:
         for i, bag in enumerate(bags, 1):
             if len(bags) > 1:
                 print(f"\n{'=' * 78}\n[{i}/{len(bags)}] {bag}")
-            todo = [o for o in outputs if bag.stem not in _imported_logs(o.root / args.version)]
+            todo = [o for o in outputs
+                    if not any(bag.stem in _imported_logs(v / args.version) for v in volumes.volumes(o.root))]
             if not todo:
                 print(f"  already imported (log '{bag.stem}') — skipped")
                 results.append((bag, "skipped", "already imported"))
@@ -1070,6 +1097,8 @@ def run(profile: Profile, doc: str, argv: list[str] | None = None) -> None:
             if len(todo) < len(outputs):
                 print(f"  already in the {', '.join(o.profile.name for o in outputs if o not in todo)} "
                       f"set — converting into the {', '.join(o.profile.name for o in todo)} set only")
+            # a recording that goes into one set only cannot move that set on alone (the volumes are twins)
+            args.roll = roll if len(todo) == len(outputs) else None
             try:
                 names = _convert(todo, args, bag)
             except (Exception, SystemExit) as exc:
@@ -1209,7 +1238,20 @@ def _convert(outputs: list[Output], args: argparse.Namespace, bag: Path) -> dict
         if not cut:
             raise SystemExit(f"no unbroken run of {args.scene_dur:g} s — no scenes")
         # Names continue each set's own list; sets kept in step (same scenes,
-        # same curation) give the same names.
+        # same curation) give the same names. When a set has too few official names left, this
+        # recording and the ones after it go into the next volume — every set together (twins).
+        room = {o.root: len(free_scene_names(args.split, {s["name"] for s in (existing[o.root] or {})
+                                                          .get("scene.json", [])})) for o in outputs}
+        roll = getattr(args, "roll", None)
+        if roll is not None and min(room.values()) < len(cut):
+            short = ", ".join(f"{o.root.name} has {room[o.root]}" for o in outputs)
+            for o in outputs:
+                existing.pop(o.root)
+                roll(o)
+                existing[o.root] = load_existing_tables(o.root / args.version)
+            print(f"  [!] the official '{args.split}' scene names ran out ({short}; {len(cut)} needed): "
+                  f"this recording and the following go into "
+                  f"{' + '.join(o.root.name for o in outputs)}")
         for o in outputs:
             used = {s["name"] for s in (existing[o.root] or {}).get("scene.json", [])}
             new_names[o.root] = official_scene_names(args.split, used, len(cut))

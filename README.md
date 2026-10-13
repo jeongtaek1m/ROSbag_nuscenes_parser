@@ -129,6 +129,16 @@ Put every scene of a bag in one split. Scene numbers the CAN bus API refuses
 scenes** (3.8 h and 50 min at 20 s). `scene.description` names the source bag
 and the offset into it.
 
+**Volumes.** When a set has too few official names left for a recording's scenes, that
+recording and the ones after it go into the next volume: `tcar_nuscenes_2`,
+`tcar_nuscenes_3`, ... next to the first (`volumes.py`). A volume is a complete
+dataroot of its own, with scene names starting again at `scene-0001`; recording
+names are unique across volumes (a bag already in any volume is skipped), and a
+recording never spans two. The converter always writes into the newest volume and
+moves on without reading the bag again; with `--full-out` both sets move on
+together (volume N of the standard set is the twin of volume N of the full set), and
+the full set's `calibration/` is copied into its new volume.
+
 ### Cameras are rectified
 
 NuScenes stores a 3×3 `camera_intrinsic` and no distortion, so every consumer

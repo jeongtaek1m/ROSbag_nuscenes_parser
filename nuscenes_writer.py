@@ -313,6 +313,15 @@ def partition_scenes(segments: list[np.ndarray], frames_per_scene: int
     return scenes, stats
 
 
+def free_scene_names(split: str, used: set[str]) -> list[str]:
+    """The official names of `split` a dataset has not used yet (the CAN bus API's refused numbers left out)."""
+    from nuscenes.utils.splits import create_splits_scenes  # local: optional dep elsewhere
+    if split not in ("train", "val"):
+        raise ValueError(f"split must be 'train' or 'val', not {split!r}")
+    return [s for s in sorted(create_splits_scenes()[split])
+            if s not in used and int(s[-4:]) not in CAN_BUS_BLACKLIST]
+
+
 def official_scene_names(split: str, used: set[str], n: int) -> list[str]:
     """The next n unused names from the official nuScenes list for `split`.
 
@@ -322,11 +331,7 @@ def official_scene_names(split: str, used: set[str], n: int) -> list[str]:
     in the intended split without modification. Numbers the CAN bus API
     refuses are skipped. The lists hold 700 train and 150 val names.
     """
-    from nuscenes.utils.splits import create_splits_scenes  # local: optional dep elsewhere
-    if split not in ("train", "val"):
-        raise ValueError(f"split must be 'train' or 'val', not {split!r}")
-    names = sorted(create_splits_scenes()[split])
-    free = [s for s in names if s not in used and int(s[-4:]) not in CAN_BUS_BLACKLIST]
+    free = free_scene_names(split, used)
     if len(free) < n:
         raise SystemExit(f"the official '{split}' list has {len(free)} unused scene "
                          f"names left, {n} needed — the dataset is full for this split")

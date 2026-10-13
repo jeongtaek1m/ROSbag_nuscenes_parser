@@ -256,6 +256,34 @@ def load_cache(path: str) -> dict | None:
 
 
 # ------------------------------------------------------------------ per-topic rows
+GROUPS = ("카메라 영상", "LiDAR 포인트", "레이더", "GNSS · INS", "CAN", "카메라 정보 · LiDAR 상태", "그 밖")
+
+
+def sensor_group(topic: str, msgtype: str) -> int:
+    """Which sensor a topic belongs to (index into GROUPS): the cameras' images and the LiDARs' points first."""
+    t, ty = topic.lower(), msgtype.lower()
+    if "camera_info" in t or ty.endswith("camerainfo") or ("lidar" in t and "status" in t):
+        return 5
+    if ty.endswith(("compressedimage", "/image")) or ("camera" in t and "image" in ty):
+        return 0
+    if ty.endswith("pointcloud2") and "radar" not in t or "lidar" in t or "velodyne" in t or "ouster" in t:
+        return 1
+    if "radar" in t:
+        return 2
+    if any(k in t for k in ("novatel", "gnss", "gps", "/ins", "imu")):
+        return 3
+    if "can" in t.replace("scan", ""):
+        return 4
+    return 6
+
+
+def natural(topic: str) -> tuple:
+    """camera_2 before camera_10; the top LiDAR (middle / top) before the others."""
+    import re
+    lead = 0 if any(k in topic for k in ("middle", "top")) else 1
+    return (lead, [int(x) if x.isdigit() else x for x in re.split(r"(\d+)", topic)])
+
+
 def make_row(name: str, t: dict, use_header: bool) -> dict:
     """What a row draws and says: its times on the chosen axis, rate, gaps, and how the stamps relate to the bag."""
     bag, hdr = t["bag"], t["hdr"]
@@ -278,6 +306,7 @@ def make_row(name: str, t: dict, use_header: bool) -> dict:
         note = "header 없음"
     n = len(times)
     row = {"topic": name, "type": t["type"], "times": times, "axis": axis, "n": n, "note": note, "lat": lat,
+           "group": sensor_group(name, t["type"]),
            "hz": 0.0, "period": 0.0, "max_gap": 0.0, "gap_a": np.zeros(0, np.int64), "gap_b": np.zeros(0, np.int64),
            "regular": False}
     if n >= 2:
@@ -358,8 +387,8 @@ def gui(path: str | None) -> None:
             self.setMinimumSize(900, 300)
             self.setFocusPolicy(Qt.FocusPolicy.StrongFocus if hasattr(Qt, "FocusPolicy") else Qt.StrongFocus)
 
-        def set_rows(self, rows, keep_view=False):
-            self.rows = rows
+        def set_rows(self, rows, keep_view=False, grouped=False):
+            self.rows, self.grouped = rows, grouped
             ts = [r["times"] for r in rows if r["n"]]
             if ts:
                 # the common span: rows whose stamps are far off the rest (another clock) do not stretch it
@@ -376,6 +405,17 @@ def gui(path: str | None) -> None:
             self._filter = text
             words = text.lower().split()
             self.shown = [r for r in self.rows if all(w in (r["topic"] + " " + r["type"]).lower() for w in words)]
+            if getattr(self, "grouped", False):             # a title line before every sensor's topics
+                out, last = [], None
+                for r in self.shown:
+                    if r["group"] != last:
+                        last = r["group"]
+                        k = sum(x["group"] == last for x in self.shown)
+                        out.append({"title": f"{GROUPS[last]}  ·  토픽 {k}개", "topic": GROUPS[last], "type": "", "n": 0,
+                                    "times": np.zeros(0, np.int64), "gap_a": np.zeros(0, np.int64), "lat": None,
+                                    "max_gap": 0.0, "group": last})
+                    out.append(r)
+                self.shown = out
             self.scroll = min(self.scroll, max(0, len(self.shown) * ROW - (self.height() - TOP)))
             self.update()
 
@@ -408,6 +448,9 @@ def gui(path: str | None) -> None:
             for k in range(n_vis):
                 r = self.shown[first + k]
                 y = k * ROW
+                if "title" in r:
+                    img[y:y + ROW] = (0x23, 0x28, 0x31)
+                    continue
                 if (first + k) % 2:
                     img[y:y + ROW] = (0x19, 0x1c, 0x21)
                 if not r["n"]:
@@ -438,10 +481,15 @@ def gui(path: str | None) -> None:
             for k in range(n_vis):
                 r = self.shown[first + k]
                 y = TOP + k * ROW - self.scroll % ROW
+                if "title" in r:
+                    p.fillRect(0, y, LABEL, ROW, QtGui.QColor("#232831"))
+                    p.setPen(QtGui.QColor("#e6b450"))
+                    p.drawText(10, y + 15, r["title"])
+                    continue
                 if (first + k) % 2:
                     p.fillRect(0, y, LABEL, ROW, QtGui.QColor(C["row"]))
                 p.setPen(QtGui.QColor(C["text"]))
-                p.drawText(10, y + 15, fm.elidedText(r["topic"], el, 290))
+                p.drawText(10 + (12 if self.grouped else 0), y + 15, fm.elidedText(r["topic"], el, 290 - (12 if self.grouped else 0)))
                 p.setPen(QtGui.QColor(C["sub"]))
                 p.drawText(QtCore.QRect(COLS[0], y, COLW[0], ROW), ar, f"{r['n']:,}")
                 p.drawText(QtCore.QRect(COLS[1], y, COLW[1], ROW), ar, f"{r['hz']:.1f} Hz" if r["hz"] else "")
@@ -488,7 +536,7 @@ def gui(path: str | None) -> None:
             if x >= LABEL:
                 t = self.t_of(x)
                 text = f"{dt.datetime.fromtimestamp(t / 1e9, KST):%H:%M:%S.%f}"[:-3] + f"  (+{(t - self.lo) / 1e9:.3f} s)"
-            if y >= TOP and 0 <= k < len(self.shown):
+            if y >= TOP and 0 <= k < len(self.shown) and "title" not in self.shown[k]:
                 r = self.shown[k]
                 text += f"   {r['topic']}  [{r['type']}]"
                 if x >= LABEL and r["n"]:
@@ -559,7 +607,7 @@ def gui(path: str | None) -> None:
             self.find.textChanged.connect(lambda s: self.tl.filter(s))
             bar.addWidget(self.find)
             self.order = QtWidgets.QComboBox()
-            self.order.addItems(["이름순", "갭 많은 순", "주기 빠른 순"])
+            self.order.addItems(["센서별", "이름순", "갭 많은 순", "빈도 높은 순"])
             self.order.currentIndexChanged.connect(lambda _: self.show_rows(keep=True))
             bar.addWidget(self.order)
             fit = bar.addAction("전체 보기 (F)")
@@ -639,9 +687,11 @@ def gui(path: str | None) -> None:
                 return
             use_header = self.mode.currentIndex() == 0
             rows = [make_row(n, t, use_header) for n, t in self.topics.items()]
-            key = [lambda r: r["topic"], lambda r: (-len(r["gap_a"]), r["topic"]), lambda r: (-r["hz"], r["topic"])][self.order.currentIndex()]
+            mode = self.order.currentIndex()
+            key = [lambda r: (r["group"], natural(r["topic"])), lambda r: natural(r["topic"]),
+                   lambda r: (-len(r["gap_a"]), r["topic"]), lambda r: (-r["hz"], r["topic"])][mode]
             rows.sort(key=key)
-            self.tl.set_rows(rows, keep_view=keep)
+            self.tl.set_rows(rows, keep_view=keep, grouped=mode == 0)
             n = sum(r["n"] for r in rows)
             gaps = sum(len(r["gap_a"]) for r in rows)
             span = (self.tl.hi - self.tl.lo) / 1e9

@@ -445,15 +445,32 @@ def gui(path: str | None) -> None:
             img[:] = (0x14, 0x16, 0x1a)
             edges = self.t0 + (self.t1 - self.t0) * np.arange(w + 1) / w
             px = (self.t1 - self.t0) / w                    # ns per pixel
+            span = (self.t1 - self.t0) / 1e9
+            step = 10 ** np.floor(np.log10(max(span / 8, 1e-6)))
+            step = next(s for s in (step, 2 * step, 5 * step, 10 * step) if span / s <= 10)
+            ticks, tk = [], np.ceil((self.t0 - self.lo) / 1e9 / step) * step
+            while self.lo + tk * 1e9 < self.t1:
+                ticks.append((int(self.x_of(self.lo + tk * 1e9)), tk))
+                tk += step
+            # The grid and the cursor are painted first and the marks over them: a line drawn over the rows hid
+            # the message under it, which read as a missing stamp.
+            lines = [(x - LABEL, (0x3a, 0x40, 0x4c)) for x, _ in ticks]
+            if self.cursor is not None and self.cursor >= LABEL:
+                lines.append((self.cursor - LABEL, (0xe6, 0xb4, 0x50)))
             for k in range(n_vis):
                 r = self.shown[first + k]
                 y = k * ROW
                 if "title" in r:
                     img[y:y + ROW] = (0x23, 0x28, 0x31)
-                    continue
-                if (first + k) % 2:
+                elif (first + k) % 2:
                     img[y:y + ROW] = (0x19, 0x1c, 0x21)
-                if not r["n"]:
+            for x, colour in lines:
+                if 0 <= x < w:
+                    img[:, x] = colour
+            for k in range(n_vis):
+                r = self.shown[first + k]
+                y = k * ROW
+                if "title" in r or not r["n"]:
                     continue
                 t = r["times"]
                 if len(r["gap_a"]):                          # missing data: red from the last message to the next
@@ -501,25 +518,23 @@ def gui(path: str | None) -> None:
                            fm.elidedText(r["note"] or ("기록 시각" if r["axis"] == "bag" else "header"), el, COLW[3]))
             # axis
             p.fillRect(0, 0, W, TOP, QtGui.QColor(C["bg"]))
-            span = (self.t1 - self.t0) / 1e9
-            step = 10 ** np.floor(np.log10(max(span / 8, 1e-6)))
-            step = next(s for s in (step, 2 * step, 5 * step, 10 * step) if span / s <= 10)
             p.setPen(QtGui.QColor(C["sub"]))
             p.drawText(10, 22, "토픽")
             for cx, cw, name in zip(COLS, COLW, ("메시지", "평균 빈도", "갭", "시간축 · 비고")):
                 p.drawText(QtCore.QRect(cx, 4, cw, 24), ar, name)
-            k0 = np.ceil((self.t0 - self.lo) / 1e9 / step)
-            tk = k0 * step
-            while self.lo + tk * 1e9 < self.t1:
-                x = int(self.x_of(self.lo + tk * 1e9))
+            below = TOP + n_vis * ROW - self.scroll % ROW       # under the last row the lines go on (nothing to hide)
+            for x, tk in ticks:
                 p.setPen(QtGui.QColor(C["axis"]))
-                p.drawLine(x, TOP - 6, x, H)
+                p.drawLine(x, TOP - 6, x, TOP - 1)
+                if below < H:
+                    p.drawLine(x, below, x, H)
                 p.setPen(QtGui.QColor(C["sub"]))
                 p.drawText(x + 4, 22, f"{tk:.{max(0, -int(np.floor(np.log10(step))))}f} s")
-                tk += step
             if self.cursor is not None and self.cursor >= LABEL:
                 p.setPen(QtGui.QColor(C["cursor"]))
-                p.drawLine(self.cursor, TOP - 6, self.cursor, H)
+                p.drawLine(self.cursor, TOP - 10, self.cursor, TOP - 1)
+                if below < H:
+                    p.drawLine(self.cursor, below, self.cursor, H)
 
         def _pos(self, e):
             q = e.position() if hasattr(e, "position") else e.pos()

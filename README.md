@@ -623,6 +623,7 @@ are unorganized and devkit consumers do not expect NaN.
 
 | Script | Purpose |
 |---|---|
+| `scripts/bag_timeline.py` | rqt_bag's timeline without ROS: one row per topic, a mark per message on the **header-stamp** axis (or the recording time), red where a regular topic misses messages; per-topic count, rate, gaps and stamp→recording latency. Reads the index and 12 bytes per message (a 34 GB bag: ~20 s the first time, cached after). `--text` prints the table only |
 | `scripts/screen_bags.py` | Per-bag verdict: delivery and gaps per stream, coverage window, INS pose gaps, INS status, scene yield vs `--sync-ms` |
 | `scripts/rebuild_ego_pose.py` | Rewrite an existing dataset's `ego_pose`, CAN bus files and `log.json` frame from INSPVA (for datasets converted before 2026-09-24) |
 | `scripts/clock_diagnosis.py` | Per-sensor clock offset/skew vs the bag clock, anchored to GPS |

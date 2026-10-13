@@ -1,5 +1,11 @@
 # Changelog
 
+## 2026-10-13 — bag 타임라인 (`scripts/bag_timeline.py`)
+
+| 항목 | 내용 |
+|---|---|
+| `scripts/bag_timeline.py` (신규) | ROS 없이 rqt_bag 타임라인: 토픽마다 한 줄, header stamp 축(또는 bag 기록 시각)에 메시지 위치, 주기적인 토픽은 빠진 구간을 빨갛게. 인덱스 + 메시지당 12바이트만 읽음(34 GB bag 약 20초, 이후 `~/.cache/tcar_bagview/`에서 즉시). 휠 확대 · 드래그 이동 · 토픽 거르기 · 정렬, `--text`는 표만 |
+
 ## 2026-10-13 — 볼륨: 공식 씬 이름(train 685개)이 차면 `tcar_nuscenes_2`로
 
 | 항목 | 내용 |

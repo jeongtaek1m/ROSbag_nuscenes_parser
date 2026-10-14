@@ -187,6 +187,40 @@ def camera_instants(cam_ts: dict[str, np.ndarray], channels: list[str], group_ns
     return instants, members
 
 
+def off_grid(ts: np.ndarray, tol: float = 0.2) -> np.ndarray:
+    """Frames of a fixed-rate sensor stamped off its own grid: bool per frame.
+
+    A frame is off when it sits more than tol periods away from the grid of both neighbours while the two
+    neighbours agree with each other (a whole number of periods apart). Seen on H-1 (2026-10-14): after a ~150 ms
+    stall every LiDAR stamped one sweep at +43.011 s instead of +42.863 s (intervals 100, 248, 52 ms), so its points
+    and its stamp do not belong together. A dropped frame, a jittery one (M1: 99.3 / 100.7 ms) or a gap is not off.
+    """
+    t = np.asarray(ts, dtype=np.int64)
+    n = len(t)
+    bad = np.zeros(n, dtype=bool)
+    if n < 3:
+        return bad
+    period = float(np.median(np.diff(t)))
+    if period <= 0:
+        return bad
+
+    def dev(a, b):                                  # how far b - a is from a whole number of periods (in periods)
+        x = (b - a) / period
+        return np.abs(x - np.round(x))
+
+    d_prev = np.full(n, np.inf)
+    d_next = np.full(n, np.inf)
+    d_prev[1:] = dev(t[:-1], t[1:])
+    d_next[:-1] = d_prev[1:]
+    agree = np.zeros(n, dtype=bool)                 # the neighbours on both sides fit each other
+    agree[1:-1] = dev(t[:-2], t[2:]) <= tol
+    bad[1:-1] = (d_prev[1:-1] > tol) & (d_next[1:-1] > tol) & agree[1:-1]
+    # the first and the last frame have one neighbour: off when it does not fit that one and the next pair fits
+    bad[0] = d_next[0] > tol and dev(t[1], t[2]) <= tol
+    bad[-1] = d_prev[-1] > tol and dev(t[-3], t[-2]) <= tol
+    return bad
+
+
 def plan_frames(lidar_ts: np.ndarray, cam_ts: dict[str, np.ndarray], gating: list[str],
                 sync_ns: int, window: dict, group_ns: int, max_gap_ns: int) -> dict:
     """Decide which LiDAR frames the dataset can use, and with which camera set.

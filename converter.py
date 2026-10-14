@@ -83,6 +83,7 @@ from nuscenes_writer import (
     merge_tables,
     new_token,
     official_scene_names,
+    off_grid,
     partition_scenes,
     deskew_points,
     plan_frames,
@@ -1213,6 +1214,20 @@ def _convert(outputs: list[Output], args: argparse.Namespace, bag: Path) -> dict
         if absent:
             print(f"  [!] not in this bag, left out: {absent}")
             channels = [c for c in channels if c not in absent]
+        # a LiDAR frame stamped off its own 10 Hz grid (its stamp does not belong to its points) is left out
+        off = {}
+        for ch in channels:
+            if data.modality.get(ch) == "lidar" and len(data.frames[ch]) >= 3:
+                ts = np.asarray(data.frames[ch], dtype=np.int64)
+                bad = off_grid(ts)
+                if bad.any():
+                    off[ch] = [int(x) for x in ts[bad]]
+                    data.frames[ch] = ts[~bad]
+        for ch, bad_ts in off.items():
+            print(f"  [!] {ch}: {len(bad_ts)} frame(s) off its 10 Hz grid, left out: "
+                  + ", ".join(f"+{(x - data.bag_start_ns) / 1e9:.3f} s" for x in bad_ts[:5])
+                  + (" ..." if len(bad_ts) > 5 else ""))
+        stats["lidar_off_grid"] = off
 
         # ---------------------------------------------------- frame selection
         sync_ns = int(args.sync_ms * 1e6)

@@ -1,5 +1,11 @@
 # Changelog
 
+## 2026-10-14 — 격자에서 벗어난 LiDAR 프레임 버림
+
+| 항목 | 내용 |
+|---|---|
+| 변환기 (`nuscenes_writer.off_grid`) | 10 Hz 격자에서 앞뒤 프레임 모두와 0.2 주기 넘게 어긋난(그런데 앞뒤 프레임끼리는 맞는) LiDAR 프레임은 stamp가 점과 맞지 않으므로 빼고 씀(모든 LiDAR 채널, import 기록 `lidar_off_grid`). H-1: 약 150 ms 멈춤 뒤 다섯 LiDAR 모두 +42.863 s 자리의 스윕을 +43.006~43.011 s로 찍음(간격 100 · 248 · 52 ms). 전에는 248 ms 간격에서 씬이 끊기기만 하고 그 프레임이 다음 씬의 첫 key frame이 됐음 |
+
 ## 2026-10-13 — bag 타임라인 (`scripts/bag_timeline.py`)
 
 | 항목 | 내용 |

@@ -59,6 +59,8 @@ def main() -> None:
         inst_drop = {x["instance_token"] for x in anns if x["sample_token"] in smp} - inst_used
         for d in sds:
             (a.dataroot / d["filename"]).unlink(missing_ok=True)
+            if d["filename"].endswith(".pcd.bin"):     # the full set's per-point times next to a LiDAR frame
+                (a.dataroot / (d["filename"][:-len(".pcd.bin")] + ".time.bin")).unlink(missing_ok=True)
         for s in scenes:
             for f in (a.dataroot / "can_bus").glob(f"{s['name']}_*.json"):
                 f.unlink()

@@ -933,6 +933,10 @@ def _parser(profile: Profile, doc: str) -> argparse.ArgumentParser:
                    help="Threads for rectification and file writes.")
     p.add_argument("--packet-msg-dir", type=Path,
                    default=here / "packet_decoder" / "src" / "rslidar_msg" / "msg")
+    p.add_argument("--volume", type=int, default=0,
+                   help="write into this volume of the set(s) (1 = the first; see volumes.py) instead of the newest, "
+                        "and do not move on when its names run out: e.g. to parse a recording again into the "
+                        "volume it was taken out of")
     p.add_argument("--max-seconds", type=float, default=0.0,
                    help="Read only the first N seconds of each bag (for tests).")
     p.add_argument("--deskew", action="store_true",
@@ -1058,9 +1062,13 @@ def run(profile: Profile, doc: str, argv: list[str] | None = None) -> None:
                          + ", ".join(str(volumes.newest(o.root)) for o in outputs)
                          + "): volume N of the one is the twin of volume N of the other")
     for o in outputs:
-        if volumes.newest(o.root) != o.root:
-            print(f"  {o.root.name}: new recordings go into its newest volume {volumes.newest(o.root).name}")
-            o.root = volumes.newest(o.root)
+        target = volumes.volume(o.root, args.volume) if args.volume else volumes.newest(o.root)
+        if args.volume and not (target / args.version).is_dir():
+            raise SystemExit(f"--volume {args.volume}: {target} holds no dataset")
+        if target != o.root:
+            print(f"  {o.root.name}: writing into {'volume ' + str(args.volume) if args.volume else 'its newest volume'} "
+                  f"{target.name}")
+            o.root = target
     what = f"converting {', '.join(map(str, args.bags))}"
     locks: list[Path] = []
 
@@ -1099,7 +1107,7 @@ def run(profile: Profile, doc: str, argv: list[str] | None = None) -> None:
                 print(f"  already in the {', '.join(o.profile.name for o in outputs if o not in todo)} "
                       f"set — converting into the {', '.join(o.profile.name for o in todo)} set only")
             # a recording that goes into one set only cannot move that set on alone (the volumes are twins)
-            args.roll = roll if len(todo) == len(outputs) else None
+            args.roll = roll if len(todo) == len(outputs) and not args.volume else None
             try:
                 names = _convert(todo, args, bag)
             except (Exception, SystemExit) as exc:

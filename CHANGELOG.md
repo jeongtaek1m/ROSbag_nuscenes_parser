@@ -6,6 +6,7 @@
 |---|---|
 | `scripts/exfat_bag_rescue.py` (신규) | 휴지통을 비운(포맷하지 않은) exFAT 드라이브에서 bag을 되살림. 드라이브는 읽기만 하고 표준 라이브러리만 씀. `scan`: 살아 있는 폴더와 지워진 폴더의 bag 항목을 찾아 bag 자체 인덱스로 검사(온전함 / 손상 구간 / 없음). `--survey`: 빈 공간 전체에서 chunk를 찾아 녹화별로 집계. `recover --out DIR [--carve]`: 온전한 bag은 그대로 복사, 손상됐거나 항목이 없는 bag은 살아 있는 chunk로 새 bag을 묶음. chunk 뒤의 인덱스 기록과 내용이 정확히 맞아야 채택하고, 흩어진 bag은 옛 FAT 체인을 따라 읽음. `check` · `repair`는 bag 파일에 같은 일. 테스트: 커널 exFAT 드라이버로 실제 이력(복사 · 휴지통 비우기 · 재마운트 후 새 bag)을 재현한 이미지에서 남은 메시지를 원본과 한 바이트도 다르지 않게 복구 |
 | `folder` | 지운 폴더를 원래 모습대로(기본 `0928_2`, 10/07 목록 기준): 온전한 bag은 원본 바이트 그대로(자체 인덱스가 기록된 크기와 정확히 맞고 모든 chunk가 맞을 때, 흩어진 것은 FAT 체인으로), 손상된 bag은 남은 chunk로, `_integrity.csv`·`_recorder.log`·`ie_*` GNSS 로그는 살아 있는 폴더 항목이나 내용(csv의 bag 크기 · 길이, 로그 첫 시각, GPS 레코드 CRC)으로 찾아 기록된 크기로, 수정 시각도 원래대로. `--only`로 나눠 담기 |
+| `scripts/nuscenes_to_bag.py` (신규) | full 세트에서 bag 메시지를 다시 만듦(bag이 잃은 시간용): 카메라는 원본 JPEG 바이트, LiDAR는 같은 점을 한 줄로(무반사 자리는 없음), 나머지 토픽은 `ext/`에서 원본 바이트 그대로(NaN 비트만 예외). `/radar/PointCloudDetection`은 제외. `--until-bag`·`--append`로 복구된 bag 앞을 채운 한 bag을 만듦. G-4 scene-0953로 원본과 대조: 63개 토픽 중 59개 바이트 일치, 카메라 JPEG 전부 일치, LiDAR 점 전부 일치 |
 
 ## 2026-10-14 — 격자에서 벗어난 LiDAR 프레임 버림
 

@@ -7,15 +7,18 @@
 What comes back, for the time the log's scenes cover (or up to the first message of --until-bag):
   cameras (7)     sensor_msgs/CompressedImage with the JPEG bytes as recorded (the full set keeps them as they were);
                   header stamp to the microsecond, seq 0
-  LiDARs (5)      sensor_msgs/PointCloud2 from .pcd.bin + .time.bin: the same returns (x, y, z, intensity, ring and
-                  each point's time) in one row; the no-return placeholders of the organized original are not kept
+  LiDARs (5)      sensor_msgs/PointCloud2 from .pcd.bin + .time.bin, the same returns (x, y, z, intensity, ring and
+                  each point's time, to ~1 us). The roof Ruby 128 goes back into its 128x1800 grid (a laser's row is
+                  fixed, the column follows the firing time; cells without a return get NaN, their row's ring and
+                  column's time, as the driver writes them); the bottom M1s' 15750x5 grids cannot be placed reliably
+                  (their rows are 126 time blocks with jitter as large as a row's step), so their returns come in one row
   other topics    every message (ext/<scene>/<topic>.json keeps all fields), serialized again with the template's
                   definitions; recording time to the microsecond. Byte for byte the original, except NaN payload
                   bits (JSON keeps NaN, not its bits: /radar/ObjectList has such NaNs)
   not kept        /radar/PointCloudDetection (the driver's cloud of /radar/DetectionList, which comes back; its own
                   stamp is the driver's clock) and /middle/rslidar_packets
 Checked on G-4 (scene-0953 against the bag): 59 of 63 topics byte for byte, every camera JPEG the same, every LiDAR
-sweep the same points (point times within float32 rounding).
+sweep the same points (point times within ~1 us); every roof sweep in its original grid, 37 of 196 byte for byte.
 A camera's or LiDAR's recording time is its stamp plus that topic's median delay in the template bag.
 
 Connection records (types, definitions, md5, callerid, latching) and per-topic constants (frame_id, image format,
@@ -116,6 +119,55 @@ def tables(dataroot, log, only=None):
     return sorted(scenes.values()), sorted(sd, key=lambda r: r[1])
 
 
+def point_dtype(m):
+    return np.dtype({"names": [f.name for f in m.fields], "formats": [PF[f.datatype] for f in m.fields],
+                     "offsets": [f.offset for f in m.fields], "itemsize": m.point_step})
+
+
+def lidar_grid(pts, rel, stamp_s, grid, dt, sweep_s=0.1):
+    """The returns put back into the organized cloud they came from: a laser's fixed row (its ring), the column
+    of their firing time (each row fires at a fixed offset within a column); the cells without a return get NaN,
+    their row's ring and their column's time, as the driver writes them. None when the returns do not fit."""
+    ring_of_row, row_of_ring, offset, H, W = grid
+    step = sweep_s / W
+    ring = pts[:, 4].astype(np.int64)
+    if ring.min() < 0 or ring.max() >= len(row_of_ring) or (row_of_ring[ring] < 0).any():
+        return None
+    row = row_of_ring[ring]
+    t = stamp_s + rel.astype(np.float64)
+    base = t - offset[row]
+    order = np.argsort(base, kind="stable")
+    b = base[order]
+    newcol = np.concatenate([[0], np.cumsum(np.diff(b) > step / 2)])
+    k = int(newcol[-1]) + 1
+    if k > W:
+        return None
+    med = np.array([np.median(x) for x in np.split(b, np.searchsorted(newcol, np.arange(1, k)))])
+    if k == W:
+        colidx = np.arange(W)
+    else:                                                     # columns without a single return
+        extra = np.maximum(np.round(np.diff(med) / step).astype(np.int64) - 1, 0)
+        lead = max(0, int(round((med[0] - stamp_s) / step)))
+        while lead + k + extra.sum() > W:
+            if extra.sum():
+                extra[np.argmax(extra)] -= 1
+            else:
+                lead -= 1
+        colidx = lead + np.concatenate([[0], np.cumsum(1 + extra)])
+    col = np.empty(len(t), np.int64)
+    col[order] = colidx[newcol]
+    if len(np.unique(row * W + col)) != len(t):
+        return None
+    g = np.zeros((H, W), dt)
+    for f in ("x", "y", "z"):
+        g[f] = np.float32("nan")
+    g["ring"] = ring_of_row[:, None]
+    g["timestamp"] = np.interp(np.arange(W), colidx, med)[None, :] + offset[:, None]
+    g["x"][row, col], g["y"][row, col], g["z"][row, col], g["intensity"][row, col] = pts[:, 0], pts[:, 1], pts[:, 2], pts[:, 3]
+    g["timestamp"][row, col] = t
+    return g
+
+
 def template_info(path):
     """Connections by topic, a first message per topic, and each payload topic's median recording delay (ns)."""
     conns, first, delay = {}, {}, {}
@@ -135,7 +187,17 @@ def template_info(path):
             first.setdefault(c.topic, m)
             lat[c.topic].append(t - (m.header.stamp.sec * 10**9 + m.header.stamp.nanosec))
         delay = {k: int(statistics.median(v)) for k, v in lat.items() if v}
-    return ts, conns, first, delay
+    grids = {}
+    m = first.get(LIDAR_POINTS_TOPIC)
+    if m is not None and m.height > 1 and m.width > 1:            # organized: rows = lasers, columns = time
+        g = np.frombuffer(bytes(m.data), point_dtype(m)).reshape(m.height, m.width)
+        ring_of_row = g["ring"][:, 0].astype(np.int64)
+        if len(set(ring_of_row)) == m.height and (g["ring"] == g["ring"][:, :1]).all():
+            row_of_ring = np.full(ring_of_row.max() + 1, -1)
+            row_of_ring[ring_of_row] = np.arange(m.height)
+            offset = np.median(g["timestamp"] - g["timestamp"][:1, :], axis=1)
+            grids[LIDAR_POINTS_TOPIC] = (ring_of_row, row_of_ring, offset, m.height, m.width)
+    return ts, conns, first, delay, grids
 
 
 def main():
@@ -156,9 +218,11 @@ def main():
     if a.until_bag:
         with AnyReader([Path(a.until_bag)]) as r:
             until = r.start_time
-    ts, conns, first, delay = template_info(a.template)
+    ts, conns, first, delay, grids = template_info(a.template)
     print(f"{a.log}: {len(scenes)} scenes in the full set ({scenes[0]} .. {scenes[-1]}), {len(sd):,} sensor frames"
           + (f"; rebuilding up to {until / 1e9:.3f}" if until else ""), flush=True)
+
+    gridded = {"grid": 0, "list": 0}
 
     def sensor_msgs():
         for ch, t_us, fn in sd:
@@ -180,20 +244,25 @@ def main():
                 pts = np.fromfile(files / fn, np.float32).reshape(-1, 5)
                 tf = files / (fn[:-len(".pcd.bin")] + ".time.bin")
                 rel = np.fromfile(tf, np.float32) if tf.exists() else np.zeros(len(pts), np.float32)
-                dt = np.dtype({"names": [f.name for f in m.fields], "formats": [PF[f.datatype] for f in m.fields],
-                               "offsets": [f.offset for f in m.fields], "itemsize": m.point_step})
-                arr = np.zeros(len(pts), dt)
-                for k, name in enumerate(("x", "y", "z", "intensity", "ring")):
-                    if name in dt.names:
-                        arr[name] = pts[:, k]
-                if "timestamp" in dt.names:
-                    arr["timestamp"] = stamp / 1e9 + rel.astype(np.float64)
+                dt = point_dtype(m)
+                arr = lidar_grid(pts, rel, stamp / 1e9, grids[topic], dt) if topic in grids and tf.exists() else None
+                if arr is None:                                   # the returns in one row
+                    arr = np.zeros((1, len(pts)), dt)
+                    for k, name in enumerate(("x", "y", "z", "intensity", "ring")):
+                        if name in dt.names:
+                            arr[name][0] = pts[:, k]
+                    if "timestamp" in dt.names:
+                        arr["timestamp"][0] = stamp / 1e9 + rel.astype(np.float64)
+                    gridded["list"] += 1
+                else:
+                    gridded["grid"] += 1
+                h, wd = arr.shape
                 msg = ts.types["sensor_msgs/msg/PointCloud2"](
                     header=ts.types["std_msgs/msg/Header"](seq=0, stamp=build(ts, "builtin_interfaces/msg/Time",
                                                                                stamp),
                                                            frame_id=m.header.frame_id),
-                    height=1, width=len(arr), fields=m.fields, is_bigendian=False, point_step=m.point_step,
-                    row_step=m.point_step * len(arr), data=np.frombuffer(arr.tobytes(), np.uint8), is_dense=True)
+                    height=h, width=wd, fields=m.fields, is_bigendian=False, point_step=m.point_step,
+                    row_step=m.point_step * wd, data=np.frombuffer(arr.tobytes(), np.uint8), is_dense=h == 1)
             else:
                 continue                                      # RADAR_FRONT: comes back as /radar/DetectionList
             if topic not in conns:
@@ -242,7 +311,8 @@ def main():
             per[topic] = per.get(topic, 0) + 1
             if n % 20000 == 0:
                 print(f"  {n:,} messages rebuilt", flush=True)
-        print(f"rebuilt {n:,} messages on {len(per)} topics", flush=True)
+        print(f"rebuilt {n:,} messages on {len(per)} topics; roof LiDAR sweeps in their original grid "
+              f"{gridded['grid']:,}, as a list {gridded['list']:,}", flush=True)
         if a.append:
             m = 0
             with AnyReader([Path(a.append)]) as r:

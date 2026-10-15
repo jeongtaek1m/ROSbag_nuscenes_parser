@@ -36,6 +36,7 @@ import shutil
 import struct
 import sys
 import time
+import zlib
 
 MAGIC = b"#ROSBAG V2.0\n"
 OP_MSG, OP_HEADER, OP_INDEX, OP_CHUNK, OP_INFO, OP_CONN = 2, 3, 4, 5, 6, 7
@@ -558,7 +559,12 @@ def walk(rd, start=0, end=None, progress=None, base=0):
             elif kind == "conn":
                 yield ("conn",) + item
             elif kind == "magic":
-                yield "magic", pos
+                jump = yield "magic", pos                     # the caller may send where to go on (a bag it copied)
+                if jump is not None:
+                    pos = jump
+                    if progress:
+                        progress(base + pos - start)
+                    continue
             pos += length
         if progress:
             progress(base + pos - start)
@@ -1082,6 +1088,371 @@ def cmd_repair(a):
     say(f"  검사: {describe(check(File(a.out)))}")
 
 
+# ------------------------------------------------------------------ a deleted folder, put back as it was
+# `ls -l` of ExFAT/0928_2 on 2026-10-07 (bytes; modification times KST, to the minute): what `folder` restores.
+FOLDER = {
+    "name": "0928_2",
+    "dirs": {"": "2026-09-28 17:14", "ie_2026-09-28_14-35-11": "2026-09-28 15:50",
+             "ie_2026-09-28_14-35-11/raw": "2026-09-28 14:35"},
+    "files": [
+        ["A-1_2026-09-28-14-40-58.bag", 53147177101, "2026-09-28 14:45"],
+        ["A-1_2026-09-28-14-40-58_integrity.csv", 32755, "2026-09-28 14:45"],
+        ["A-1_2026-09-28-14-40-58_recorder.log", 5530, "2026-09-28 14:45"],
+        ["A-2_2026-09-28-14-45-11.bag", 43452727591, "2026-09-28 14:48"],
+        ["A-2_2026-09-28-14-45-11_integrity.csv", 32816, "2026-09-28 14:49"],
+        ["A-2_2026-09-28-14-45-11_recorder.log", 5530, "2026-09-28 14:48"],
+        ["A-4_2026-09-28-14-51-38.bag", 51419979927, "2026-09-28 14:55"],
+        ["A-4_2026-09-28-14-51-38_integrity.csv", 32747, "2026-09-28 14:56"],
+        ["A-4_2026-09-28-14-51-38_recorder.log", 5530, "2026-09-28 14:55"],
+        ["A-5_2026-09-28-14-55-45.bag", 63530397733, "2026-09-28 15:00"],
+        ["A-5_2026-09-28-14-55-45_integrity.csv", 32804, "2026-09-28 15:01"],
+        ["A-5_2026-09-28-14-55-45_recorder.log", 5530, "2026-09-28 15:00"],
+        ["A-6_2026-09-28-15-02-16_recorder.log", 5530, "2026-09-28 15:08"],
+        ["A-6_2026-09-28-15-02-17.bag", 77002016883, "2026-09-28 15:08"],
+        ["A-6_2026-09-28-15-02-17_integrity.csv", 32798, "2026-09-28 15:09"],
+        ["A-7_2026-09-28-15-08-17.bag", 59106914112, "2026-09-28 15:13"],
+        ["A-7_2026-09-28-15-08-17_integrity.csv", 32811, "2026-09-28 15:13"],
+        ["A-7_2026-09-28-15-08-17_recorder.log", 5530, "2026-09-28 15:13"],
+        ["A-8_2026-09-28-15-13-00_recorder.log", 5530, "2026-09-28 15:19"],
+        ["A-8_2026-09-28-15-13-01.bag", 78061305071, "2026-09-28 15:19"],
+        ["A-8_2026-09-28-15-13-01_integrity.csv", 32811, "2026-09-28 15:20"],
+        ["A-9_2026-09-28-15-19-07_recorder.log", 5530, "2026-09-28 15:24"],
+        ["A-9_2026-09-28-15-19-08.bag", 67492251983, "2026-09-28 15:24"],
+        ["A-9_2026-09-28-15-19-08_integrity.csv", 32768, "2026-09-28 15:25"],
+        ["ie_2026-09-28_14-35-11/master_station_info.txt", 4002, "2026-09-28 15:50"],
+        ["ie_2026-09-28_14-35-11/raw/oem7_2026-09-28_05-35-11_commands.txt", 4483, "2026-09-28 14:35"],
+        ["ie_2026-09-28_14-35-11/raw/oem7_2026-09-28_05-35-11.GPS", 40880198, "2026-09-28 15:50"],
+    ],
+}
+NOVATEL_ASCII = re.compile(rb"#[A-Z0-9]+A,[A-Z]+[0-9]*,")
+GPS_EPOCH, LEAP_S = 315964800, 18
+
+
+def novatel_crc(b):
+    return zlib.crc32(b, 0xFFFFFFFF) ^ 0xFFFFFFFF
+
+
+def novatel_walk(d, i=0):
+    """How far NovAtel OEM7 logs parse from i (ASCII records with *crc, binary ones with CRC32, port prompts, line
+    ends): (offset where they stop, records, unix time of the first timed record)."""
+    n, count, t0 = len(d), 0, None
+    while i < n:
+        c = d[i]
+        if c in (0x0D, 0x0A):
+            i += 1
+            continue
+        if c == 0x5B:                                         # [USB2] and the like
+            m = re.match(rb"\[[A-Z0-9_]{2,12}\]", d[i:i + 16])
+            if not m:
+                break
+            i += m.end()
+            continue
+        if c in (0x23, 0x25):                                 # #...*crc ASCII log
+            star = d.find(b"*", i, i + 65536)
+            if star < 0 or star + 9 > n:
+                break
+            try:
+                if novatel_crc(d[i + 1:star]) != int(d[star + 1:star + 9], 16):
+                    break
+            except ValueError:
+                break
+            if t0 is None:
+                f = d[i:star].split(b";")[0].split(b",")
+                if len(f) > 6 and f[5].isdigit() and int(f[5]) > 1000:
+                    t0 = GPS_EPOCH + int(f[5]) * 604800 + float(f[6]) - LEAP_S
+            i = star + 9
+        elif d[i:i + 3] == b"\xaa\x44\x12":                   # binary, long header
+            if i + 28 > n:
+                break
+            e = i + d[i + 3] + u16(d, i + 8) + 4
+            if e > n or u32(d, e - 4) != novatel_crc(d[i:e - 4]):
+                break
+            if t0 is None and u16(d, i + 14) > 1000:
+                t0 = GPS_EPOCH + u16(d, i + 14) * 604800 + u32(d, i + 16) / 1000 - LEAP_S
+            i = e
+        elif d[i:i + 3] == b"\xaa\x44\x13":                   # binary, short header
+            if i + 16 > n:
+                break
+            e = i + 12 + d[i + 3] + 4
+            if e > n or u32(d, e - 4) != novatel_crc(d[i:e - 4]):
+                break
+            if t0 is None and u16(d, i + 6) > 1000:
+                t0 = GPS_EPOCH + u16(d, i + 6) * 604800 + u32(d, i + 8) / 1000 - LEAP_S
+            i = e
+        else:
+            break
+        count += 1
+    return i, count, t0
+
+
+def kind_of(path):
+    n = os.path.basename(path)
+    for suffix, kind in ((".bag", "bag"), ("_integrity.csv", "csv"), ("_recorder.log", "log"),
+                         ("master_station_info.txt", "master"), ("_commands.txt", "commands"), (".GPS", "gps")):
+        if n.endswith(suffix):
+            return kind
+    return None
+
+
+def small_kind(b):
+    """The kind of companion file a cluster starts with (b: its first bytes)."""
+    if b.startswith(b"run_utc,item,check,value,status"):
+        return "csv"
+    if b.startswith(b"\x1b[0m[ INFO] [") or b.startswith(b"[ INFO] ["):
+        return "log"
+    if b.startswith(b"=====") and b"IE MASTER STATION" in b[:200]:
+        return "master"
+    if b.startswith(b"; =====") and b"NovAtel" in b[:300]:
+        return "commands"
+    if NOVATEL_ASCII.match(b[:40]) or b[:3] in (b"\xaa\x44\x12", b"\xaa\x44\x13"):
+        if novatel_walk(b[:16384])[1] >= 3:
+            return "gps"
+    return None
+
+
+def name_time(path):
+    """The time in a companion file's name: oem7_<UTC>, else the recording's local time (KST); unix s."""
+    n = os.path.basename(path)
+    m = re.search(r"oem7_(\d{4}-\d{2}-\d{2})_(\d{2}-\d{2}-\d{2})", n)
+    if m:
+        return calendar.timegm(time.strptime(m.group(1) + "-" + m.group(2), "%Y-%m-%d-%H-%M-%S"))
+    m = re.search(r"(\d{4}-\d{2}-\d{2}-\d{2}-\d{2}-\d{2})", n)
+    return calendar.timegm(time.strptime(m.group(1), "%Y-%m-%d-%H-%M-%S")) - KST if m else None
+
+
+def companion_ok(path, data, size, sizes):
+    """Whether data is the file at path: its kind's signature and what its content says about its name."""
+    if len(data) != size:
+        return False
+    kind = kind_of(path)
+    if kind == "csv":                                         # the bag's size (GiB) and length it reports
+        stem = os.path.basename(path)[:-len("_integrity.csv")]
+        bag, dur = sizes.get(stem + ".bag"), KNOWN.get(stem)
+        m = re.search(rb" in ([0-9.]+) s \(", data)
+        return (data.startswith(b"run_utc,item,check,value,status") and data.endswith(b"\n") and bag is not None
+                and ('"bag_openable","%.2f GB"' % (bag / 2**30)).encode() in data
+                and (dur is None or m is None or abs(float(m.group(1)) - dur) < 10))
+    if kind == "log":
+        m = re.search(rb"\[ INFO\] \[(\d+)\.\d+\]", data[:200])
+        return m is not None and int(m.group(1)) == name_time(path) and data.endswith(b"\n")
+    if kind == "master":
+        return data.startswith(b"=====") and path.split("/")[0].encode() in data
+    if kind == "commands":
+        return data.startswith(b"; =====") and b"NovAtel" in data[:300]
+    if kind == "gps":
+        start = 0 if novatel_walk(data[:4096])[1] else min([q for q in (data.find(b"\xaa\x44", 0, 65536),
+                                                                       data.find(b"#", 0, 65536)) if q >= 0] or [0])
+        end, count, t0 = novatel_walk(data, start)
+        return end == len(data) and count > 100 and t0 is not None and abs(t0 - name_time(path)) < 3600
+    return False
+
+
+def say_line(*a):
+    sys.stderr.write("\n")
+    say(*a)
+
+
+def exact_bag(fs, chain, bags, done):
+    """The bag starting at the first cluster of chain (runs; contiguous: one run to the end of its free space),
+    whole: (stem, size, extent) when its first chunk names a wanted recording, its own index parses to exactly that
+    recording's size and every chunk checks out; None if not."""
+    room = sum(k for _, k in chain) * fs.cs
+    ext = Extent(fs, chain, room)
+    head = ext.read(0, len(MAGIC) + 8 + HEADER_LEN)
+    h = parse(head, len(MAGIC))
+    if not head.startswith(MAGIC) or h is None or h.op != OP_HEADER:
+        return None
+    first = record_at(ext, len(MAGIC) + 8 + HEADER_LEN, room)
+    stem = recording_of(first[2].start) if first and first[0] == "chunk" else None
+    if stem not in bags or stem + ".bag" in done:
+        return None
+    size = bags[stem][1]
+    ip = u64(h.fields[b"index_pos"])
+    if not ip < size <= room:
+        return None
+    e = Extent(fs, chain, size)
+    if read_index(e, ip, u32(h.fields[b"conn_count"]), u32(h.fields[b"chunk_count"])) and check(e)["ok"]:
+        return stem, size, e
+    return None
+
+
+def cmd_folder(a):
+    man = json.load(open(a.manifest)) if a.manifest else FOLDER
+    fs = open_device(a.device)
+    root = os.path.join(a.out, man["name"])
+    os.makedirs(root, exist_ok=True)
+    own(a.out)
+    if os.stat(a.out).st_dev == os.stat(fs.d.path).st_rdev:
+        sys.exit("--out이 복구할 드라이브 위에 있습니다. 다른 디스크를 주세요")
+    sizes = {f[0]: f[1] for f in man["files"]}
+    files = [f for f in man["files"] if not a.only or any(f[0].startswith(p) for p in a.only)
+             or (not a.no_ie and "/" in f[0])]
+    bags = {f[0][:-4]: f for f in files if f[0].endswith(".bag")}
+    need, free = sum(f[1] for f in files), shutil.disk_usage(a.out).free
+    say(f"{man['name']}/: 파일 {len(files)}개 (bag {len(bags)}개), 최대 {gb(need)} → {root} (남은 공간 {gb(free)})")
+    if need > free - (1 << 30):
+        sys.exit("공간이 모자랍니다. --only로 나눠서 하세요")
+    done, writers, heads, used_heads, cands, dircands = {}, {}, set(), set(), {}, set()
+
+    def hook(off, data):                                      # what starts each free cluster read
+        first = fs.heap + -(-(off - fs.heap) // fs.cs) * fs.cs
+        for p in range(first, off + len(data) - 96 + 1, fs.cs):
+            b = data[p - off:p - off + 512]
+            c = (p - fs.heap) // fs.cs + 2
+            if b[:len(MAGIC)] == MAGIC:
+                heads.add(c)
+                continue
+            if b[:1] in (b"#", b"\xaa"):
+                b = data[p - off:p - off + 16384]
+            k = small_kind(b)
+            if k:
+                cands.setdefault(k, set()).add(c)
+            elif b[0] in (0x85, 0x05) and b[32] & 0x7F == 0x40:
+                dircands.add(c)
+
+    def drop_writer(stem):
+        w = writers.pop(stem, None)
+        if w:
+            w.f.close()
+            os.remove(w.path)
+
+    runs = fs.free_runs()
+    total = sum(k for _, k in runs) * fs.cs
+    say(f"빈 공간 {gb(total)}을 한 번 읽으며 bag · 로그 · GPS 파일을 찾습니다")
+    prog = Progress("빈 공간 읽기", total)
+    fs.d.hook = hook
+    passed = 0
+    for c, k in runs:
+        g = walk(Extent(fs, [(c, k)], k * fs.cs), progress=lambda p: prog(passed + p))
+        send, last = None, None
+        while True:
+            try:
+                item = g.send(send)
+            except StopIteration:
+                break
+            send = None
+            if item[0] == "magic" and item[1] % fs.cs == 0:
+                h0 = c + item[1] // fs.cs
+                hit = exact_bag(fs, [(h0, c + k - h0)], bags, done)
+                if hit:
+                    stem, size, ext = hit
+                    used_heads.add(h0)
+                    drop_writer(stem)
+                    say_line(f"  {stem}.bag: 원본 그대로 남아 있음, 복사합니다 ({gb(size)})")
+                    copy(ext, os.path.join(root, stem + ".bag"))
+                    done[stem + ".bag"] = {"how": "원본 그대로", "size": size}
+                    send = item[1] + size
+            elif item[0] == "chunk":
+                ch = item[1]
+                last = recording_of(ch.start)
+                if last in bags and last + ".bag" not in done:
+                    if last not in writers:
+                        writers[last] = BagWriter(os.path.join(root, last + ".bag"))
+                    writers[last].add_chunk(ch)
+            elif item[0] == "conn" and last in writers:
+                writers[last].add_conn(item[1], item[2])
+        passed += k * fs.cs
+    prog.end()
+    for h in sorted(heads - used_heads):                     # bags whose clusters are scattered: their FAT chain
+        if fs.allocated(h):
+            continue
+        chain = fs.stale_runs(h, limit=-(-max([f[1] for f in bags.values()] or [0]) // fs.cs))
+        if len(chain) < 2:
+            continue                                         # contiguous: read whole above
+        hit = exact_bag(fs, chain, bags, done)
+        if hit:
+            stem, size, e2 = hit
+            drop_writer(stem)
+            say(f"  {stem}.bag: 흩어진 원본이 그대로 남아 있음, 복사합니다 ({gb(size)})")
+            copy(e2, os.path.join(root, stem + ".bag"))
+            done[stem + ".bag"] = {"how": "원본 그대로 (흩어진 조각)", "size": size}
+            continue
+        ext = Extent(fs, chain, sum(k for _, k in chain) * fs.cs)
+        first = record_at(ext, len(MAGIC) + 8 + HEADER_LEN, ext.size)
+        if first is None or first[0] != "chunk" or recording_of(first[2].start) not in bags:
+            continue                                         # not one of ours, or the chain does not go on with it
+        spans, last = {}, None
+        for item in walk(ext):
+            if item[0] == "chunk":
+                last = recording_of(item[1].start)
+                if last in bags and last + ".bag" not in done:
+                    if last not in writers:
+                        writers[last] = BagWriter(os.path.join(root, last + ".bag"))
+                    writers[last].add_chunk(item[1], trusted=True)
+                    sp = spans.setdefault(last, [item[1].start, item[1].end])
+                    sp[0], sp[1] = min(sp[0], item[1].start), max(sp[1], item[1].end)
+            elif item[0] == "conn" and last in writers:
+                writers[last].add_conn(item[1], item[2], True)
+        for stem, (t0, t1) in spans.items():
+            writers[stem].drop_untrusted(t0, t1)
+    for stem, w in sorted(writers.items()):
+        missing = w.close()
+        r = check(File(w.path))
+        done[stem + ".bag"] = {"how": "남은 chunk로 다시 묶음", "size": os.path.getsize(w.path),
+                               "start": r.get("start"), "end": r.get("end"), "ok": r.get("ok"),
+                               "missing_conns": missing}
+    # companion files: their own directory entries if a folder of them survived, else by content
+    orphans = {}
+    for c in sorted(dircands):
+        for e in fs.entries(fs.d.read(fs.off(c), fs.cs)):
+            if e["intact"] and not e["attr"] & 0x10:
+                orphans.setdefault(e["name"], []).append(e)
+    for path, size, _ in files:
+        if path.endswith(".bag"):
+            continue
+        got = None
+        for e in orphans.get(os.path.basename(path), []):
+            runs_e = fs.runs(e["first"], e["nofat"], e["size"])
+            if e["size"] == size and fs.used(runs_e) == 0:
+                data = Extent(fs, runs_e, size).read(0, size)
+                if companion_ok(path, data, size, sizes):
+                    got = data, "폴더 항목으로"
+                    break
+        if got is None:
+            for c in sorted(cands.get(kind_of(path), ())):
+                data = fs.d.read(fs.off(c), size)
+                if companion_ok(path, data, size, sizes):
+                    got = data, "내용으로"
+                    break
+        if got is None:
+            done[path] = {"how": "못 찾음"}
+            continue
+        dst = os.path.join(root, path)
+        os.makedirs(os.path.dirname(dst), exist_ok=True)
+        with open(dst, "wb") as f:
+            f.write(got[0])
+        own(dst)
+        done[path] = {"how": "원본 그대로 (" + got[1] + ")", "size": size}
+    # times as they were
+    for path, size, mtime in files:
+        dst = os.path.join(root, path)
+        if os.path.exists(dst):
+            t = calendar.timegm(time.strptime(mtime, "%Y-%m-%d %H:%M")) - KST
+            os.utime(dst, (t, t))
+    for d in sorted(man["dirs"], key=len, reverse=True):
+        dst = os.path.join(root, d)
+        if os.path.isdir(dst):
+            own(dst)
+            t = calendar.timegm(time.strptime(man["dirs"][d], "%Y-%m-%d %H:%M")) - KST
+            os.utime(dst, (t, t))
+    say(f"\n{root}:")
+    for path, size, _ in files:
+        r = done.get(path, {"how": "못 찾음"})
+        extra = ""
+        if r["how"].startswith("남은"):
+            dur = KNOWN.get(path[:-4])
+            span = (r["end"] - r["start"]) / 1e9 if r.get("start") else 0
+            extra = (f" · {gb(r['size'])} / 원래 {gb(size)} · {kst(r.get('start'))} ~ {kst(r.get('end'))}"
+                     + (f" (녹화 {dur}초 중 {span:.0f}초)" if dur else "")
+                     + (f" · 연결 정보 없는 토픽 id {r['missing_conns']}" if r.get("missing_conns") else ""))
+        say(f"  {path}: {r['how']}{extra}")
+    path = os.path.join(a.out, "folder_report.json")
+    with open(path, "w") as f:
+        json.dump(done, f, indent=1, default=str)
+    own(path)
+    say(f"보고서: {path}")
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd")
@@ -1096,6 +1467,13 @@ def main():
     r.add_argument("--carve", action="store_true", help="항목이 없는 녹화도 빈 공간의 chunk로 다시 묶기")
     c = sub.add_parser("check", help="bag 파일 검사")
     c.add_argument("bag")
+    fo = sub.add_parser("folder", help="지워진 폴더(0928_2)를 원래 모습대로: bag, 로그, csv, ie GPS")
+    fo.add_argument("device", nargs="?", default="/dev/disk/by-label/ExFAT")
+    fo.add_argument("--out", required=True, help="이 안에 0928_2/를 만듦")
+    fo.add_argument("--only", type=lambda s: [x for x in s.split(",") if x],
+                    help="bag 이름 앞부분, 쉼표로 (그 bag의 로그 · csv도 같이). ie_ 폴더는 늘 포함")
+    fo.add_argument("--no-ie", action="store_true", help="ie_ 폴더는 빼기")
+    fo.add_argument("--manifest", help="폴더 목록 JSON (기본: 0928_2)")
     p = sub.add_parser("repair", help="bag 파일을 살아 있는 chunk로 다시 묶기")
     p.add_argument("bag")
     p.add_argument("--out", required=True)
@@ -1103,7 +1481,8 @@ def main():
     if not a.cmd:
         ap.print_help()
         return
-    {"scan": cmd_scan, "recover": cmd_recover, "check": cmd_check, "repair": cmd_repair}[a.cmd](a)
+    {"scan": cmd_scan, "recover": cmd_recover, "folder": cmd_folder, "check": cmd_check,
+     "repair": cmd_repair}[a.cmd](a)
 
 
 if __name__ == "__main__":

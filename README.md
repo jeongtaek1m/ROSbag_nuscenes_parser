@@ -265,8 +265,13 @@ show both sides; `--scenes a,b`: by name). Run the rules (`curate.py`) afterward
 **Volumes.** Once the official scene names of the first volume are used up, a parse continues in
 `parsed/tcar_nuscenes_2` (and `tcar_nuscenes_full_2`) by itself. The parser page shows every volume as one
 dataset (a recording's row names its volume); the curation page gets a volume picker, since scene names start
-again in each volume: rules, review, 최종 확정 and its undo work on the picked volume and its full twin. 검증하기,
-캘리브레이션 넣기 and "기본 세트 큐레이션 반영" cover every volume.
+again in each volume: rules and review work on the picked volume. 최종 확정 ends the round in every volume at once
+(`curation/finalize_volumes.py`): every volume's dry run must pass first, then each volume deletes, renumbers and
+locks, its full twin follows (`mirror_full.py`), and the names that freed in the earlier volumes take the later
+volumes' oldest whole recordings, in both sets, with their locks (`curation/move_logs.py --fill`, as the DM
+datasets do; a recording that does not fit is passed over for a later one that does; a published one never
+moves). After a move a finalize before it can no longer be undone. 검증하기, 캘리브레이션 넣기 and
+"기본 세트 큐레이션 반영" cover every volume.
 
 **Bag timeline.** "bag 타임라인" under the recordings opens the selected recording's bag in
 `scripts/bag_timeline.py` (its own window): per topic, where its header stamps are and where messages are

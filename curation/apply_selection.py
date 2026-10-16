@@ -34,6 +34,7 @@ import glob
 import json
 import os
 import pickle
+import re
 import shutil
 import sys
 import time
@@ -102,9 +103,45 @@ def lock_rounds(sel_dir):
     return (_read(os.path.join(sel_dir, LOCK_NAME_JSON), {}) or {}).get('rounds') or []
 
 
+def lock_moved_in(sel_dir):
+    """Locked scenes that came from another volume with their recording (move_logs.py): [{stamp, from, logs, tokens}]."""
+    return (_read(os.path.join(sel_dir, LOCK_NAME_JSON), {}) or {}).get('moved_in') or []
+
+
 def locked_tokens(sel_dir):
-    """Scene tokens earlier rounds locked: never deleted, never candidates again."""
-    return {t for r in lock_rounds(sel_dir) for t in r.get('tokens', [])}
+    """Scene tokens earlier rounds locked (here, or in the volume they were moved from): never deleted, never
+    candidates again."""
+    return {t for r in lock_rounds(sel_dir) + lock_moved_in(sel_dir) for t in r.get('tokens', [])}
+
+
+def write_lock(sel_dir, rounds=None, moved_in=None):
+    """locked.json with these rounds (and/or moved_in); what is not given stays as it is."""
+    path = os.path.join(sel_dir, LOCK_NAME_JSON)
+    j = _read(path, {}) or {}
+    j['version'] = 1
+    j['rounds'] = rounds if rounds is not None else j.get('rounds') or []
+    if moved_in is not None:
+        j['moved_in'] = moved_in
+    if not j.get('moved_in'):
+        j.pop('moved_in', None)
+    os.makedirs(sel_dir, exist_ok=True)
+    _write(path, j, indent=1)
+
+
+def moves_since(dataroot, stamp):
+    """Recordings moved into or out of this volume (move_logs.py) after stamp (YYYYMMDD-HHMMSS)."""
+    out = []
+    root = os.path.realpath(dataroot)
+    name = os.path.basename(root)
+    m = re.match(r'(.+?)_([2-9]|[1-9]\d+)$', name)
+    base = m.group(1) if m and os.path.isdir(os.path.join(os.path.dirname(root), m.group(1))) else name
+    fam = [os.path.join(os.path.dirname(root), base)] + glob.glob(os.path.join(os.path.dirname(root), base + '_*'))
+    for v in fam:
+        for m in glob.glob(os.path.join(str(v), '_moved', '*.json')):
+            j = _read(m, {}) or {}
+            if j.get('stamp', '') > stamp and root in (os.path.realpath(j.get('src', '')), os.path.realpath(j.get('dst', ''))):
+                out.append(j)
+    return out
 
 
 def confirmed(sel_dir, want='drop'):
@@ -452,8 +489,7 @@ def finalize(dataroot, log=print, precheck=True):
                                       'backup': r.get('backup'), 'deleted': len(p['deleted']), 'n': len(new),
                                       'logs': sorted({logfile.get(s['log_token'], '') for s in new}),
                                       'tokens': [s['token'] for s in new]}]
-        os.makedirs(sel, exist_ok=True)
-        _write(os.path.join(sel, LOCK_NAME_JSON), {'version': 1, 'rounds': rounds}, indent=1)
+        write_lock(sel, rounds)
         with open(os.path.join(sel, 'decisions_log.txt'), 'a', encoding='utf-8') as f:
             f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')}  === 최종 확정: {len(p['deleted'])}개 삭제, 남은 {len(new)}개 잠금 "
                     f"(이전에 잠긴 {len(scenes) - len(new)}개) ===\n")
@@ -470,7 +506,9 @@ def unlock_last(dataroot, log=print):
             raise ValueError('잠긴 라운드가 없습니다')
         if rounds[-1].get('backup'):
             raise ValueError(f"이 라운드는 씬을 지웠습니다: --undo {rounds[-1]['backup']} 로 되돌리세요")
-        _write(os.path.join(sel, LOCK_NAME_JSON), {'version': 1, 'rounds': rounds[:-1]}, indent=1)
+        if moves_since(dataroot, rounds[-1]['stamp']):
+            raise ValueError('이 라운드 뒤에 볼륨 사이로 녹화를 옮겼습니다 (move_logs): 되돌릴 수 없습니다')
+        write_lock(sel, rounds[:-1])
         with open(os.path.join(sel, 'decisions_log.txt'), 'a', encoding='utf-8') as f:
             f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')}  === 최종 확정 되돌림 (잠금 해제 {rounds[-1]['n']}개) ===\n")
         log(f"[unlock] {rounds[-1]['n']} scenes unlocked")
@@ -649,6 +687,10 @@ def undo(backup, dataroot, log=print):
 def _undo(backup, dataroot, log):
     if os.path.exists(os.path.join(backup, FILES_GONE)):
         raise ValueError(f'{backup}: 이 백업의 파일은 지웠습니다 (--prune-backup) — 되돌릴 수 없습니다')
+    moved = moves_since(dataroot, os.path.basename(os.path.normpath(backup)))
+    if moved:
+        raise ValueError(f"{backup} 뒤에 볼륨 사이로 녹화를 옮겼습니다 ({', '.join(m['logs'][0] for m in moved)} 등): "
+                         '표를 그때로 돌리면 옮긴 녹화가 깨지므로 되돌릴 수 없습니다')
     man = _read(os.path.join(backup, 'manifest.json'))
     if not man:
         raise ValueError(f'{backup}/manifest.json 없음')
@@ -736,4 +778,7 @@ def main():
 
 
 if __name__ == '__main__':
-    sys.exit(main())
+    try:
+        sys.exit(main())
+    except ValueError as e:                       # refusals (locks held, a move since the backup, ...): the reason only
+        sys.exit(f'[apply_selection] {e}')

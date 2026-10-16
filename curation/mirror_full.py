@@ -12,7 +12,8 @@ the standard set (review, 최종 확정 in the app); this brings the full set to
   - a final deletion the standard set has undone since the last sync is undone here too (its backup);
   - a full scene whose recording is in the standard set but whose twin is gone from it is deleted, with
     apply_selection's deletion: the dry run first, the files into _removed/<stamp>/, the renaming, --undo;
-  - selection/locked.json takes the standard set's rounds, each scene token swapped for its twin's;
+  - selection/locked.json takes the standard set's rounds and moved-in locks (move_logs.py), each scene token
+    swapped for its twin's;
   - then every twin pair must have the same name, and the full set must pass apply_selection's check
     (references, key-frame files, devkit, CAN bus).
 
@@ -92,7 +93,7 @@ def sync(std, full, simulate=False, log=print):
         if r.get('backup'):
             A._undo(r['backup'], full, log)
         rounds = [x for x in A.lock_rounds(sel) if x.get('mirrors') != r['mirrors']]
-        A._write(os.path.join(sel, A.LOCK_NAME_JSON), {'version': 1, 'rounds': rounds}, indent=1)
+        A.write_lock(sel, rounds)
         log(f"[mirror] 표준에서 되돌린 라운드 {r['mirrors']}: full도 되돌렸습니다")
 
     c = compare(std, full)
@@ -122,8 +123,9 @@ def sync(std, full, simulate=False, log=print):
     # 3. locks: the standard rounds, in full-set tokens
     F_tok = {sc['token']: k[0] for k, sc in c['F'].items()}
     rounds = _rounds(std, full, c['twins'], F_tok, backup)
-    os.makedirs(sel, exist_ok=True)
-    A._write(os.path.join(sel, A.LOCK_NAME_JSON), {'version': 1, 'rounds': rounds}, indent=1)
+    moved_in = [dict(m, tokens=[c['twins'][t] for t in m.get('tokens', []) if t in c['twins']])
+                for m in A.lock_moved_in(os.path.join(std, 'selection'))]  # locks that came along with moved recordings
+    A.write_lock(sel, rounds, moved_in)
     # 4. in step?
     problems = []
     if c['drop'] or c['no_twin']:
@@ -137,7 +139,7 @@ def sync(std, full, simulate=False, log=print):
         'only_standard': c['only_standard'], 'only_full': c['only_full'], 'problems': problems}, indent=1)
     for m in problems:
         log(f'[mirror] 문제: {m}')
-    log(f"[mirror] full = 표준 큐레이션: 씬 {len(c['F'])}개, 잠금 {sum(r['n'] for r in rounds)}개"
+    log(f"[mirror] full = 표준 큐레이션: 씬 {len(c['F'])}개, 잠금 {sum(r['n'] for r in rounds) + sum(len(m['tokens']) for m in moved_in)}개"
         + (f", 이번에 {backup}로 옮김" if backup else ''))
     return problems
 

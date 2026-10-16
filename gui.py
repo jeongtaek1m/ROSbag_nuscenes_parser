@@ -427,6 +427,7 @@ def curation_data(dataroot: Path) -> dict:
             # locked by an earlier round's 최종 확정 (apply_selection.py --finalize): never deleted, never candidates
             "locked": {n for n, v in rule.items() if (v or {}).get("locked")},
             "rounds": read("locked.json").get("rounds") or [],
+            "moved_in": read("locked.json").get("moved_in") or [],   # locked recordings moved in (move_logs.py)
             "release": read("hf_release.json"),     # what went out to the Hub (scripts/hf_release.py writes it)
             # released scenes whose sensor files were deleted locally (scripts/drop_published_files.py)
             "dropped": [r for r in read("files_dropped.json").get("rounds") or [] if r.get("done")],
@@ -452,6 +453,8 @@ def log_stage(data: dict, log: str) -> tuple:
     """(round number or None, release name or None) of a recording: the curation round whose 최종 확정 locked it,
     and the Hugging Face release it first went out in."""
     rnd = next((k for k, r in enumerate(data["rounds"], 1) if log in (r.get("logs") or [])), None)
+    if rnd is None and any(log in (m.get("logs") or []) for m in data.get("moved_in") or []):
+        rnd = len(data["rounds"]) or 1          # moved in from a later volume by the same 최종 확정
     return rnd, ((data.get("release") or {}).get("logs") or {}).get(log)
 
 
@@ -2082,7 +2085,8 @@ class MainWindow(QtWidgets.QMainWindow):
         heading.addLayout(titles, 1)
         self.vol_picker = QtWidgets.QComboBox()
         self.vol_picker.setToolTip("큐레이션할 볼륨. 공식 씬 이름(train 685개)이 다 차면 새 녹화는 tcar_nuscenes_2, _3 …에 들어갑니다. "
-                                   "씬 이름이 볼륨마다 다시 시작하므로 큐레이션 · 검토 · 최종 확정은 볼륨별로 합니다")
+                                   "씬 이름이 볼륨마다 다시 시작하므로 규칙 · 검토는 볼륨별로 합니다. 최종 확정은 모든 볼륨을 한 번에 하고, "
+                                   "앞 볼륨에 빈 씬 이름이 생기면 뒤 볼륨의 오래된 녹화로 채웁니다")
         self.vol_picker.setVisible(False)
         self.vol_picker.activated.connect(self._pick_volume)
         heading.addWidget(self.vol_picker, alignment=Qt.AlignmentFlag.AlignTop)
@@ -2130,7 +2134,8 @@ class MainWindow(QtWidgets.QMainWindow):
         final = QtWidgets.QVBoxLayout()
         final.setSpacing(6)
         self.cur_final_btn = button("", self._final_delete, "danger")
-        self.cur_final_btn.setToolTip("이번 라운드를 끝냅니다: 버리기 확정 씬을 빼고(_removed/로 옮김), 남는 씬을 모두 잠급니다. "
+        self.cur_final_btn.setToolTip("이번 라운드를 모든 볼륨에서 끝냅니다: 버리기 확정 씬을 빼고(_removed/로 옮김), 남는 씬을 "
+                                      "모두 잠그고, 앞 볼륨의 빈 씬 이름은 뒤 볼륨 녹화로 채웁니다. "
                                       "잠긴 씬은 이후 새 데이터가 들어와도 절대 삭제되지 않습니다")
         final.addWidget(self.cur_final_btn, alignment=Qt.AlignmentFlag.AlignRight)
         self.cur_final_note = label("", "faint")
@@ -2847,13 +2852,15 @@ class MainWindow(QtWidgets.QMainWindow):
         self.cur_kept.setText(f"회색 = 남는 씬 {kept:,}개 ({pc(kept)}): " + (f"잠김(이전 라운드) {w['locked']:,} · " if w["locked"] else "")
                               + f"필터 통과 {w['pass']:,} · 사람이 남기기로 확정 {w['keep']:,}"
                               + ("  ·  잠긴 씬은 절대 삭제되지 않고, 새로 들어온 데이터만 후보·삭제 대상입니다" if w["locked"] else ""))
-        new = w["n"] - w["locked"]
-        self.cur_final_btn.setText(f"최종 확정 · 버리기 {w['drop']}개 삭제" if w["drop"] else "최종 확정 · 삭제 없음")
-        self._final_ready = bool(new) and not cand
+        drop_all, cand_all, new_all, nvol = self._all_volume_counts()
+        self._final_ready = bool(new_all) and not cand_all
         self.cur_final_note.setText(
-            "새 데이터가 없습니다 · 모두 잠김" if not new else
-            f"후보 {cand}개를 먼저 확정하세요" if cand else
-            f"버리기 {w['drop']}개를 빼고 남는 새 씬 {new - w['drop']}개를 잠급니다 (이후 삭제 불가)")
+            "새 데이터가 없습니다 · 모두 잠김" if not new_all else
+            f"후보 {cand_all}개를 먼저 확정하세요" + (" (모든 볼륨)" if nvol > 1 else "") if cand_all else
+            (f"볼륨 {nvol}개 한꺼번에: " if nvol > 1 else "")
+            + f"버리기 {drop_all}개를 빼고 남는 새 씬 {new_all - drop_all}개를 잠급니다"
+            + (" · 앞 볼륨 빈 이름은 뒤 볼륨 녹화로 채움" if nvol > 1 else "") + " (이후 삭제 불가)")
+        self._final_buttons()
         self.cur_subtitle.setText(
             (f"데이터셋 전체 씬 {total:,}개" + (f" (지금 {w['n']:,}개 + 삭제 완료 {deleted:,}개)" if deleted else "")
              + "  ·  필터를 통과한 씬은 바로 남기고, 걸린 씬은 후보가 되어 사람이 검토에서 확정합니다") if total else
@@ -3072,44 +3079,52 @@ class MainWindow(QtWidgets.QMainWindow):
                                 self._py("curation/curate.py", "--dataroot", self.dataset))], kind="curate")
 
     def _final_delete(self):
-        """최종 확정: the round ends. The confirmed 버리기 scenes go, every scene left is locked for good (a later round
-        with new recordings can only delete new scenes)."""
+        """최종 확정: the round ends in every volume at once (curation/finalize_volumes.py). The confirmed 버리기
+        scenes go and every scene left is locked for good, in each volume and its full twin; then the names that
+        freed in the earlier volumes take the later volumes' oldest whole recordings (curation/move_logs.py)."""
         if self.job or not self.data_root:
             return
+        full = (self.base_full / VERSION).is_dir()
         sys.path.insert(0, str(CURATION))
         try:
-            import apply_selection
-            plan = apply_selection.plan(str(self.dataset))
-        except (ValueError, OSError) as error:
+            import finalize_volumes
+            P = finalize_volumes.plan_all(self.base_dataset, self.base_full if full else None)
+            lines = finalize_volumes.describe(P)
+        except (ValueError, OSError, SystemExit) as error:
             return self._message("계획을 만들 수 없습니다", str(error))
         finally:
             sys.path.remove(str(CURATION))
-        if plan["candidates"]:
-            return self._message("후보를 먼저 확정하세요", f"아직 확정하지 않은 후보 {plan['candidates']}개가 있습니다. "
+        open_ = [f"{x['volume'].name} {x['plan']['candidates']}개" for x in P["volumes"] if x["plan"]["candidates"]]
+        if open_:
+            return self._message("후보를 먼저 확정하세요", f"아직 확정하지 않은 후보가 있습니다 ({', '.join(open_)}). "
                                  "잠그면 다시 볼 수 없으니, 검토에서 모두 확정한 뒤 최종 확정하세요.")
-        k, new = len(plan["deleted"]), plan["n_before"] - plan["n_locked"] - len(plan["deleted"])
-        text = (f"이번 라운드를 최종 확정합니다.\n\n· 버리기 확정 {k}개를 데이터셋에서 뺍니다"
-                + (f" (씬 {plan['n_before']}개 → {plan['n_after']}개, 이름 당김 {len(plan['rename'])}개, "
-                   f"옮길 파일 {plan['bytes_moved'] / 1e9:.1f} GB · _removed/로 옮기니 되돌릴 수 있음)" if k else "")
-                + f"\n· 남는 새 씬 {new}개를 잠급니다" + (f" (이미 잠긴 {plan['n_locked']}개와 함께)" if plan["n_locked"] else "")
-                + ".\n\n잠긴 씬은 앞으로 새 데이터가 들어와도 후보가 되지 않고 절대 삭제되지 않습니다. "
-                  "새로 파싱한 녹화의 씬만 필터·검토·삭제 대상이 됩니다."
-                + ("\n\n지우기 전에 표에만 먼저 적용해 모든 참조(scene · sample · sample_data · ego_pose · prev/next · log/map)와 "
-                   "devkit 불러오기를 확인하고, 문제가 있으면 아무것도 지우지 않습니다. 지운 뒤에도 devkit · CAN bus로 다시 확인합니다."
-                   if k else "")
-                + (f"\n\nfull 세트(parsed/{FULL_DATASET})에도 같은 씬을 빼고 같은 씬을 잠급니다."
-                   if (self.full_dataset / VERSION).is_dir() else ""))
+        k = sum(len(x["plan"]["deleted"]) for x in P["volumes"])
+        new = sum(x["plan"]["n_after"] - x["plan"]["n_locked"] for x in P["volumes"])
+        many = len(P["volumes"]) > 1
+        text = (("이번 라운드를 모든 볼륨에서 한 번에 최종 확정합니다." if many else "이번 라운드를 최종 확정합니다.")
+                + "\n\n" + "\n".join("· " + l.strip() for l in lines)
+                + "\n\n버리기 확정 씬은 _removed/로 옮기고, 남는 씬은 빈 번호 없이 이름을 당긴 뒤 모두 잠급니다. "
+                  "잠긴 씬은 앞으로 새 데이터가 들어와도 후보가 되지 않고 절대 삭제되지 않습니다."
+                + ("\n\n그다음 앞 볼륨에 빈 씬 이름이 생기면 뒤 볼륨의 가장 오래된 녹화로 통째로 채웁니다 "
+                   "(녹화 하나가 두 볼륨에 나뉘지 않아서 다 안 들어가는 녹화는 건너뜀, 잠금도 함께 옮김). "
+                   "녹화를 옮긴 뒤에는 이번 확정을 되돌릴 수 없습니다." if P["moves"] else "")
+                + "\n\n지우기 전에 모든 볼륨에서 표에만 먼저 적용해 참조와 devkit 불러오기를 확인하고, "
+                  "하나라도 문제가 있으면 아무것도 바꾸지 않습니다."
+                + (f"\n\nfull 세트(parsed/{FULL_DATASET}…)에도 같은 씬을 빼고, 같은 녹화를 같은 이름으로 옮기고, "
+                   "같은 씬을 잠급니다." if full else ""))
         if not self._confirm("최종 확정할까요?", text, f"최종 확정 · {k}개 삭제" if k else "최종 확정", True):
             return
-        tool = lambda *a: self._py("curation/apply_selection.py", "--dataroot", self.dataset, *a)
-        steps = ([("proc", "미리 검사: 표에만 삭제를 적용해 모든 참조와 devkit 불러오기 확인 (문제가 있으면 여기서 멈춤)",
-                   tool("--simulate"))] if k else [])
-        steps += [("proc", "버리기 확정 씬 옮기고 남은 씬 잠그기", tool("--finalize", "--no-precheck"))]
-        # always checked, deletions or not: a locked scene is a validated one (the parser page counts on it)
-        steps += [("proc", ("삭제 후 점검" if k else "잠근 뒤 점검") + ": 표 참조 · key frame 파일 · devkit · CAN bus", tool("--check"))]
-        steps += self._mirror_step()
-        steps += [("proc", "필터 다시 실행 (잠긴 씬 제외)", self._py("curation/curate.py", "--dataroot", self.dataset))]
-        self.run(f"최종 확정 · 버리기 {k}개 삭제, 새 씬 {new}개 잠금", steps, kind="apply")
+        args = ("--standard", self.base_dataset) + (("--full", self.base_full) if full else ())
+        tool = lambda *a: self._py("curation/finalize_volumes.py", *args, *a)
+        steps = [("proc", "미리 검사 · 모든 볼륨: 남은 후보, 표에만 삭제를 적용해 참조 · devkit 확인 (문제가 있으면 여기서 멈춤)",
+                  tool("--stage", "precheck")),
+                 ("proc", "최종 확정 · 모든 볼륨: 버리기 확정 씬 빼기, 이름 당기기, 잠그기, 점검, full 세트 반영",
+                  tool("--stage", "finalize"))]
+        if many:
+            steps.append(("proc", "앞 볼륨의 빈 씬 이름을 뒤 볼륨 녹화로 채우기 (기본 · full 두 세트)",
+                          self._py("curation/move_logs.py", *args, *(() if full else ("--no-full",)), "--fill", "--apply")))
+        steps.append(("proc", "점검 · 필터 다시 실행 (모든 볼륨)", tool("--stage", "after")))
+        self.run(f"최종 확정 · {'모든 볼륨 · ' if many else ''}버리기 {k}개 삭제, 새 씬 {new}개 잠금", steps, kind="apply")
 
     def _undo_apply(self):
         """Take back the last 최종 확정 (its deletion and its lock), or an older plain deletion."""
@@ -3307,17 +3322,33 @@ class MainWindow(QtWidgets.QMainWindow):
         sig += sorted(u.parent.name for u in (ds / "_removed").glob("*/UNDONE"))
         return tuple(sig)
 
+    def _all_volume_counts(self):
+        """(confirmed 버리기, open candidates, scenes not locked yet, volumes) over every volume: 최종 확정 takes
+        them all at once."""
+        drop = cand = new = 0
+        vols = [d for d in (self.volume_dirs() if self.data_root else []) if d in self.vol_status] or [self.dataset]
+        for d in vols:
+            data = self.cdata if d == self.dataset else self.vol_cdata.get(d)
+            st = self.status_all if d == self.dataset else self.vol_status.get(d)
+            if not data or not st:
+                continue
+            names = [n for ns in st["names_by_log"].values() for n in ns]
+            drop += sum(scene_state(data, n) == "drop" for n in names)
+            cand += sum(scene_state(data, n) in CANDIDATES for n in names)
+            new += sum(scene_state(data, n) != "locked" for n in names)
+        return drop, cand, new, len(vols)
+
     def _final_buttons(self):
-        """최종 삭제 on the curation page and in the review bar: the confirmed 버리기 scenes of the dataset."""
-        names = [n for ns in self.status_all["names_by_log"].values() for n in ns]
-        drop = sum(scene_state(self.cdata, n) == "drop" for n in names)
-        cand = sum(scene_state(self.cdata, n) in CANDIDATES for n in names)
-        new = sum(scene_state(self.cdata, n) != "locked" for n in names)
+        """최종 확정 on the curation page and in the review bar: the confirmed 버리기 scenes of every volume."""
+        drop, cand, new, nvol = self._all_volume_counts()
+        every = "모든 볼륨 · " if nvol > 1 else ""
         for b in (self.cur_final_btn, self.review_final_btn):
-            b.setText(f"최종 확정 · 버리기 {drop}개 삭제" if drop else "최종 확정 · 삭제 없음")
+            b.setText(f"최종 확정 · {every}버리기 {drop}개 삭제" if drop else f"최종 확정 · {every}삭제 없음")
             b.setEnabled(self.job is None and bool(new) and not cand)
-            b.setToolTip("새 데이터가 없습니다 (모두 잠김)" if not new else f"후보 {cand}개를 먼저 확정하세요" if cand else
-                         f"버리기 {drop}개를 빼고 남는 새 씬을 잠급니다")
+            b.setToolTip("새 데이터가 없습니다 (모두 잠김)" if not new else
+                         f"후보 {cand}개를 먼저 확정하세요" + (" (모든 볼륨 합계)" if nvol > 1 else "") if cand else
+                         f"버리기 {drop}개를 빼고 남는 새 씬을 잠급니다"
+                         + (f" · 볼륨 {nvol}개를 한 번에 하고, 앞 볼륨의 빈 이름은 뒤 볼륨 녹화로 채웁니다" if nvol > 1 else ""))
 
     def _final_from_review(self):
         self._close_review()

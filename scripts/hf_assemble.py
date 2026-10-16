@@ -1,10 +1,15 @@
 #!/usr/bin/env python3
-"""Put the T-Car nuScenes tars together into one dataset directory, and keep it up to date.
+"""Put the T-Car nuScenes tars together into dataset directories, and keep them up to date.
 
 Uploaded next to the tars as `assemble.py` (Python 3.8+, standard library only).
 
     hf download shchon11/TCar --repo-type dataset --revision <release> --local-dir tcar_tars
     python tcar_tars/assemble.py --tars tcar_tars --out tcar_nuscenes
+
+The repository can hold more than one dataset: the root one, and each folder with its own manifest.json
+(tcar_nuscenes_2/, ...: a later volume, whose scene names restart at the official list, so each is a dataroot of
+its own). They are all put together, each next to --out: tcar_nuscenes/, tcar_nuscenes_2/, ... (--only-this:
+just the one of --tars).
 
 Run the same two commands again for a newer release: `hf download` fetches only the tars that are new,
 and this script extracts only the shards it has not extracted before (it remembers them in
@@ -51,10 +56,25 @@ def main():
                     '(hf download --include ... for some recordings only); their scenes have no files')
     ap.add_argument('--delete-tars', action='store_true', help='delete each tar once extracted (saves space; '
                     'hf download then fetches it again next time, so keep them if you will update)')
+    ap.add_argument('--only-this', action='store_true', help="only the dataset of --tars, not the other datasets in "
+                    "its folders (tcar_nuscenes_2/, ...)")
     args = ap.parse_args()
-    man = json.load(open(os.path.join(args.tars, 'manifest.json'), encoding='utf-8'))
-    os.makedirs(args.out, exist_ok=True)
-    state_path = os.path.join(args.out, STATE)
+    jobs = [(args.tars, args.out)] if os.path.isfile(os.path.join(args.tars, 'manifest.json')) else []
+    if not args.only_this:                        # the other datasets of the repository: each into its own dataroot
+        for d in sorted(os.listdir(args.tars)):
+            if os.path.isfile(os.path.join(args.tars, d, 'manifest.json')):
+                jobs.append((os.path.join(args.tars, d), os.path.join(os.path.dirname(os.path.abspath(args.out)), d)))
+    if not jobs:
+        sys.exit(f'no manifest.json in {args.tars} (nor in a folder of it): download a release first')
+    for tars, out in jobs:
+        print(f"== {tars} -> {out}", flush=True)
+        assemble(tars, out, args)
+
+
+def assemble(tars, out, args):
+    man = json.load(open(os.path.join(tars, 'manifest.json'), encoding='utf-8'))
+    os.makedirs(out, exist_ok=True)
+    state_path = os.path.join(out, STATE)
     state = json.load(open(state_path, encoding='utf-8')) if os.path.isfile(state_path) else {'shards': {}, 'meta': None}
 
     def save():
@@ -66,37 +86,37 @@ def main():
     print(f"release {man['release']}: {len(man['shards'])} sensor shards ({len(todo)} to extract), "
           f"{man['totals']['scenes']} scenes")
     for k, s in enumerate(todo, 1):
-        path = os.path.join(args.tars, s['path'])
+        path = os.path.join(tars, s['path'])
         if not os.path.isfile(path):
             if args.allow_missing:
                 print(f"  [{k}/{len(todo)}] {s['path']}: not downloaded, skipped")
                 continue
-            sys.exit(f'missing {s["path"]}: download the release again (hf download ... --local-dir {args.tars}), '
+            sys.exit(f'missing {s["path"]}: download the release again (hf download ... --local-dir {tars}), '
                      'or --allow-missing for some recordings only')
         if not args.no_verify and sha256(path) != s['sha256']:
             sys.exit(f'{s["path"]}: sha256 does not match the manifest (incomplete download?)')
         print(f"  [{k}/{len(todo)}] {s['path']}  ({s['bytes'] / 1e9:.1f} GB, {s['files']} files)", flush=True)
-        extract(path, args.out)
+        extract(path, out)
         state['shards'][s['path']] = s['sha256']
         save()
         if args.delete_tars:
             os.remove(path)
     meta = man['meta']
     if state.get('meta') != meta['sha256']:
-        path = os.path.join(args.tars, meta['path'])
+        path = os.path.join(tars, meta['path'])
         if not args.no_verify and sha256(path) != meta['sha256']:
             sys.exit(f'{meta["path"]}: sha256 does not match the manifest')
         for d in META_DIRS:                   # scene names (and so CAN bus file names) can change between releases
-            shutil.rmtree(os.path.join(args.out, d), ignore_errors=True)
-        for f in os.listdir(args.out):
+            shutil.rmtree(os.path.join(out, d), ignore_errors=True)
+        for f in os.listdir(out):
             if f.endswith('.import.json'):
-                os.remove(os.path.join(args.out, f))
+                os.remove(os.path.join(out, f))
         print(f"  tables: {meta['path']}", flush=True)
-        extract(path, args.out)
+        extract(path, out)
         state['meta'], state['release'] = meta['sha256'], man['release']
         save()
-    print(f"done: {args.out} is release {man['release']}. Check: "
-          f"python -c \"from nuscenes.nuscenes import NuScenes; NuScenes('v1.0-trainval', '{args.out}')\"")
+    print(f"done: {out} is release {man['release']}. Check: "
+          f"python -c \"from nuscenes.nuscenes import NuScenes; NuScenes('v1.0-trainval', '{out}')\"")
 
 
 if __name__ == '__main__':

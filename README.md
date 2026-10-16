@@ -472,6 +472,12 @@ python scripts/hf_release.py --branch 1002 --from main --token-file ~/Documents/
 - **Recipients**: `hf download shchon11/TCar --repo-type dataset --revision <release> --local-dir tcar_tars`, then
   `python tcar_tars/assemble.py --tars tcar_tars --out tcar_nuscenes` ([`scripts/hf_assemble.py`](scripts/hf_assemble.py)).
   The same two commands update a copy to a newer release: only new tars are fetched and extracted.
+- **Later volumes in folders**: a volume after the first (its scene names restart at the official list) is
+  released into the same branch with `--prefix tcar_nuscenes_2` (`--dataroot` that volume): the folder gets its own
+  `sensors/`, `meta/`, `manifest.json`, README and `assemble.py`; the branch and `main` are repo-wide, and every
+  dataset's card lists all datasets of the branch. Release the root volume first, then each folder.
+  `assemble.py` puts every dataset of the download together, each next to `--out` (`tcar_nuscenes/`,
+  `tcar_nuscenes_2/`, …; `--only-this` for one).
 - `--to-dir DIR` writes the same layout into a directory instead (a copy to hand over on a disk, or a test).
 
 ## Layout

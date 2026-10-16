@@ -369,6 +369,61 @@ class DirRemote:
                 dst.write_text(c, encoding='utf-8')
 
 
+class Prefixed:
+    """A remote seen through one folder of the repository (--prefix): the second volume of a set
+    (tcar_nuscenes_2, ...) lives in <folder>/ with its own manifest, meta/, sensors/, card and assemble.py (its scene
+    names restart at the official list and would clash with the root dataset's). Branches and main are the
+    repository's: a release (branch) holds every dataset."""
+    def __init__(self, remote, prefix):
+        self.r, self.p = remote, prefix.strip('/') + '/'
+
+    def has_branch(self, name):
+        return self.r.has_branch(name)
+
+    def create_branch(self, base):
+        return self.r.create_branch(base)
+
+    def mirror(self, src, dst='main'):
+        return self.r.mirror(src, dst)
+
+    def files(self, rev=None):
+        return {k[len(self.p):]: v for k, v in self.r.files(rev).items() if k.startswith(self.p)}
+
+    def all_files(self, rev=None):
+        return self.r.files(rev)
+
+    def read_json(self, path, rev=None):
+        return self.r.read_json(self.p + path, rev)
+
+    def read_root_json(self, path, rev=None):
+        return self.r.read_json(path, rev)
+
+    def put(self, local, path, msg):
+        return self.r.put(local, self.p + path, msg)
+
+    def commit(self, adds, deletes, msg):
+        return self.r.commit({self.p + k: v for k, v in adds.items()}, [self.p + d for d in deletes], msg)
+
+    def commit_root(self, adds, msg):
+        return self.r.commit(adds, [], msg)
+
+
+def datasets_in(remote, rev, here, man):
+    """[(folder, scenes, logs, GB)] of every dataset in the branch ('' = the repository root), this one from `man`."""
+    allf = remote.all_files(rev) if hasattr(remote, 'all_files') else remote.files(rev)
+    folders = ({''} if 'manifest.json' in allf else set()) | {k.split('/')[0] for k in allf
+                                                                if k.count('/') == 1 and k.endswith('/manifest.json')}
+    folders.add(here)
+    out = []
+    for f in sorted(folders):
+        m = man if f == here else (remote.read_root_json if hasattr(remote, 'read_root_json') else remote.read_json)(
+            (f + '/' if f else '') + 'manifest.json', rev)
+        if m:
+            t = m['totals']
+            out.append((f, t['scenes'], t['logs'], t['bytes'] / 1e9))
+    return out
+
+
 def apply_selection_sha(path):
     h = hashlib.sha256()
     with open(path, 'rb') as f:
@@ -461,8 +516,9 @@ def _order(log):
     return (m.group(1), int(m.group(2)), log) if m else (log, 0, log)
 
 
-def readme(man, repo):
-    """The dataset card (README.md), written from the manifest every release."""
+def readme(man, repo, here='', datasets=()):
+    """The dataset card (README.md), written from the manifest every release. here: its folder ('' = the root);
+    datasets: datasets_in(), every dataset of the repository (a section listing them when there are several)."""
     rel, tot = man['release'], man['totals']
     hours = tot['seconds'] / 3600
     shards = man['shards']
@@ -500,8 +556,39 @@ def readme(man, repo):
                    f"`{rel}` are downloaded and extracted." if prev else
                    "when a newer release is out, run the same two commands with its name as `--revision`, in the same "
                    "directories: only the new tars are downloaded and extracted.")
+    base = 'tcar_nuscenes_full' if full else 'tcar_nuscenes'
+    sub_dirs = [f for f, *_ in datasets if f and f != here]
+    all_sub = [f for f, *_ in datasets if f]                  # every dataset folder (this one too)
+    get = (f'hf download {repo} --repo-type dataset --revision {rel} --local-dir tcar_tars\n'
+           f'python tcar_tars/assemble.py --tars tcar_tars --out {base}'
+           + (f'      # -> {base}/ and {", ".join(f + "/" for f in all_sub)}' if all_sub else ''))
+    load = (f'nusc = NuScenes(version="v1.0-trainval", dataroot="{base}")\n'
+            f'can = NuScenesCanBus(dataroot="{base}")      # pose, ms_imu, meta per scene'
+            + ''.join(f'\nnusc_{f.rsplit("_", 1)[-1]} = NuScenes(version="v1.0-trainval", dataroot="{f}")   # its own scene names'
+                      for f in all_sub))
+    only = ''
+    if sub_dirs or here:
+        only = ("\n\nOne dataset only: the root one with `--exclude " + ' '.join(f'"{f}/*"' for f in sub_dirs or [here])
+                + "` on `hf download`" + (f", or this one (`{here}`) with `--include \"{here}/*\"` and "
+                f"`python tcar_tars/{here}/assemble.py --tars tcar_tars/{here} --out {here} --only-this`" if here else "") + ".")
+    family = ''
+    if len(datasets) > 1:
+        rows = '\n'.join(f"| {'`' + f + '/`' if f else 'repository root'} | {f or base} | {n} | {lg} | {gb:.0f} |"
+                         + (' ← this card' if f == here else '') for f, n, lg, gb in datasets)
+        family = f"""
+## Datasets in this repository
+
+| folder | dataset | scenes | recordings | GB |
+|---|---|---|---|---|
+{rows}
+
+Each is a complete nuScenes `v1.0-trainval` dataroot of its own. A dataset holds at most the 685 official train scene
+names, so the next one (a later volume of the same recordings series) starts the list again (`scene-0001`, ...):
+their scene names clash. `assemble.py` puts each together into its own folder; open each with its own
+`NuScenes(dataroot=...)`. The same release (branch) holds all of them.
+"""
     if full:
-        title = f"# T-Car nuScenes, full sensor set — release `{rel}`"
+        title = f"# T-Car nuScenes, full sensor set{f' ({here})' if here else ''} — release `{rel}`"
         intro = ("Driving data from the T-Car test vehicle with every sensor it records — seven cameras, five LiDARs, "
                  "the front radar, RTK INS / GNSS, vehicle CAN — in the [nuScenes](https://www.nuscenes.org/) "
                  "`v1.0-trainval` format, with the camera and roof-LiDAR calibration.")
@@ -512,7 +599,7 @@ def readme(man, repo):
         side_note = ''
         maint = f" --repo {repo} --dataroot <full dataroot>"
     else:
-        title = f"# T-Car nuScenes — release `{rel}`"
+        title = f"# T-Car nuScenes{f' ({here})' if here else ''} — release `{rel}`"
         intro = ("Driving data from the T-Car test vehicle (six cameras, a roof LiDAR, RTK INS) in the\n"
                  "[nuScenes](https://www.nuscenes.org/) `v1.0-trainval` format: load it with the `nuscenes-devkit` as is.")
         sensors_note = STANDARD_NOTES
@@ -521,6 +608,8 @@ def readme(man, repo):
         side_note = ("\nThe `0923` branch holds the calibration sample recordings of 2026-09-23 (one tar per channel, its own\n"
                      "scene numbering); they are not part of this series.\n")
         maint = ''
+    if here:
+        maint = f" --repo {repo} --dataroot <the {here} volume> --prefix {here}"
     return f"""{title}
 
 {intro}
@@ -537,17 +626,17 @@ def readme(man, repo):
 
 ```bash
 pip install -U huggingface_hub
-hf download {repo} --repo-type dataset --revision {rel} --local-dir tcar_tars
-python tcar_tars/assemble.py --tars tcar_tars --out tcar_nuscenes
+{get}
 ```
 
 ```python
 from nuscenes.nuscenes import NuScenes
 from nuscenes.can_bus.can_bus_api import NuScenesCanBus
-nusc = NuScenes(version="v1.0-trainval", dataroot="tcar_nuscenes")
-can = NuScenesCanBus(dataroot="tcar_nuscenes")      # pose, ms_imu, meta per scene
+{load}
 ```
+{only}
 
+{family}
 **Some recordings only**: download the tables and the recordings you want, and let `assemble.py` skip the rest
 (the tables still list every scene; the files of the others are just absent):
 
@@ -555,7 +644,7 @@ can = NuScenesCanBus(dataroot="tcar_nuscenes")      # pose, ms_imu, meta per sce
 hf download {repo} --repo-type dataset --revision {rel} --local-dir tcar_tars \\
     --include "manifest.json" --include "assemble.py" --include "meta/*" \\
     --include "sensors/A-1_*/*" --include "sensors/B-2_*/*"
-python tcar_tars/assemble.py --tars tcar_tars --out tcar_nuscenes --allow-missing
+python tcar_tars/assemble.py --tars tcar_tars --out {base} --allow-missing
 ```
 
 **Updating**: {update_note} Nothing already extracted is changed;
@@ -621,13 +710,13 @@ go last. First release of this series: `{first}`.
 RECORD = 'hf_release.json'                        # <dataroot>/selection/: what went out, for the app
 
 
-def save_record(root, man, repo):
+def save_record(root, man, repo, here=''):
     """The releases and which recording first went out in which one, next to the curation files, so the app can
     tell published data from new data without asking the Hub."""
     first = {}
     for sh in man.get('shards', []):
         first.setdefault(sh['log'], sh['release'])
-    rec = {'repo': repo, 'latest': man['release'], 'updated': datetime.datetime.now().astimezone().isoformat(timespec='seconds'),
+    rec = {'repo': repo, 'folder': here, 'latest': man['release'], 'updated': datetime.datetime.now().astimezone().isoformat(timespec='seconds'),
            'releases': [{k: r.get(k) for k in ('name', 'created', 'new_logs', 'new_scenes', 'scenes', 'parser_commit')}
                         for r in man.get('releases', [])],
            'logs': first, 'scene_tokens': sorted({t for sh in man.get('shards', []) for t in sh['scene_tokens']})}
@@ -665,6 +754,9 @@ def main():
     ap.add_argument('--no-main', action='store_true', help='leave main as it is (default: main becomes a copy of this release)')
     ap.add_argument('--main-only', action='store_true', help='only make main a copy of the published release --branch')
     ap.add_argument('--record-only', action='store_true', help=f'only write selection/{RECORD} from the published release --branch')
+    ap.add_argument('--prefix', default='', help='the folder of the repository this dataset goes into: a later volume '
+                    '(tcar_nuscenes_2, tcar_nuscenes_full_2, ...), whose scene names clash with the root dataset. '
+                    'Default: the root')
     args = ap.parse_args()
     root = os.path.realpath(args.dataroot)
 
@@ -675,16 +767,20 @@ def main():
             sys.exit(f'no hf_ token in {args.token_file}')
         token = m.group(0)
     remote = DirRemote(args.to_dir, args.branch) if args.to_dir else HfRemote(args.repo, args.branch, token or os.environ.get('HF_TOKEN'))
+    here = args.prefix.strip('/')
+    if here:
+        remote = Prefixed(remote, here)
 
     if args.card_only or args.main_only or args.record_only:   # nothing of the release's data is touched
         man = remote.read_json('manifest.json')
         if not man:
             sys.exit(f'{args.branch} has no manifest.json')
-        save_record(root, man, args.repo)
+        save_record(root, man, args.repo, here)
         if args.record_only:
             return
         if args.card_only:
-            remote.commit({'README.md': readme(man, args.repo)}, [], f'{args.branch}: README')
+            remote.commit({'README.md': readme(man, args.repo, here, datasets_in(remote, args.branch, here, man))}, [],
+                          f'{args.branch}: README')
             log(f'README.md of {args.branch} rewritten')
         if args.main_only or not args.no_main:
             log(f"main = release {args.branch}: {remote.mirror(args.branch)} changes")
@@ -744,14 +840,16 @@ def main():
                               'sample_data': ds['sample_data'], 'bytes': round(sum(x['bytes'] for x in shards) * 0.86),
                               'raw_bytes': sum(x['bytes'] for x in shards),
                               'seconds': ds['seconds'], 'annotations': ds['annotations']}}
-            Path(args.readme_out).write_text(readme(man, args.repo), encoding='utf-8')
+            Path(args.readme_out).write_text(readme(man, args.repo, here, datasets_in(remote, src, here, man)
+                                                     if remote.has_branch(src) else [(here, len(ds['scenes']), len(ds['by_log']), 0)]),
+                                              encoding='utf-8')
             log(f'README preview: {args.readme_out}')
         log('plan only: add --upload to build and upload')
         return
 
     # 3. upload: branch, then the parts (each its own commit, resumable), then meta + manifest + README
     os.makedirs(args.stage, exist_ok=True)
-    state_path = os.path.join(args.stage, f'{args.branch}.state.json')
+    state_path = os.path.join(args.stage, f"{args.branch}{'.' + here if here else ''}.state.json")
     state = json.load(open(state_path)) if os.path.isfile(state_path) else {'shards': {}}
     if not exists:
         remote.create_branch(args.base)
@@ -808,18 +906,32 @@ def main():
         'scenes': len(ds['scenes']), 'parser_commit': commit, 'parser_dirty': dirty,
         'lock_rounds': [r['stamp'] for r in apply_selection.lock_rounds(os.path.join(root, 'selection'))]}]
     man = {'dataset': 'T-Car nuScenes', 'profile': ds['profile'], 'version': VERSION, 'layout': LAYOUT, 'release': args.branch,
+           'folder': here,
            'totals': {'scenes': len(ds['scenes']), 'logs': len(ds['by_log']), 'samples': ds['samples'],
                       'sample_data': ds['sample_data'], 'bytes': sum(s['bytes'] for s in shards),
                       'raw_bytes': sum(s.get('raw_bytes', s['bytes']) for s in shards), 'seconds': round(ds['seconds'], 1),
                       'annotations': ds['annotations']},
            'channels': ds['channels'], 'logs': ds['log_info'],
            'meta': {'path': META_PATH, 'bytes': mn, 'sha256': msha}, 'releases': rels, 'shards': shards}
+    datasets = datasets_in(remote, args.branch, here, man)
     remote.commit({META_PATH: meta_dest, 'manifest.json': json.dumps(man, ensure_ascii=False, indent=1),
-                   'README.md': readme(man, args.repo), 'assemble.py': (HERE / 'hf_assemble.py').read_text(encoding='utf-8')},
-                  [], f'{args.branch}: tables, manifest, README ({len(ds["scenes"])} scenes, +{rels[-1]["new_scenes"]})')
+                   'README.md': readme(man, args.repo, here, datasets),
+                   'assemble.py': (HERE / 'hf_assemble.py').read_text(encoding='utf-8')},
+                  [], f'{args.branch}: {here + ": " if here else ""}tables, manifest, README ({len(ds["scenes"])} scenes, '
+                      f'+{rels[-1]["new_scenes"]})')
     os.remove(meta_dest)
-    log(f"release {args.branch} done: {len(shards)} sensor tars + meta, {len(ds['scenes'])} scenes")
-    save_record(root, man, args.repo)
+    log(f"release {args.branch}{' (' + here + '/)' if here else ''} done: {len(shards)} sensor tars + meta, {len(ds['scenes'])} scenes")
+    save_record(root, man, args.repo, here)
+    if len(datasets) > 1:                          # the other datasets' cards list this one too
+        root_remote = remote.r if here else remote
+        for f, *_ in datasets:
+            if f == here:
+                continue
+            other = Prefixed(root_remote, f) if f else root_remote
+            m = other.read_json('manifest.json', args.branch)
+            if m:
+                other.commit({'README.md': readme(m, args.repo, f, datasets)}, [], f"{args.branch}: {f + ': ' if f else ''}README")
+                log(f"README of {f or 'the root dataset'} lists the {len(datasets)} datasets")
     if not args.no_main and args.branch != 'main':  # main always holds the latest release
         log(f"main = release {args.branch}: {remote.mirror(args.branch)} changes")
 

@@ -1,5 +1,13 @@
 # Changelog
 
+## 2026-10-16 — HF 배포: 뒤 볼륨은 저장소 폴더로 (`--prefix`)
+
+| 항목 | 내용 |
+|---|---|
+| `scripts/hf_release.py --prefix <폴더>` | 두 번째 볼륨부터(씬 이름이 공식 목록 처음부터 다시 시작해 루트와 합칠 수 없음) 같은 브랜치의 폴더(`tcar_nuscenes_2/` 등)로 배포: 폴더마다 `sensors/` · `meta/` · `manifest.json`(`folder`) · README · `assemble.py`, 진행 기록은 `<stage>/<branch>.<폴더>.state.json`. 브랜치 만들기와 `main` 반영은 저장소 전체. 어느 데이터셋을 올리든 그 브랜치 모든 데이터셋의 README에 "Datasets in this repository" 표(폴더 · 씬 · 녹화 · 크기)와 폴더별 받는 법을 다시 씀. `--card-only` · `--readme-out` · 배포 기록(`hf_release.json`)도 폴더 단위 |
+| `scripts/hf_assemble.py` | 내려받은 저장소의 모든 데이터셋을(루트 + `manifest.json`이 있는 폴더) 각각 `--out` 옆 자기 dataroot로 조립(`tcar_nuscenes/`, `tcar_nuscenes_2/`, …), `--only-this`로 하나만 |
+| 검증 | 합성 두 볼륨을 `--to-dir`로: r1(루트 G-8 + `tcar_nuscenes_2/` H-4), r2(`--from r1`, 볼륨 2에 H-5 추가 → 새 tar 1개만, 루트는 변화 없음), `assemble.py` 두 번(두 번째는 새 tar 하나만 풂), 두 dataroot 모두 devkit 로드 · 파일 전부 있음, `--card-only`는 그 폴더 README만 |
+
 ## 2026-10-16 — 최종 확정: 모든 볼륨 한 번에, 빈 이름은 뒤 볼륨 녹화로 채움
 
 | 항목 | 내용 |
